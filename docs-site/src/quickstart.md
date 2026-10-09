@@ -6,7 +6,7 @@ to use, `use` on the machine that should tunnel through it.
 ## Install
 
 Download the latest release for your system from the
-[releases page](https://github.com/atereshkin/spora/releases) and put the
+[releases page](https://github.com/Spora-VPN/spora/releases) and put the
 binary somewhere on your `PATH`:
 
 - **Linux**: `spora-<version>-linux-<arch>.tar.gz`, a single static
@@ -24,7 +24,7 @@ binary somewhere on your `PATH`:
 Or build from source (a Rust toolchain is the only requirement):
 
 ```bash
-git clone https://github.com/atereshkin/spora.git
+git clone https://github.com/Spora-VPN/spora.git
 cd spora
 cargo build --release -p spora-cli
 # the binary is target/release/spora-cli; rename or alias it to `spora`

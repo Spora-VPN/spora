@@ -8,7 +8,7 @@ Spora is a tool for improving *connectivity* under adverse network conditions (c
 
 ## Project structure
 
-This repository contains all the networking functionality, FFIs and a cross-platform CLI client. The GUI Spora applications are distributed in binary form only.
+This repository contains all the networking functionality, FFIs and a cross-platform CLI client. The Android app is open source too: [Spora-VPN/spora-android](https://github.com/Spora-VPN/spora-android). The other GUI Spora applications are distributed in binary form only.
 
 It is a Rust [workspace](Cargo.toml) (edition 2024). The crates:
 

@@ -43,6 +43,6 @@ both and let clients fall back.
 
 An open relay forwards for any sharer that registers. To limit yours to
 sharers you have authorized, the relay supports capability tokens; the
-repository's [relay/README.md](https://github.com/atereshkin/spora/blob/main/relay/README.md)
+repository's [relay/README.md](https://github.com/Spora-VPN/spora/blob/main/relay/README.md)
 covers issuing them, the alternative TCP and Noise carriers for networks
 that block UDP or fingerprint QUIC, and the relay's own session log.

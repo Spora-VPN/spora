@@ -30,7 +30,13 @@ private = { ignore = true }
 # No blanket ignores: if an advisory fires, the fix is a dependency update, and
 # an ignore entry needs an inline comment explaining why no fix is possible.
 yanked = "warn"
-ignore = []
+ignore = [
+    # basic-toml is unmaintained (archived, no successor release). Only
+    # askama_derive uses it, at build time, to read askama's template config
+    # for uniffi's binding generator; every askama release up to 0.16.1 still
+    # does (its `config` feature), so no uniffi version avoids it.
+    { id = "RUSTSEC-2026-0374", reason = "build-time only, via uniffi's askama; no release drops it" },
+]
 
 [bans]
 multiple-versions = "warn"

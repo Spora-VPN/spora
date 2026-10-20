@@ -270,6 +270,7 @@ fn record_close(home: &Path) -> serde_json::Value {
 }
 
 /// A UDP port on loopback that nothing uses right now.
+#[cfg(target_os = "linux")]
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
         .unwrap()
@@ -423,7 +424,10 @@ fn a_second_signal_skips_the_last_upload() {
 /// Ctrl+C while `use` is still dialing (a relay that never answers takes
 /// its full dial timeout, 8 s) stops it there: the process exits normally,
 /// the dial's record ends `never_connected` with its unfinished steps
-/// `abandoned`, and that ending is sent before the process goes.
+/// `abandoned`, and that ending is sent before the process goes. Linux
+/// only: `--tun-name` is what lets `use` run without root, and only Linux
+/// has it.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_dial_stopped_by_a_signal_ends_its_record_and_sends_it() {
     let api = FakeApi::start();
@@ -502,6 +506,8 @@ fn a_dial_stopped_by_a_signal_ends_its_record_and_sends_it() {
 /// permission to attach a TUN) fails as a local failure, not as a tunnel
 /// the network lost. Its record says so. The share is a direct endpoint on
 /// loopback, so no relay is involved. Skipped as root, which could attach.
+/// Linux only, like `--tun-name`.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_tunnel_this_host_cannot_take_ends_as_a_local_failure() {
     // SAFETY: geteuid has no preconditions and cannot fail.

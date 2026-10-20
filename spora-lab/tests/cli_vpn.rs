@@ -14,7 +14,7 @@
 //! The resolver assertions bind-mount a private copy over `/etc/resolv.conf`
 //! inside the lab's mount namespace (the real file is never touched).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::BufRead as _;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
@@ -56,6 +56,8 @@ const WAN_SERVICES_IP_ALT: &str = "203.0.113.101";
 const RULE_PREF_MAIN: &str = "21327";
 const RULE_PREF_TABLE: &str = "21328";
 const TABLE: &str = "21328";
+/// `SPORA_API` of every spawned CLI: a closed port (discard), never Spora's.
+const LAB_API: &str = "http://127.0.0.1:9";
 
 fn svc_ip() -> Ipv4Addr {
     WAN_SERVICES_IP.parse().expect("WAN_SERVICES_IP parses")
@@ -96,11 +98,18 @@ struct Cli {
 }
 
 impl Cli {
-    fn spawn(ns: &Netns, label: &str, args: &[String]) -> Result<Cli, String> {
+    /// `dir` becomes the process's `XDG_STATE_HOME`: share/use write their
+    /// diagnostic log there and read the telemetry switch from there, which
+    /// must be a fresh (off) state, never the developer's own. The API base
+    /// is a closed local port as well: should a scenario ever switch uploads
+    /// on, lab records still go nowhere.
+    fn spawn(ns: &Netns, label: &str, dir: &Path, args: &[String]) -> Result<Cli, String> {
         use std::os::unix::process::CommandExt as _;
         let bin = cli_binary()?;
         let mut cmd = ns.command(bin.to_str().ok_or("binary path is not utf8")?);
-        cmd.args(args)
+        cmd.env("XDG_STATE_HOME", dir.join("state"))
+            .env("SPORA_API", LAB_API)
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -455,7 +464,7 @@ fn start_sharer(
     if !direct_upgrade {
         args.push("--no-direct-upgrade".into());
     }
-    let mut sharer = Cli::spawn(&topo.sharer, "sharer", &args)?;
+    let mut sharer = Cli::spawn(&topo.sharer, "sharer", dir, &args)?;
     let ready = sharer.wait_named("share_ready", Duration::from_secs(20))?;
     let url = ready["url"]
         .as_str()
@@ -586,6 +595,7 @@ fn full_tunnel_relay() -> Result<(), String> {
     let mut client = Cli::spawn(
         &topo.client,
         "client",
+        &dir,
         &use_args(&url, &dir, &["--no-direct-upgrade"]),
     )?;
 
@@ -746,6 +756,10 @@ fn full_tunnel_relay() -> Result<(), String> {
     // Clean exit on SIGTERM puts everything back.
     let status = client.stop()?;
     expect(status.success(), format!("client exit status {status}"))?;
+    // The client's stop went out before its process did: the sharer hears
+    // the session end now, not once its keepalive gives up on a silent peer
+    // (tens of seconds).
+    sharer.wait_named("session_ended", Duration::from_secs(5))?;
     let after = client_routing(&topo.client)?;
     expect(
         !has_policy_rules(&after.rules4),
@@ -777,8 +791,111 @@ fn full_tunnel_relay() -> Result<(), String> {
     expect(!backup_left, "resolv.conf backup left behind")?;
 
     sharer.stop()?;
+    check_diag_log(&dir, &url)?;
+    // Both records tell an orderly leave: the client ended its session, the
+    // sharer's peer closed it, and the share, stopped after its client left,
+    // closes `closed_by_peer` rather than `lost`.
+    let (ends, closes) = record_endings(&dir.join("records-use"))?;
+    expect(
+        ends == ["ok/local_shutdown"] && closes == ["closed_locally"],
+        format!("client record: session ends {ends:?}, closes {closes:?}"),
+    )?;
+    let (ends, closes) = record_endings(&dir.join("records-share"))?;
+    expect(
+        ends == ["ok/peer_closed"] && closes == ["closed_by_peer"],
+        format!("sharer record: session ends {ends:?}, closes {closes:?}"),
+    )?;
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
+}
+
+/// How the runs recorded in `dir` ended: every `session_end` step's verdict
+/// as `outcome/reason` (a later entry with the same `seq` supersedes an
+/// earlier one, as for any step), and every close's outcome.
+fn record_endings(dir: &Path) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut ends = BTreeMap::new();
+    let mut closes = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for entry in entries {
+        let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            match v["t"].as_str() {
+                Some("step") if v["kind"] == "session_end" => {
+                    let verdict = format!(
+                        "{}/{}",
+                        v["outcome"].as_str().unwrap_or("?"),
+                        v["reason"].as_str().unwrap_or("-")
+                    );
+                    ends.insert((path.clone(), v["seq"].as_u64()), verdict);
+                }
+                Some("close") => closes.push(v["outcome"].as_str().unwrap_or("?").to_string()),
+                _ => {}
+            }
+        }
+    }
+    Ok((ends.into_values().collect(), closes))
+}
+
+/// Both processes kept a diagnostic log under the `XDG_STATE_HOME` that
+/// `Cli::spawn` gave them: each file opened with its header, lines stamped
+/// with the run's record id, and neither the share URL's secret nor a
+/// per-flow or periodic-statistics line in it (the scenario's traffic makes
+/// the sharer log flows).
+fn check_diag_log(dir: &Path, url: &str) -> Result<(), String> {
+    let log_dir = dir.join("state").join("spora").join("log");
+    let secret = url
+        .split("/s/")
+        .nth(1)
+        .and_then(|rest| rest.split('?').next())
+        .filter(|blob| !blob.is_empty())
+        .ok_or(format!("no /s/<blob> in the share url {url}"))?;
+    let entries = std::fs::read_dir(&log_dir).map_err(|e| format!("{}: {e}", log_dir.display()))?;
+    let (mut files, mut stamped) = (0, false);
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("{}: {e}", log_dir.display()))?
+            .path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !(name.starts_with("diag-") && name.ends_with(".jsonl")) {
+            continue;
+        }
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        files += 1;
+        expect(
+            text.lines()
+                .next()
+                .is_some_and(|l| l.contains(r#""msg":"log opened""#)),
+            format!("{name} does not start with its header"),
+        )?;
+        expect(
+            !text.contains(secret),
+            format!("{name} holds the share URL's secret"),
+        )?;
+        for target in [spora_core::FLOW_LOG_TARGET, spora_core::STATS_LOG_TARGET] {
+            expect(
+                !text.contains(&format!(r#""tgt":"{target}""#)),
+                format!("{name} holds {target} lines"),
+            )?;
+        }
+        stamped |= text.contains(r#""run":""#);
+    }
+    expect(
+        files >= 2,
+        format!(
+            "{files} diag log file(s) in {}, expected one per process",
+            log_dir.display()
+        ),
+    )?;
+    expect(stamped, "no diag log line is stamped with a run id")
 }
 
 // ---------------------------------------------------------------------------
@@ -791,7 +908,7 @@ fn full_tunnel_direct_upgrade() -> Result<(), String> {
     let _resolv = IsolatedResolvConf::setup()?;
 
     let (mut sharer, url) = start_sharer(&topo, &dir, true)?;
-    let mut client = Cli::spawn(&topo.client, "client", &use_args(&url, &dir, &[]))?;
+    let mut client = Cli::spawn(&topo.client, "client", &dir, &use_args(&url, &dir, &[]))?;
     let ready = client.wait_named("tunnel_ready", CONNECT_TIMEOUT)?;
     expect(
         ready["upgrade_enabled"] == true,
@@ -854,6 +971,7 @@ fn split_tunnel() -> Result<(), String> {
     let mut client = Cli::spawn(
         &topo.client,
         "client",
+        &dir,
         &use_args(
             &url,
             &dir,
@@ -979,6 +1097,7 @@ fn attach_mode_touches_nothing() -> Result<(), String> {
     let mut client = Cli::spawn(
         &topo.client,
         "client",
+        &dir,
         &use_args(&url, &dir, &["--no-direct-upgrade", "--tun-name", tun]),
     )?;
     let ready = client.wait_named("tunnel_ready", CONNECT_TIMEOUT)?;

@@ -2,7 +2,7 @@
 members = [
     "spora-core", "spora-vpn", "spora-cli",
     "relay", "relay-client", "spora-ffi",
-    "spora-lab",
+    "spora-lab", "spora-service",
 ]
 # Vendored third-party fork (netstack-smoltcp); built as a path dependency of
 # spora-core but not a workspace member — we don't lint or test it as our own.

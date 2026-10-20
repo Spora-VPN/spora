@@ -45,10 +45,15 @@ if it wants to.
 
 ## Clean shutdown
 
-SIGTERM and SIGINT both disconnect cleanly and restore any host changes;
-processes exit zero. SIGKILL skips cleanup by definition; the next
-`spora use` repairs the client-side leftovers it finds. On Windows,
-closing the console counts as a clean shutdown.
+SIGTERM, SIGINT and SIGHUP all disconnect cleanly and restore any host
+changes; processes exit zero. That holds at any point of a run, including
+while `spora use` is still connecting: it stops the attempt, and its
+`stopping` event then comes without a `tunnel_ready`. A second signal
+skips the last diagnostics upload; a third ends the process at once
+(exit status 130), without cleanup, as SIGKILL would. SIGKILL skips
+cleanup by definition; the next `spora use` repairs the client-side
+leftovers it finds. On Windows, closing the console counts as a clean
+shutdown.
 
 ## Records for assertions
 

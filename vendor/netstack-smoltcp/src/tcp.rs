@@ -130,7 +130,9 @@ fn grow_ring(ring: &mut RingBuffer<'static, u8>, max: usize) -> bool {
 }
 
 /// Warn (rate-limited to one line per 5 s, with a dropped-since count) that
-/// the socket cap refused a SYN. Per-drop detail stays at trace.
+/// the socket cap refused a SYN. Per-drop detail stays at trace. The warning
+/// itself names no flow; the latest refused SYN's addresses follow it on the
+/// flow target (see `crate::FLOW_TARGET`).
 fn report_syn_drop(src_addr: SocketAddr, dst_addr: SocketAddr) {
     use std::sync::atomic::AtomicU64;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -138,6 +140,7 @@ fn report_syn_drop(src_addr: SocketAddr, dst_addr: SocketAddr) {
     static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
 
     trace!(
+        target: crate::FLOW_TARGET,
         "TCP socket cap ({}) reached; dropping SYN {} -> {}",
         MAX_TCP_SOCKETS, src_addr, dst_addr
     );
@@ -155,9 +158,13 @@ fn report_syn_drop(src_addr: SocketAddr, dst_addr: SocketAddr) {
         let count = DROPPED.swap(0, Ordering::Relaxed);
         tracing::warn!(
             "TCP socket cap ({}) reached: {} SYN(s) refused (RST) since last report — \
-             new TCP connections through the tunnel are failing (latest {} -> {})",
+             new TCP connections through the tunnel are failing",
             MAX_TCP_SOCKETS,
-            count,
+            count
+        );
+        tracing::warn!(
+            target: crate::FLOW_TARGET,
+            "TCP socket cap: latest refused SYN {} -> {}",
             src_addr,
             dst_addr
         );
@@ -265,7 +272,10 @@ impl TcpListenerRunner {
             let packet = match TcpPacket::new_checked(payload) {
                 Ok(p) => p,
                 Err(err) => {
-                    error!("invalid TCP err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, payload: {payload:?}");
+                    error!(
+                        target: crate::FLOW_TARGET,
+                        "invalid TCP err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, payload: {payload:?}"
+                    );
                     continue;
                 }
             };
@@ -291,7 +301,12 @@ impl TcpListenerRunner {
                 let admit = {
                     let mut flows = live_flows.lock().unwrap();
                     if flows.contains(&flow) {
-                        trace!("duplicate SYN {} -> {}, forwarding to existing socket", src_addr, dst_addr);
+                        trace!(
+                            target: crate::FLOW_TARGET,
+                            "duplicate SYN {} -> {}, forwarding to existing socket",
+                            src_addr,
+                            dst_addr
+                        );
                         false
                     } else if flows.len() >= MAX_TCP_SOCKETS {
                         // At the cap every new connection is refused (RST):
@@ -323,6 +338,7 @@ impl TcpListenerRunner {
                 let per_buf = buf_bytes / 2;
                 if per_buf == SMALL_TCP_BUFFER_SIZE as usize {
                     trace!(
+                        target: crate::FLOW_TARGET,
                         "TCP buffer budget exhausted; small buffers for {} -> {}",
                         src_addr,
                         dst_addr
@@ -358,7 +374,12 @@ impl TcpListenerRunner {
                     continue;
                 }
 
-                trace!("created TCP connection for {} <-> {}", src_addr, dst_addr);
+                trace!(
+                    target: crate::FLOW_TARGET,
+                    "created TCP connection for {} <-> {}",
+                    src_addr,
+                    dst_addr
+                );
 
                 let initial_ring = INITIAL_RING_BUFFER_SIZE.min(per_buf);
                 let control = Arc::new(SpinMutex::new(TcpSocketControl {

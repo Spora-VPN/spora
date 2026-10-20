@@ -1,5 +1,5 @@
-use crate::IpTransport;
-use crate::record::{Reason, Recorder, StepKind};
+use crate::record::{Fault, Reason, Recorder, StepKind};
+use crate::{IpTransport, STATS_LOG_TARGET};
 use futures_util::{Sink, Stream};
 use log::{debug, info, trace, warn};
 use std::future::Future;
@@ -37,9 +37,31 @@ pub struct LinkCounters {
     /// Round trip of the most recently answered probe, in microseconds. This
     /// one includes the tunnel itself, unlike a carrier's own estimate.
     pub last_rtt_us: AtomicU64,
+    /// What ended the session's transport, as this layer saw it: the first
+    /// error (or end of stream) its inner transport yielded — classified
+    /// where it was born, e.g. the QUIC close reason — or its own verdict
+    /// that the peer went silent (`keepalive_timeout`, which nobody else can
+    /// see). The first word wins; a session's `session_end` reads it.
+    ended_by: std::sync::Mutex<Option<Fault>>,
 }
 
 impl LinkCounters {
+    /// Note what ended the transport, unless something already has.
+    fn note_end(&self, cause: impl FnOnce() -> Fault) {
+        let mut slot = self.ended_by.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(cause());
+        }
+    }
+
+    /// What ended the transport, if it has ended.
+    pub(crate) fn ended_by(&self) -> Option<Fault> {
+        self.ended_by
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Round trip of the most recently answered probe, if there has been one.
     pub fn last_rtt(&self) -> Option<std::time::Duration> {
         match self.last_rtt_us.load(Ordering::Relaxed) {
@@ -106,6 +128,11 @@ pub struct KeepAliveConfig {
     /// going quiet. Nobody else can see that one: from the outside, a tunnel
     /// killed by silence and one killed by an error look identical.
     pub recorder: Option<Recorder>,
+    /// Called when this layer declares the peer dead, before it ends the
+    /// stream — so the carrier can tell the peer the session died (rather
+    /// than the orderly close a dropped transport sends), if the peer can
+    /// still hear it.
+    pub on_dead: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for KeepAliveConfig {
@@ -124,6 +151,7 @@ impl Default for KeepAliveConfig {
             active_window: None,
             counters: None,
             recorder: None,
+            on_dead: None,
         }
     }
 }
@@ -194,6 +222,14 @@ fn build_icmp_echo(cfg: &KeepAliveConfig, seq: &mut u16) -> Vec<u8> {
     pkt
 }
 
+/// A send through the inner transport failed: it has ended (see
+/// `KeepAliveTransport::note_send_error`). Keep the cause.
+fn note_send_end(counters: &Option<Arc<LinkCounters>>, e: &io::Error) {
+    if let Some(c) = counters {
+        c.note_end(|| Fault::from_io(e));
+    }
+}
+
 /// Try to flush a pending keepalive packet through the inner sink.
 /// Free function to avoid borrow conflicts.
 fn flush_send_state(
@@ -211,6 +247,7 @@ fn flush_send_state(
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(e)) => {
                         warn!("Keepalive poll_ready failed: {}", e);
+                        note_send_end(counters, &e);
                         *send_state = KeepAliveSendState::Idle;
                         return Poll::Ready(());
                     }
@@ -220,13 +257,14 @@ fn flush_send_state(
                 let pkt = std::mem::take(pkt);
                 if let Err(e) = Pin::new(&mut **inner).start_send(pkt) {
                     warn!("Keepalive start_send failed: {}", e);
+                    note_send_end(counters, &e);
                     *send_state = KeepAliveSendState::Idle;
                     return Poll::Ready(());
                 }
 
                 match Pin::new(&mut **inner).poll_flush(cx) {
                     Poll::Ready(Ok(())) => {
-                        trace!("Keepalive sent");
+                        trace!(target: STATS_LOG_TARGET, "Keepalive sent");
                         *sent_at = Some(Instant::now());
                         if let Some(c) = counters {
                             c.probes_sent.fetch_add(1, Ordering::Relaxed);
@@ -236,6 +274,7 @@ fn flush_send_state(
                     }
                     Poll::Ready(Err(e)) => {
                         warn!("Keepalive poll_flush failed: {}", e);
+                        note_send_end(counters, &e);
                         *send_state = KeepAliveSendState::Idle;
                         return Poll::Ready(());
                     }
@@ -269,6 +308,10 @@ fn is_icmp_echo_reply(pkt: &[u8], expected_id: u16) -> bool {
 /// - **Periodic** (share/server side): timer-based pings when idle, recv_timeout for dead peer.
 /// - **Adaptive** (client/use side): externally controlled via atomic knob. On-demand probing
 ///   that activates when traffic resumes after an idle gap, or always-on at a configurable interval.
+///
+/// Per-probe log lines go to [`STATS_LOG_TARGET`] (the record's samples count
+/// the probes); state transitions — dormant, probing, rescue, dead — keep
+/// this module's own target.
 pub struct KeepAliveTransport {
     inner: IpTransport,
     cfg: KeepAliveConfig,
@@ -347,10 +390,10 @@ impl KeepAliveTransport {
                             .active_window
                             .is_some_and(|w| Instant::now().duration_since(*last_inbound) > w);
                         if quiet {
-                            trace!("Keepalive: periodic ping suppressed (peer quiet)");
+                            trace!(target: STATS_LOG_TARGET, "Keepalive: periodic ping suppressed (peer quiet)");
                         } else {
                             let pkt = build_icmp_echo(&self.cfg, &mut self.seq);
-                            debug!("Keepalive: periodic ping (seq={})", self.seq);
+                            debug!(target: STATS_LOG_TARGET, "Keepalive: periodic ping (seq={})", self.seq);
                             self.send_state = KeepAliveSendState::Sending(pkt);
                         }
                     }
@@ -425,7 +468,7 @@ impl KeepAliveTransport {
                             if let Poll::Ready(()) = ping_timer.as_mut().poll(cx) {
                                 let interval = std::time::Duration::from_secs(knob_val);
                                 let pkt = build_icmp_echo(&self.cfg, &mut self.seq);
-                                debug!("Keepalive: ping timer fired, sending ICMP echo");
+                                debug!(target: STATS_LOG_TARGET, "Keepalive: ping timer fired, sending ICMP echo");
                                 self.send_state = KeepAliveSendState::Sending(pkt);
                                 ping_timer.as_mut().reset(Instant::now() + interval);
                                 response_deadline
@@ -516,6 +559,16 @@ impl KeepAliveTransport {
     fn check_dead(&mut self, cx: &mut Context<'_>) -> Option<Poll<Option<io::Result<Vec<u8>>>>> {
         let recorder = self.cfg.recorder.clone();
         let inbound_grace = self.cfg.inbound_grace;
+        let counters = self.cfg.counters.clone();
+        let on_dead = self.cfg.on_dead.clone();
+        let declare_dead = |detail: String| {
+            if let Some(c) = counters.as_ref() {
+                c.note_end(|| Fault::new(Reason::KeepaliveTimeout, detail));
+            }
+            if let Some(on_dead) = on_dead.as_ref() {
+                on_dead();
+            }
+        };
         match &mut self.mode_state {
             ModeState::Periodic {
                 recv_timer,
@@ -525,19 +578,18 @@ impl KeepAliveTransport {
                 if let Some(rt) = recv_timer.as_mut() {
                     match rt.as_mut().poll(cx) {
                         Poll::Ready(_) => {
-                            warn!(
-                                "No inbound traffic for {:?}, peer appears dead",
-                                recv_timeout
-                            );
+                            // The timer exists only when the timeout does.
+                            let silent = recv_timeout.unwrap_or_default();
+                            warn!("No inbound traffic for {silent:?}, peer appears dead");
                             // Nobody else can see this: a tunnel killed by
                             // silence and one killed by an error look
                             // identical from the outside.
+                            let detail = format!("nothing inbound for {silent:?}");
                             if let Some(rec) = recorder.as_ref() {
-                                rec.mark(StepKind::Liveness).fail(
-                                    Reason::KeepaliveTimeout,
-                                    format!("nothing inbound for {recv_timeout:?}"),
-                                );
+                                rec.mark(StepKind::Liveness)
+                                    .fail(Reason::KeepaliveTimeout, detail.clone());
                             }
+                            declare_dead(detail);
                             Some(Poll::Ready(None))
                         }
                         Poll::Pending => None,
@@ -556,6 +608,7 @@ impl KeepAliveTransport {
                             // Connection not yet proven alive — keep probing but don't
                             // declare dead. The relay handshake may still be in progress.
                             debug!(
+                                target: STATS_LOG_TARGET,
                                 "Keepalive: response deadline fired but no inbound yet, waiting"
                             );
                             response_deadline
@@ -582,14 +635,14 @@ impl KeepAliveTransport {
                                     "Keepalive: peer dead (no response to rescue ping, no inbound for {:?})",
                                     inbound_grace
                                 );
+                                let detail = format!(
+                                    "no answer to the rescue probe, nothing inbound for {inbound_grace:?}"
+                                );
                                 if let Some(rec) = recorder.as_ref() {
-                                    rec.mark(StepKind::Liveness).fail(
-                                        Reason::KeepaliveTimeout,
-                                        format!(
-                                            "no answer to the rescue probe, nothing inbound for {inbound_grace:?}"
-                                        ),
-                                    );
+                                    rec.mark(StepKind::Liveness)
+                                        .fail(Reason::KeepaliveTimeout, detail.clone());
                                 }
+                                declare_dead(detail);
                                 return Some(Poll::Ready(None));
                             }
                         } else {
@@ -620,9 +673,9 @@ impl Stream for KeepAliveTransport {
             Poll::Ready(Some(Ok(pkt))) => {
                 let reply = is_icmp_echo_reply(&pkt, this.cfg.icmp_id);
                 if reply {
-                    debug!("Keepalive: received ICMP echo reply (ping response)");
+                    debug!(target: STATS_LOG_TARGET, "Keepalive: received ICMP echo reply (ping response)");
                 } else {
-                    trace!("Keepalive: inbound packet ({} bytes)", pkt.len());
+                    trace!(target: STATS_LOG_TARGET, "Keepalive: inbound packet ({} bytes)", pkt.len());
                 }
                 if let Some(c) = this.cfg.counters.as_ref() {
                     if reply {
@@ -648,8 +701,36 @@ impl Stream for KeepAliveTransport {
                     Poll::Pending
                 }
             }
-            other => other,
+            // The inner transport ended: keep what ended it for the
+            // session's `session_end`. Its error was classified where it was
+            // born (an `io::Error` made from a `Fault` gives its code back).
+            Poll::Ready(Some(Err(e))) => {
+                if let Some(c) = this.cfg.counters.as_ref() {
+                    c.note_end(|| Fault::from_io(&e));
+                }
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                if let Some(c) = this.cfg.counters.as_ref() {
+                    c.note_end(|| Fault::new(Reason::TransportClosed, "the transport ended"));
+                }
+                Poll::Ready(None)
+            }
         }
+    }
+}
+
+impl KeepAliveTransport {
+    /// A send failed: the inner transport has ended (the session's router
+    /// is gone), and this may be the first anyone hears of it — a send can
+    /// race the stream to the end, and the client's reconnect layer records
+    /// the session's end the moment a send fails. Keep the cause, as the
+    /// stream side would.
+    fn note_send_error<T>(&self, res: Result<T, io::Error>) -> Result<T, io::Error> {
+        if let Err(e) = &res {
+            note_send_end(&self.cfg.counters, e);
+        }
+        res
     }
 }
 
@@ -659,7 +740,9 @@ impl Sink<Vec<u8>> for KeepAliveTransport {
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
         let _ = this.poll_maybe_probe(cx);
-        Pin::new(&mut this.inner).poll_ready(cx)
+        Pin::new(&mut this.inner)
+            .poll_ready(cx)
+            .map(|res| this.note_send_error(res))
     }
 
     fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
@@ -669,13 +752,16 @@ impl Sink<Vec<u8>> for KeepAliveTransport {
             c.tx_bytes.fetch_add(item.len() as u64, Ordering::Relaxed);
         }
         this.on_outbound();
-        Pin::new(&mut this.inner).start_send(item)
+        let res = Pin::new(&mut this.inner).start_send(item);
+        this.note_send_error(res)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
         let _ = this.poll_maybe_probe(cx);
-        Pin::new(&mut this.inner).poll_flush(cx)
+        Pin::new(&mut this.inner)
+            .poll_flush(cx)
+            .map(|res| this.note_send_error(res))
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -834,6 +920,62 @@ mod tests {
             Ok(None) => {}
             other => panic!("expected None (peer dead), got {:?}", other),
         }
+    }
+
+    /// Declaring the peer dead tells the carrier first (so it can close the
+    /// session as dead rather than as an orderly end), and keeps the verdict.
+    #[tokio::test]
+    async fn declaring_the_peer_dead_calls_on_dead() {
+        tokio::time::pause();
+
+        let (local, _remote) = mock_transport_pair();
+        let counters = Arc::new(LinkCounters::default());
+        let deaths = Arc::new(AtomicU64::new(0));
+        let seen = deaths.clone();
+        let cfg = KeepAliveConfig {
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(5),
+                recv_timeout: Some(std::time::Duration::from_secs(15)),
+            },
+            counters: Some(counters.clone()),
+            on_dead: Some(Arc::new(move || {
+                seen.fetch_add(1, Ordering::Relaxed);
+            })),
+            ..Default::default()
+        };
+        let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
+
+        tokio::time::advance(std::time::Duration::from_secs(16)).await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), ka.next()).await;
+        assert!(matches!(result, Ok(None)), "{result:?}");
+        assert_eq!(deaths.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counters.ended_by().map(|f| f.reason),
+            Some(Reason::KeepaliveTimeout)
+        );
+    }
+
+    /// A send that fails is the transport's end, noted at once: the client's
+    /// reconnect layer records the session's end on that failure, before
+    /// anyone polls the stream.
+    #[tokio::test]
+    async fn a_failed_send_is_noted_as_the_end() {
+        let (local, handle) = mock_transport();
+        let counters = Arc::new(LinkCounters::default());
+        let cfg = KeepAliveConfig {
+            counters: Some(counters.clone()),
+            ..Default::default()
+        };
+        let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
+        handle.inject_send_error(io::Error::from(Fault::new(
+            Reason::PeerClosed,
+            "closed by peer (code 0)",
+        )));
+        assert!(ka.send(vec![1, 2, 3]).await.is_err());
+        assert_eq!(
+            counters.ended_by().map(|f| f.reason),
+            Some(Reason::PeerClosed)
+        );
     }
 
     #[tokio::test]

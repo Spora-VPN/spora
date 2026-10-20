@@ -13,7 +13,9 @@ This repository contains all the networking functionality, FFIs and a cross-plat
 It is a Rust [workspace](Cargo.toml) (edition 2024). The crates:
 
 - **`spora-core`** — the library everything else builds on. All of the networking lives here: NAT traversal (UDP hole punching), the relay-path and direct QUIC transports, the direct-path upgrade, the userland exit netstack, and the connection log. Its public surface is two calls — `share()` (act as an exit) and `connect(url)` (act as a client).
-- **`spora-cli`** — the cross-platform command-line client; builds to the `spora-cli` binary with `share`, `use <URL>`, `log` and `record` subcommands. The reference front-end for `spora-core`.
+- **`spora-cli`** — the cross-platform command-line client; builds to the `spora-cli` binary with `share`, `use <URL>`, `log`, `record`, `report` and `telemetry` subcommands. The reference front-end for `spora-core`.
+- **`spora-vpn`** — the client-side host integration behind `spora use` (tunnel interface, routes, resolver, MTU, undo-on-exit) on Linux, macOS and Windows, shared with the Windows service.
+- **`spora-service`** — what a client keeps about itself and may send home: the diagnostic log, crash reports, bug-report bundles (`spora report`) and the opt-in telemetry uploader. Linked by the CLI and the FFI, so every client keeps the same files.
 - **`spora-ffi`** — [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings that wrap `spora-core` for the Android app (built as a `cdylib` with generated Kotlin; build outputs land in `jniLibs/` and `out/uniffi/`).
 - **`relay`** — the relay daemon: a "dumb" forwarder that pairs a sharer and client by routing key and splices their traffic without ever seeing inside it (it holds no keys and reads no plaintext). A public relay is built into the client, so running your own is optional. See [`relay/README.md`](relay/README.md) for its carriers, authorization, and session log.
 - **`relay-client`** — the sliver shared by core and relay: the relay wire-protocol constants and the sharer's registration loop.
@@ -69,7 +71,7 @@ See [`relay/README.md`](relay/README.md) for running a relay in production — i
 sudo spora-cli use "https://spora.to/s/…"
 ```
 
-A full VPN client on Linux, macOS and Windows: it brings up the tunnel interface (TUN / `utun` / wintun), routes your traffic through it, sends your DNS to the sharer (whose exit resolves through its own resolvers), follows the path's discovered MTU, and undoes all of it on exit (Ctrl+C / SIGTERM). It needs privileges — root on Linux/macOS, an elevated console on Windows (where `wintun.dll` from [wintun.net](https://www.wintun.net/) must sit next to the executable).
+A full VPN client on Linux, macOS and Windows: it brings up the tunnel interface (TUN / `utun` / wintun), routes your traffic through it, sends your DNS to the sharer (whose exit resolves through its own resolvers), follows the path's discovered MTU, and undoes all of it on exit (Ctrl+C, SIGTERM, or the terminal closing). It needs privileges — root on Linux/macOS, an elevated console on Windows (where `wintun.dll` from [wintun.net](https://www.wintun.net/) must sit next to the executable).
 
 The host's own default route is never replaced: on Linux the tunnel lives in its own routing table behind two policy rules (the wg-quick model), elsewhere as the two half-default routes — and the tunnel's own sockets toward the relay, the STUN servers, and the hole-punched peer are kept on the physical uplink (`SO_MARK` / `IP_BOUND_IF` / `IP_UNICAST_IF`), so nothing loops.
 
@@ -92,7 +94,15 @@ spora-cli record show                 # the newest run, step by step
 spora-cli record export -o run.json   # hand it to someone else
 ```
 
-`list` and `show` take `--json`; `export` is always JSON. This is the thing to send when reporting a connection problem: it says *where* the attempt died rather than only that it did.
+`list` and `show` take `--json`; `export` is always JSON. A record says *where* the attempt died rather than only that it did.
+
+`share` and `use` also keep a diagnostic log and any crash reports beside it (`$XDG_STATE_HOME/spora/log/`, `--no-diag-log` turns it off). To report a problem, bundle all of it into one zip and email it to support@spora.to; this needs no account and no network:
+
+```bash
+spora-cli report --note "what you were doing"   # sudo spora-cli report for a sudo spora-cli use
+```
+
+Runs made with sudo keep their files in root's home (even where sudo keeps your `HOME`, as on macOS), so bundle those with sudo too. Uploading the same records, log and crash reports to Spora in the background is opt-in: `spora-cli telemetry on` (and `off`, `status`). It is off unless you turn it on, and the connection log never uploads.
 
 ### Other overrides
 

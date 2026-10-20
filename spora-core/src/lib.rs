@@ -125,13 +125,51 @@ pub(crate) fn raw_socket_handle(socket: &impl std::os::windows::io::AsRawSocket)
 
 pub struct ConnectResult {
     pub transport: IpTransport,
+    /// Stops the run: cancelling it closes the live session's connection
+    /// (the exit records an orderly leave), ends the background tasks and
+    /// closes the record.
     pub cancel: CancellationToken,
+    /// Stops the run like `cancel` and waits until the stop has reached the
+    /// network — for a process about to exit (see [`RunStopper::stop`]).
+    pub stopper: RunStopper,
     pub keepalive_knob: Arc<AtomicU64>,
     pub keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
     /// This run's diagnostic record (see [`record`]). Disabled — and inert —
     /// unless `Config::record` asked for one. It is closed when `cancel`
     /// fires; a caller that ends the session another way should close it.
     pub record: Recorder,
+}
+
+/// The longest [`RunStopper::stop`] waits for a stopped client's QUIC close
+/// to be handed to the network. It normally takes well under a millisecond;
+/// the bound is for a connection whose socket will not take it.
+pub const STOP_FLUSH_GRACE: Duration = Duration::from_millis(500);
+
+/// Stops a client run and waits until the stop has reached the network.
+/// Cheap to clone; obtained from [`ConnectResult::stopper`].
+#[derive(Clone)]
+pub struct RunStopper {
+    cancel: CancellationToken,
+    /// Cancelled once the run's closing is done.
+    closed: CancellationToken,
+}
+
+impl RunStopper {
+    /// Stop the run — exactly what cancelling [`ConnectResult::cancel`]
+    /// does — and wait until it has finished closing: the record closed and
+    /// the live session's QUIC close handed to the network (at most
+    /// [`STOP_FLUSH_GRACE`] spent on that). A process that is about to exit
+    /// awaits this before its runtime goes: dropped too early, the runtime
+    /// takes the connection's driver with it before the close is sent, the
+    /// exit hears nothing, and its keepalive declares the session dead 30 s
+    /// later — a failure in its record, for a client that left on purpose.
+    /// Best called while the transport is still held: dropping it first
+    /// closes the connection too, but only this close is watched until it
+    /// has gone out.
+    pub async fn stop(&self) {
+        self.cancel.cancel();
+        self.closed.cancelled().await;
+    }
 }
 
 /// Every protocol interval/timeout that used to be a hardcoded constant.
@@ -153,8 +191,14 @@ pub struct Timings {
     pub quic_keep_alive: Duration,
     /// `ReconnectTransport` sleep after a failed dial.
     pub reconnect_delay: Duration,
-    /// Initiator retry delay after a failed direct-upgrade attempt.
+    /// Initiator wait after a failed direct-upgrade attempt — the first wait
+    /// of a streak of consecutive failures. Each further failure doubles it,
+    /// up to `upgrade_retry_max`. The streak is per session (a reconnect
+    /// starts over) and a wake from dormancy (keepalive knob 0 -> >0) starts
+    /// it over too.
     pub upgrade_retry_delay: Duration,
+    /// Cap on the doubling initiator retry wait (see `upgrade_retry_delay`).
+    pub upgrade_retry_max: Duration,
     /// How long the transport router holds the current transport's death
     /// waiting for an in-flight direct-upgrade swap before propagating it
     /// (see `transport::upgradable`). Must cover the responder's conclusion
@@ -192,6 +236,7 @@ impl Default for Timings {
             quic_keep_alive: Duration::from_secs(10),
             reconnect_delay: transport::RECONNECT_DELAY, // 5s
             upgrade_retry_delay: Duration::from_secs(15),
+            upgrade_retry_max: Duration::from_secs(5 * 60),
             upgrade_rescue_grace: Duration::from_secs(2),
             punch_phase_timeout: Duration::from_secs(5),
             punch_send_interval: Duration::from_millis(300),
@@ -324,6 +369,18 @@ impl Default for Config {
     }
 }
 
+/// Log target of every line that names one of a client's flows (its source or
+/// destination address). Such lines keep their levels on stderr and logcat,
+/// but the diagnostic log file never keeps this target: per-flow destinations
+/// belong to the connection log, which never leaves the sharer's machine.
+pub const FLOW_LOG_TARGET: &str = "spora_core::flow";
+
+/// Log target of periodic per-connection statistics and per-probe lines.
+/// The diagnostic log file drops this target: the connection record's
+/// samples already carry these numbers, at a cadence that keeps the file's
+/// history measured in days rather than hours.
+pub const STATS_LOG_TARGET: &str = "spora_core::stats";
+
 /// Built-in STUN fallback order. The first four answered from the Russian
 /// field-lab node when selected; Google remains last for networks where it is
 /// reachable. Provider diversity precedes Cloudflare's alternate port.
@@ -346,6 +403,11 @@ pub struct ShareSession {
     pub url: Url,
     pub cancel: CancellationToken,
     pub task: JoinHandle<()>,
+    /// This run's diagnostic record (see [`record`]), e.g. for reporting
+    /// network changes into it. Disabled — and inert — unless
+    /// `Config::record` asked for one. The share loop closes it however the
+    /// share ends.
+    pub record: Recorder,
 }
 
 impl ShareSession {
@@ -521,6 +583,7 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     let cancel_child = cancel.clone();
     let config_for_loop = config.clone();
     let identity_for_loop = identity.clone();
+    let record = rec.clone();
     let task = tokio::spawn(run_share_loop(
         listener,
         listener_ctx,
@@ -532,16 +595,32 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
         rec,
     ));
 
-    Ok(ShareSession { url, cancel, task })
+    Ok(ShareSession {
+        url,
+        cancel,
+        task,
+        record,
+    })
 }
 
 /// Closes the exit's record however `run_share_loop` ends — including the
-/// endings nobody planned.
-struct ShareRecordGuard(Recorder);
+/// endings nobody planned. `stop` is the share's own token: cancelled, the
+/// share was stopped; not cancelled, the loop ended on its own or its task
+/// was dropped — which, when the process panicked, is the program failing
+/// rather than anyone shutting it down.
+struct ShareRecordGuard {
+    rec: Recorder,
+    stop: CancellationToken,
+}
 
 impl Drop for ShareRecordGuard {
     fn drop(&mut self) {
-        self.0.close_shutdown(Some(Reason::LocalShutdown));
+        let reason = if !self.stop.is_cancelled() && record::crashing() {
+            Reason::Crashed
+        } else {
+            Reason::LocalShutdown
+        };
+        self.rec.close_shutdown(Some(reason));
     }
 }
 
@@ -1145,7 +1224,12 @@ async fn run_share_loop(
     // Any exit from this loop ends the run, so the record gets its ending
     // here — including the exits nobody planned (endpoint death, a panic in
     // a hook), which is when having one matters most.
-    let _record_guard = ShareRecordGuard(rec.clone());
+    // Declared after `_cancel_guard`, so dropped first: the token still says
+    // whether anyone stopped the share.
+    let _record_guard = ShareRecordGuard {
+        rec: rec.clone(),
+        stop: cancel.clone(),
+    };
     let secret = identity.secret;
     let mut tunnel_cancel: Option<CancellationToken> = None;
     let mut iteration: u32 = 0;
@@ -1368,6 +1452,7 @@ async fn run_share_loop(
                     identity.clone(),
                     &config,
                     child_cancel,
+                    cancel.clone(),
                     slog,
                     rec.for_session(iteration),
                     path_kind,
@@ -1377,12 +1462,80 @@ async fn run_share_loop(
     }
 }
 
+/// The session's transport as the share's exit (the netstack, or a custom
+/// handler) holds it. When the exit lets go of it while the session was not
+/// cancelled from this end, the exit ended on its own — a handler that
+/// failed or returned, a netstack that stopped, a client it gave up on — and
+/// the client is told the session died (`SessionMeters::close_dead`). That
+/// has to happen here, as the exit drops it: the router dropping the
+/// connection a moment later would close it the orderly way. A client that
+/// closed the session itself already closed the connection, which keeps
+/// that close.
+struct ExitTransport {
+    inner: IpTransport,
+    meters: SessionMeters,
+    /// The session's own token: cancelled when a newer session replaced
+    /// this one or the share stopped — the deliberate ends.
+    session_cancel: CancellationToken,
+}
+
+impl Drop for ExitTransport {
+    fn drop(&mut self) {
+        if !self.session_cancel.is_cancelled() {
+            self.meters.close_dead();
+        }
+    }
+}
+
+impl futures_util::Stream for ExitTransport {
+    type Item = std::io::Result<Vec<u8>>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl futures_util::Sink<Vec<u8>> for ExitTransport {
+    type Error = std::io::Error;
+
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_ready(cx)
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
+        Pin::new(&mut self.inner).start_send(item)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_close(cx)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_responder_tunnel(
     session: carrier::PeerSession,
     identity: Arc<Identity>,
     config: &Config,
     tunnel_cancel: CancellationToken,
+    // The share's own token (`tunnel_cancel`'s parent): cancelled, the
+    // session ended because the share stopped rather than being replaced.
+    share_stop: CancellationToken,
     slog: Option<Arc<SessionLog>>,
     rec: Recorder,
     path_kind: PathKind,
@@ -1405,10 +1558,14 @@ fn spawn_responder_tunnel(
         .path(path_kind)
         .ok();
     let meters = SessionMeters::new(&rec, carrier_kind, path_kind, quic_conn.clone(), fixed_mtu);
-    spawn_sampler(meters.clone(), tunnel_cancel.clone());
 
     let (upgradable, upgrade_sender, router_handle) =
         upgradable_transport(transport, config.timings.upgrade_rescue_grace);
+    spawn_sampler(
+        meters.clone(),
+        tunnel_cancel.clone(),
+        upgrade_sender.ended(),
+    );
     // Share-side keepalive: reactive, not always-on. It pings only while the
     // client is active (recently heard from) and goes quiet once the client
     // goes silent — so a dormant client is never forced to ACK share-side
@@ -1434,13 +1591,17 @@ fn spawn_responder_tunnel(
         active_window: Some(active_window),
         counters: Some(meters.counters.clone()),
         recorder: Some(rec.clone()),
+        on_dead: Some(meters.on_dead()),
         ..Default::default()
     };
     // The meter (Custom exit mode) must ignore the synthetic keepalive pings
     // riding the tunnel; tell it which inner address pair they use.
     let keepalive_pair = (keepalive_cfg.src_ip, keepalive_cfg.dst_ip);
-    let transport: IpTransport =
-        Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
+    let transport: IpTransport = Box::new(ExitTransport {
+        inner: Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg)),
+        meters: meters.clone(),
+        session_cancel: tunnel_cancel.clone(),
+    });
 
     let protector_for_tunnel = config.protector.clone();
     let upgrade_cancel = tunnel_cancel.clone();
@@ -1587,20 +1748,20 @@ fn spawn_responder_tunnel(
         } else {
             "transport_closed"
         };
-        // The two cases the core can actually tell apart here. A cancelled
-        // session was almost always replaced by a newer peer; a closed one
-        // died on its own, and the carrier's own step (if any) says how.
-        rec.mark(StepKind::SessionEnd)
-            .carrier(carrier_kind)
-            .path(meters.path.get())
-            .fail(
-                if end_cancel.is_cancelled() {
-                    Reason::Replaced
-                } else {
-                    Reason::TransportClosed
-                },
-                reason,
-            );
+        if end_cancel.is_cancelled() {
+            // Cancelled from this end: a newer peer took its place, or the
+            // share stopped (the run's own token) — either way the ordinary
+            // end of a session. (A stop's step usually lands after the run's
+            // close, and so is not recorded at all.)
+            if share_stop.is_cancelled() {
+                meters.record_local_end(Reason::LocalShutdown, "the share stopped");
+            } else {
+                meters.record_local_end(Reason::Replaced, "a newer session took its place");
+            }
+        } else {
+            // It ended by itself: the client closed it, or it died.
+            meters.record_end();
+        }
         if let Some(sl) = &slog {
             sl.end(reason);
         }
@@ -1664,6 +1825,10 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     let keepalive_knob = Arc::new(AtomicU64::new(0));
     let keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>> =
         Arc::new(std::sync::Mutex::new(None));
+    // The session up right now, if any: whoever sees it end — its transport
+    // dying under the reconnect layer, or the caller stopping — takes it out
+    // and records its `session_end`, once.
+    let live_session: SessionSlot = Arc::new(std::sync::Mutex::new(None));
 
     let initial = match dial_relays(
         &relay_addrs,
@@ -1673,6 +1838,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         keepalive_knob.clone(),
         keepalive_waker.clone(),
         &rec.for_cycle(0),
+        &live_session,
     )
     .await
     {
@@ -1698,6 +1864,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     // what a failed lookup falls back to.
     let known_relays = Arc::new(std::sync::Mutex::new(relay_addrs.clone()));
     let dialer_rec = rec.clone();
+    let dialer_session = live_session.clone();
     // Which re-dial cycle a step belongs to. Without it, forty reconnects in
     // an hour are forty indistinguishable piles of steps.
     let cycles = Arc::new(AtomicU64::new(0));
@@ -1710,6 +1877,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         let known = known_relays.clone();
         let cycle = cycles.fetch_add(1, Ordering::Relaxed) + 1;
         let rec = dialer_rec.for_cycle(cycle as u32);
+        let session = dialer_session.clone();
         Box::pin(async move {
             emit(&config.event_hook, TunnelEvent::Reconnecting);
             rec.mark(StepKind::Reconnect).ok();
@@ -1719,7 +1887,10 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
             // task rather than a blocking pool thread — the network namespace
             // (and any per-thread resolver state) belongs to this thread.
             let relays = resolve_for_dial(&token.relays, &known, &rec);
-            let result = dial_relays(&relays, &token, &config, cancel, knob, waker, &rec).await;
+            let result = dial_relays(
+                &relays, &token, &config, cancel, knob, waker, &rec, &session,
+            )
+            .await;
             if result.is_ok() {
                 emit(&config.event_hook, TunnelEvent::Reconnected);
             }
@@ -1727,24 +1898,65 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         })
     });
 
-    let transport = Box::new(ReconnectTransport::new(
-        initial,
-        dialer,
-        config.timings.reconnect_delay,
-        Some((keepalive_knob.clone(), keepalive_waker.clone())),
-    ));
+    // A session that ends by itself — the sharer closed it (stopped, or
+    // took another client), or it died — says how at the moment the
+    // reconnect layer sees it go, ahead of the redial it starts. One that
+    // ends because the caller stopped is the closer's below.
+    let dying_session = live_session.clone();
+    let dying_cancel = cancel.clone();
+    let on_death: transport::DeathHook = Box::new(move || {
+        if dying_cancel.is_cancelled() {
+            return;
+        }
+        let ended = dying_session.lock().ok().and_then(|mut s| s.take());
+        if let Some(meters) = ended {
+            meters.record_end();
+            // Before the reconnect layer drops the transport, whose drop
+            // would close the connection as an orderly end.
+            meters.close_dead();
+        }
+    });
+    let transport = Box::new(
+        ReconnectTransport::new(
+            initial,
+            dialer,
+            config.timings.reconnect_delay,
+            Some((keepalive_knob.clone(), keepalive_waker.clone())),
+        )
+        .with_death_hook(on_death),
+    );
     // The record outlives the call: it is closed when the caller cancels, so
-    // a session that runs for an hour still gets an ending.
+    // a session that runs for an hour still gets an ending. The live
+    // session's connection is closed right then too, not whenever the caller
+    // gets round to dropping the transport: a process that exits after
+    // stopping may never get that far with its runtime still running, and
+    // the exit would hear nothing until its keepalive gave up on us.
     let closing = rec.clone();
     let closing_cancel = cancel.clone();
+    let closed = CancellationToken::new();
+    let closed_guard = closed.clone().drop_guard();
     tokio::spawn(async move {
+        // However this task ends — done, or dropped with the runtime — a
+        // `RunStopper::stop` waiting on it is released.
+        let _closed = closed_guard;
         closing_cancel.cancelled().await;
-        closing.mark(StepKind::SessionEnd).ok();
+        let ended = live_session.lock().ok().and_then(|mut s| s.take());
+        let conn = ended.as_ref().and_then(SessionMeters::current_quic);
+        if let Some(meters) = ended {
+            meters.record_local_end(Reason::LocalShutdown, "the tunnel was stopped");
+        }
         closing.close_shutdown(Some(Reason::LocalShutdown));
+        if let Some(conn) = conn {
+            transport::quic::close_and_flush(&conn, b"client stopped", STOP_FLUSH_GRACE).await;
+        }
     });
 
     Ok(ConnectResult {
         transport,
+        stopper: RunStopper {
+            cancel: cancel.clone(),
+            closed,
+        },
         cancel,
         keepalive_knob,
         keepalive_waker,
@@ -1807,6 +2019,7 @@ async fn dial_relays(
     keepalive_knob: Arc<AtomicU64>,
     keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
     rec: &Recorder,
+    session: &SessionSlot,
 ) -> Result<IpTransport, Fault> {
     let mut last_err: Option<Fault> = None;
     for &(relay_addr, protocol) in relay_addrs {
@@ -1827,6 +2040,7 @@ async fn dial_relays(
             keepalive_knob.clone(),
             keepalive_waker.clone(),
             rec,
+            session,
         );
         match tokio::time::timeout(config.timings.relay_dial_timeout, attempt).await {
             Ok(Ok(transport)) => {
@@ -1868,6 +2082,7 @@ async fn dial_initiator(
     keepalive_knob: Arc<AtomicU64>,
     keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
     rec: &Recorder,
+    live_session: &SessionSlot,
 ) -> Result<IpTransport, Fault> {
     // Select the client-side dialer for this endpoint's protocol. The returned
     // session is end-to-end authenticated (routing-key pinned + secret) whatever
@@ -1920,10 +2135,15 @@ async fn dial_initiator(
         .path(path_kind)
         .ok();
     let meters = SessionMeters::new(rec, carrier_kind, path_kind, quic_conn.clone(), fixed_mtu);
-    spawn_sampler(meters.clone(), cancel.clone());
+    if let Ok(mut live) = live_session.lock() {
+        *live = Some(meters.clone());
+    }
 
     let (upgradable, upgrade_sender, router_handle) =
         upgradable_transport(transport, config.timings.upgrade_rescue_grace);
+    // Per session, not per run: `cancel` is the run's token, and this runs
+    // again on every redial.
+    spawn_sampler(meters.clone(), cancel.clone(), upgrade_sender.ended());
     let upgrade_knob = keepalive_knob.clone();
     let keepalive_cfg = KeepAliveConfig {
         mode: KeepAliveMode::Adaptive {
@@ -1935,6 +2155,7 @@ async fn dial_initiator(
         inbound_grace: config.timings.keepalive_inbound_grace,
         counters: Some(meters.counters.clone()),
         recorder: Some(rec.clone()),
+        on_dead: Some(meters.on_dead()),
         ..Default::default()
     };
     let transport: IpTransport =
@@ -2112,6 +2333,9 @@ pub(crate) struct SessionMeters {
     fixed_mtu: Option<u16>,
 }
 
+/// The client's session that is up right now (see `connect`).
+type SessionSlot = Arc<std::sync::Mutex<Option<SessionMeters>>>;
+
 impl SessionMeters {
     fn new(
         rec: &Recorder,
@@ -2137,6 +2361,67 @@ impl SessionMeters {
         if let Ok(mut slot) = self.quic.lock() {
             *slot = quic;
         }
+    }
+
+    /// The session's QUIC connection right now (after an upgrade, the direct
+    /// one); `None` on a carrier without one.
+    fn current_quic(&self) -> Option<Connection> {
+        self.quic.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// This end found the session dead: tell the peer so over its current
+    /// connection (`transport::quic::SESSION_DEAD_CODE`), ahead of the
+    /// orderly close the transport's drop would send — which the peer would
+    /// record as an ordinary end. Called on every failure path that ends a
+    /// session: the keepalive giving up (both roles), the client's reconnect
+    /// layer seeing its transport die, an exit that stopped on its own. A
+    /// connection already closed — the peer's own close, an idle timeout —
+    /// keeps the close it had.
+    fn close_dead(&self) {
+        if let Some(conn) = self.current_quic() {
+            transport::quic::close_dead(&conn);
+        }
+    }
+
+    /// The keepalive layer's `on_dead` for this session.
+    fn on_dead(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let meters = self.clone();
+        Arc::new(move || meters.close_dead())
+    }
+
+    /// Record this session's `session_end`, for a session that ended by
+    /// itself (not cancelled from this end), with what ended it as the
+    /// keepalive layer saw it (see `LinkCounters::ended_by`): the QUIC close
+    /// reason, its own `keepalive_timeout`, a stream error's code. A peer's
+    /// deliberate close is the ordinary end of a session, so it concludes
+    /// `ok` (`peer_closed`); the rest are failures — among them a peer that
+    /// closed the session because it died on its side (`close_dead`), and
+    /// `transport_closed` when nothing better is known (an nz or TCP stream
+    /// that just ended, an exit handler that returned on its own).
+    fn record_end(&self) {
+        let fault = self
+            .counters
+            .ended_by()
+            .unwrap_or_else(|| Fault::new(Reason::TransportClosed, "the transport closed"));
+        let step = self.end_step();
+        if fault.reason == Reason::PeerClosed {
+            step.ok_because(fault.reason, fault.detail);
+        } else {
+            step.fail_with(&fault);
+        }
+    }
+
+    /// Record this session's `session_end` for a session this end ended —
+    /// replaced, or stopped — which is an ordinary end: `ok`, with `why`.
+    fn record_local_end(&self, why: Reason, detail: &str) {
+        self.end_step().ok_because(why, detail);
+    }
+
+    fn end_step(&self) -> record::StepHandle {
+        self.rec
+            .mark(StepKind::SessionEnd)
+            .carrier(self.carrier)
+            .path(self.path.get())
     }
 
     fn take_sample(&self) {
@@ -2185,18 +2470,28 @@ impl SessionMeters {
     }
 }
 
-/// Sample this session until it is cancelled. Cheap: a few atomics and one
+/// Sample this session until it ends — its router stops (`ended`, see
+/// [`UpgradeSender::ended`]) or `cancel` fires — and meanwhile count its
+/// traffic toward the run's closing total. Cheap: a few atomics and one
 /// `stats()` call per interval.
-fn spawn_sampler(meters: SessionMeters, cancel: CancellationToken) {
-    let interval = meters.rec.sample_interval();
-    if !meters.rec.is_enabled() || interval.is_zero() {
+///
+/// Ending with the session, not the run, matters on the client: every
+/// redial builds a new session, and a sampler that lived as long as the run
+/// would go on sampling (and holding the connection of) each dead one.
+fn spawn_sampler(meters: SessionMeters, cancel: CancellationToken, ended: CancellationToken) {
+    if !meters.rec.is_enabled() {
         return;
     }
+    let interval = meters.rec.sample_interval();
+    let traffic = meters.rec.count_traffic(meters.counters.clone());
     tokio::spawn(async move {
+        // Dropped when the session ends, folding its final figures in.
+        let _traffic = traffic;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(interval) => meters.take_sample(),
+                _ = ended.cancelled() => break,
+                _ = tokio::time::sleep(interval), if !interval.is_zero() => meters.take_sample(),
             }
         }
     });
@@ -2271,6 +2566,189 @@ fn neg_err(e: TunnelError) -> DirectError {
     }
 }
 
+/// The initiator's wait between failed direct-upgrade attempts: `base`
+/// (`Timings::upgrade_retry_delay`) after the first failure of a streak,
+/// doubled for each further consecutive failure, never more than `max`
+/// (`Timings::upgrade_retry_max`; a cap below `base` wins). One per session,
+/// so a reconnect starts over; a wake from dormancy [`reset`]s it, wherever
+/// the wake is seen (see [`UpgradePacing`]).
+///
+/// A path that has refused to punch a few times in a row is unlikely to
+/// start punching on the next try, and each try is STUN queries, a punch
+/// burst and a record entry — so the attempts thin out instead of firing
+/// every 15 s for the life of the session.
+///
+/// [`reset`]: UpgradeBackoff::reset
+#[derive(Debug)]
+struct UpgradeBackoff {
+    base: Duration,
+    max: Duration,
+    /// Consecutive failed attempts since the streak (re)started.
+    failures: u32,
+}
+
+impl UpgradeBackoff {
+    fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            base,
+            max,
+            failures: 0,
+        }
+    }
+
+    /// Count a failed attempt and return the wait before the next one.
+    fn failed(&mut self) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        // 2^31 is far past any cap; stopping there keeps the shift defined.
+        let doublings = (self.failures - 1).min(31);
+        self.base.saturating_mul(1u32 << doublings).min(self.max)
+    }
+
+    /// The wait the first failure of a streak gets.
+    fn first_wait(&self) -> Duration {
+        self.base.min(self.max)
+    }
+
+    /// Start the streak over.
+    fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
+
+/// Failed direct-upgrade attempts the initiator makes while the application
+/// is dormant before it parks until a wake.
+const MAX_DORMANT_UPGRADE_ATTEMPTS: u32 = 3;
+
+/// The initiator's pacing between direct-upgrade attempts: the backoff
+/// streak, and the dormancy bookkeeping around it. A wake — the keepalive
+/// knob going from 0 to above it — starts the streak over and counts dormant
+/// attempts afresh wherever it is seen: before an attempt, at the end of one
+/// that began dormant, in the dormant park, or during the retry wait
+/// ([`wait_before_retry`]).
+#[derive(Debug)]
+struct UpgradePacing {
+    backoff: UpgradeBackoff,
+    /// Attempts that failed while dormant since the last wake.
+    dormant_attempts: u32,
+    /// The knob read above 0 when the current attempt began.
+    was_active: bool,
+}
+
+impl UpgradePacing {
+    fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            backoff: UpgradeBackoff::new(base, max),
+            dormant_attempts: 0,
+            was_active: false,
+        }
+    }
+
+    /// Before an attempt, with the knob as it reads now: whether to park
+    /// until a wake instead (dormant, and out of dormant attempts).
+    fn before_attempt(&mut self, knob: u64) -> bool {
+        let active = knob > 0;
+        if active && !self.was_active {
+            // Awake (or just started).
+            self.woke();
+        }
+        self.was_active = active;
+        !active && self.dormant_attempts >= MAX_DORMANT_UPGRADE_ATTEMPTS
+    }
+
+    /// An attempt failed, with the knob as it reads now (`None`: there is
+    /// none, so never dormant): the wait before the next attempt.
+    fn after_failure(&mut self, knob: Option<u64>) -> Duration {
+        match knob {
+            Some(0) => self.dormant_attempts += 1,
+            // The attempt began dormant and the application woke while it
+            // ran: a wake like any other, so the next wait is the streak's
+            // first — not the doubled one the dormant streak had reached.
+            Some(_) if !self.was_active => {
+                info!("Direct upgrade: woke during the attempt; backoff reset");
+                self.woke();
+            }
+            _ => {}
+        }
+        self.backoff.failed()
+    }
+
+    /// Awake: the streak starts over and dormant attempts count afresh.
+    fn woke(&mut self) {
+        self.dormant_attempts = 0;
+        self.was_active = true;
+        self.backoff.reset();
+    }
+}
+
+/// How often the initiator's retry wait looks at the keepalive knob for a
+/// wake from dormancy (the same cadence the dormant park polls at).
+const UPGRADE_KNOB_POLL: Duration = Duration::from_secs(5);
+
+/// How an initiator's retry wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryWaitEnd {
+    /// Time for the next attempt. `woke`: the application woke from
+    /// dormancy during the wait, and `backoff` has started over.
+    Elapsed { woke: bool },
+    /// The run was cancelled or the session ended: stop trying.
+    Stop,
+}
+
+/// Wait `wait` before the next direct-upgrade attempt. `dormant`: the
+/// keepalive knob read 0 when the failed attempt concluded. (A wake during
+/// the attempt itself was already counted when it concluded, by
+/// [`UpgradePacing::after_failure`].)
+///
+/// The wait can be minutes, so it watches for the two things that change the
+/// plan: the session ending (no point lingering on a dead one) and a wake from
+/// dormancy (`knob` seen at 0, then above it), which starts the streak over —
+/// `backoff` is reset and the wait in progress shrinks to the streak's first
+/// wait, counted from when it began, much as the dormant park acts on a wake
+/// at once.
+async fn wait_before_retry(
+    wait: Duration,
+    dormant: bool,
+    backoff: &mut UpgradeBackoff,
+    knob: Option<&AtomicU64>,
+    cancel: &CancellationToken,
+    upgrade_sender: &UpgradeSender,
+) -> RetryWaitEnd {
+    let started = tokio::time::Instant::now();
+    let mut deadline = started + wait;
+    let mut seen_dormant = dormant;
+    let mut woke = false;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return RetryWaitEnd::Elapsed { woke };
+        }
+        let tick = (deadline - now).min(UPGRADE_KNOB_POLL);
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("Direct upgrade cancelled during retry wait");
+                return RetryWaitEnd::Stop;
+            }
+            _ = upgrade_sender.closed() => {
+                info!("Upgrade channel closed during retry wait, stopping direct upgrade");
+                return RetryWaitEnd::Stop;
+            }
+            _ = tokio::time::sleep(tick) => {}
+        }
+        let Some(knob) = knob else {
+            continue;
+        };
+        if knob.load(Ordering::Relaxed) == 0 {
+            seen_dormant = true;
+        } else if seen_dormant {
+            seen_dormant = false;
+            woke = true;
+            backoff.reset();
+            deadline = deadline.min(started + backoff.first_wait());
+            info!("Direct upgrade: woke during the retry wait; backoff reset");
+        }
+    }
+}
+
 /// Background task: repeatedly try to establish a direct UDP connection.
 /// On success, send the new transport via `upgrade_sender`.
 ///
@@ -2300,10 +2778,8 @@ pub(crate) async fn try_direct_upgrade(
     // continues across the swap.
     meters: SessionMeters,
 ) {
-    const MAX_DORMANT_ATTEMPTS: u32 = 3;
-    let mut dormant_attempts: u32 = 0;
-    let mut was_active = false;
     let initiator = matches!(role, DirectRole::Initiator { .. });
+    let mut pacing = UpgradePacing::new(timings.upgrade_retry_delay, timings.upgrade_retry_max);
 
     loop {
         if cancel.is_cancelled() {
@@ -2315,29 +2791,23 @@ pub(crate) async fn try_direct_upgrade(
             return;
         }
 
-        if initiator && let Some(ref knob) = keepalive_knob {
-            let knob_val = knob.load(std::sync::atomic::Ordering::Relaxed);
-            let active = knob_val > 0;
-            if active && !was_active {
-                dormant_attempts = 0;
-            }
-            was_active = active;
-            if !active && dormant_attempts >= MAX_DORMANT_ATTEMPTS {
-                info!("Direct upgrade: dormant attempts exhausted, waiting for screen-on");
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => { info!("Direct upgrade cancelled while parked"); return; }
-                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-                    }
-                    if upgrade_sender.is_closed() {
-                        info!("Upgrade channel closed while parked");
-                        return;
-                    }
-                    if knob.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                        dormant_attempts = 0;
-                        was_active = true;
-                        break;
-                    }
+        if initiator
+            && let Some(ref knob) = keepalive_knob
+            && pacing.before_attempt(knob.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            info!("Direct upgrade: dormant attempts exhausted, waiting for screen-on");
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => { info!("Direct upgrade cancelled while parked"); return; }
+                    _ = tokio::time::sleep(UPGRADE_KNOB_POLL) => {}
+                }
+                if upgrade_sender.is_closed() {
+                    info!("Upgrade channel closed while parked");
+                    return;
+                }
+                if knob.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                    pacing.woke();
+                    break;
                 }
             }
         }
@@ -2471,15 +2941,24 @@ pub(crate) async fn try_direct_upgrade(
                     return;
                 }
                 if initiator {
-                    if let Some(ref knob) = keepalive_knob
-                        && knob.load(std::sync::atomic::Ordering::Relaxed) == 0
+                    let knob = keepalive_knob
+                        .as_ref()
+                        .map(|k| k.load(std::sync::atomic::Ordering::Relaxed));
+                    let wait = pacing.after_failure(knob);
+                    warn!("Retrying in {wait:?}...");
+                    match wait_before_retry(
+                        wait,
+                        knob == Some(0),
+                        &mut pacing.backoff,
+                        keepalive_knob.as_deref(),
+                        &cancel,
+                        &upgrade_sender,
+                    )
+                    .await
                     {
-                        dormant_attempts += 1;
-                    }
-                    warn!("Retrying in {:?}...", timings.upgrade_retry_delay);
-                    tokio::select! {
-                        _ = cancel.cancelled() => { info!("Direct upgrade cancelled during retry wait"); return; }
-                        _ = tokio::time::sleep(timings.upgrade_retry_delay) => {}
+                        RetryWaitEnd::Elapsed { woke: false } => {}
+                        RetryWaitEnd::Elapsed { woke: true } => pacing.woke(),
+                        RetryWaitEnd::Stop => return,
                     }
                 }
             }
@@ -3495,5 +3974,261 @@ mod tests {
             .await
             .expect("responder upgrade task must terminate once the signal channel is closed")
             .unwrap();
+    }
+
+    /// The share run's recorder is handed back, so a platform can report
+    /// network changes into a live share; stopping the share still closes it.
+    #[tokio::test]
+    async fn share_hands_back_its_record() {
+        use crate::record::{NetworkKind, NetworkState, RecordConfig};
+
+        // A relay that never answers: REGISTER is fire-and-forget.
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = relay.local_addr().unwrap().port();
+        let wifi = NetworkState {
+            kind: NetworkKind::Wifi,
+            validated: Some(true),
+        };
+        let config = Config {
+            relays: vec![RelayEndpoint::new("127.0.0.1", relay_port)],
+            dns_forwarder: None,
+            record: Some(RecordConfig::in_memory().with_network(wifi)),
+            ..Config::default()
+        };
+        let session = share(Identity::generate(), config).await.expect("share()");
+        let record = session.record.clone();
+        let cellular = NetworkState {
+            kind: NetworkKind::Cellular,
+            validated: Some(false),
+        };
+        record.network(cellular);
+        session.stop().await;
+
+        let snap = record.snapshot().expect("recording was asked for");
+        assert_eq!(snap.open.role, Role::Exit);
+        assert_eq!(snap.open.network, Some(wifi));
+        let changes: Vec<_> = snap
+            .steps_of(StepKind::Network)
+            .map(|s| s.network)
+            .collect();
+        assert_eq!(changes, vec![Some(cellular)]);
+        let close = snap.close.expect("stopping the share closes its record");
+        assert_eq!(
+            close.reason,
+            Some(Reason::LocalShutdown),
+            "a stop, not a crash"
+        );
+    }
+
+    /// A session's sampler ends with the session — its router stopping — not
+    /// with the run: a client redials into a new session every time the
+    /// tunnel drops, and each dead one must stop being sampled (and held).
+    /// Its traffic still counts toward the run's closing total.
+    #[tokio::test]
+    async fn a_sessions_sampler_ends_with_the_session() {
+        use crate::record::RecordConfig;
+        use crate::transport::mock::mock_transport;
+
+        let cfg = RecordConfig {
+            sample_interval: Duration::from_millis(10),
+            ..RecordConfig::in_memory()
+        };
+        let rec = Recorder::start(&cfg, Role::Client, None, Vec::new(), true);
+        let (mock, _handle) = mock_transport();
+        let (upgradable, upgrade_sender, _router) =
+            upgradable_transport(Box::new(mock), Duration::ZERO);
+        let meters = SessionMeters::new(
+            &rec.for_cycle(0),
+            Carrier::Quic,
+            PathKind::Relay,
+            None,
+            1200,
+        );
+        meters.counters.tx_bytes.fetch_add(500, Ordering::Relaxed);
+        meters.counters.rx_bytes.fetch_add(700, Ordering::Relaxed);
+        let run = CancellationToken::new();
+        spawn_sampler(meters, run.clone(), upgrade_sender.ended());
+        let samples = || rec.snapshot().unwrap().samples.len();
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(samples() > 0, "a live session is sampled");
+        // The session ends: its transport is dropped and the router stops.
+        drop(upgradable);
+        tokio::time::timeout(Duration::from_secs(2), upgrade_sender.ended().cancelled())
+            .await
+            .expect("the router ends with its transport");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let after_end = samples();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(samples(), after_end, "sampled after its session ended");
+        assert!(!run.is_cancelled());
+
+        rec.close(Outcome::ClosedLocally, None, None);
+        let close = rec.snapshot().unwrap().close.unwrap();
+        assert_eq!((close.tx_bytes, close.rx_bytes), (500, 700));
+    }
+
+    #[test]
+    fn upgrade_retry_waits_double_up_to_the_cap() {
+        let secs = Duration::from_secs;
+        let mut backoff = UpgradeBackoff::new(secs(15), secs(300));
+        let waits: Vec<u64> = (0..7).map(|_| backoff.failed().as_secs()).collect();
+        assert_eq!(waits, [15, 30, 60, 120, 240, 300, 300]);
+        // However long the streak, the arithmetic stays at the cap.
+        for _ in 0..100 {
+            backoff.failed();
+        }
+        assert_eq!(backoff.failed(), secs(300));
+        backoff.reset();
+        assert_eq!(backoff.failed(), secs(15), "a reset starts the streak over");
+
+        // A cap below the base wins.
+        let mut capped = UpgradeBackoff::new(secs(15), secs(10));
+        assert_eq!(capped.first_wait(), secs(10));
+        assert_eq!(capped.failed(), secs(10));
+        assert_eq!(capped.failed(), secs(10));
+    }
+
+    /// A live session's upgrade channel, for driving `wait_before_retry`: the
+    /// session lives while both the transport and the mock's far end do.
+    fn live_upgrade_channel() -> (
+        crate::transport::upgradable::UpgradableTransport,
+        crate::transport::mock::MockTransportHandle,
+        UpgradeSender,
+    ) {
+        let (mock, handle) = crate::transport::mock::mock_transport();
+        let (upgradable, sender, _router) = upgradable_transport(Box::new(mock), Duration::ZERO);
+        (upgradable, handle, sender)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_wait_without_a_wake_runs_its_course() {
+        let (_upgradable, _far_end, sender) = live_upgrade_channel();
+        let knob = AtomicU64::new(10);
+        let mut backoff = UpgradeBackoff::new(Duration::from_secs(15), Duration::from_secs(300));
+        backoff.failed();
+        let wait = backoff.failed(); // 30s
+        let t0 = tokio::time::Instant::now();
+        let end = wait_before_retry(
+            wait,
+            false,
+            &mut backoff,
+            Some(&knob),
+            &CancellationToken::new(),
+            &sender,
+        )
+        .await;
+        assert_eq!(end, RetryWaitEnd::Elapsed { woke: false });
+        assert_eq!(t0.elapsed(), Duration::from_secs(30));
+        assert_eq!(
+            backoff.failed(),
+            Duration::from_secs(60),
+            "the streak goes on"
+        );
+    }
+
+    /// Screen off and on again during a long wait: the wait shrinks to the
+    /// streak's first one (counted from its start) and the streak restarts.
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_during_the_retry_wait_restarts_the_backoff() {
+        let (_upgradable, _far_end, sender) = live_upgrade_channel();
+        let knob = Arc::new(AtomicU64::new(10));
+        let mut backoff = UpgradeBackoff::new(Duration::from_secs(15), Duration::from_secs(300));
+        for _ in 0..4 {
+            backoff.failed();
+        }
+        let wait = backoff.failed(); // 240s
+        let flipper = knob.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            flipper.store(0, Ordering::Relaxed); // dormant
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            flipper.store(10, Ordering::Relaxed); // awake, at 12s
+        });
+        let t0 = tokio::time::Instant::now();
+        let end = wait_before_retry(
+            wait,
+            false,
+            &mut backoff,
+            Some(&knob),
+            &CancellationToken::new(),
+            &sender,
+        )
+        .await;
+        assert_eq!(end, RetryWaitEnd::Elapsed { woke: true });
+        // The knob is read every 5s: dormant seen at 10s, the wake at 15s,
+        // which is already the reset streak's first wait.
+        assert_eq!(t0.elapsed(), Duration::from_secs(15));
+        assert_eq!(backoff.failed(), Duration::from_secs(15));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_wait_ends_with_its_session() {
+        let (upgradable, _far_end, sender) = live_upgrade_channel();
+        let mut backoff = UpgradeBackoff::new(Duration::from_secs(15), Duration::from_secs(300));
+        let wait = backoff.failed();
+        drop(upgradable); // the session's transport is gone: its router stops
+        let t0 = tokio::time::Instant::now();
+        let end = wait_before_retry(
+            wait,
+            false,
+            &mut backoff,
+            None,
+            &CancellationToken::new(),
+            &sender,
+        )
+        .await;
+        assert_eq!(end, RetryWaitEnd::Stop);
+        assert!(t0.elapsed() < wait, "lingered {:?}", t0.elapsed());
+    }
+
+    /// Decision 11's wake, seen where it is easiest to miss: the screen goes
+    /// off, the next attempt begins dormant, and the application wakes while
+    /// that attempt runs. The wait after it is the streak's first, not the
+    /// doubled one the streak had reached.
+    #[test]
+    fn a_wake_during_a_dormant_attempt_restarts_the_streak() {
+        let secs = Duration::from_secs;
+        let mut pacing = UpgradePacing::new(secs(15), secs(300));
+        for want in [15, 30, 60] {
+            assert!(!pacing.before_attempt(10));
+            assert_eq!(pacing.after_failure(Some(10)), secs(want));
+        }
+        assert!(!pacing.before_attempt(0), "the attempt begins dormant");
+        assert_eq!(
+            pacing.after_failure(Some(10)),
+            secs(15),
+            "woken during the attempt: the streak starts over"
+        );
+        assert!(!pacing.before_attempt(10));
+        assert_eq!(pacing.after_failure(Some(10)), secs(30), "and goes on");
+    }
+
+    /// Attempts made while dormant carry the streak on, and after three of
+    /// them the initiator parks; the wake that ends the park starts it over.
+    #[test]
+    fn dormant_attempts_carry_the_streak_and_run_out() {
+        let secs = Duration::from_secs;
+        let mut pacing = UpgradePacing::new(secs(15), secs(300));
+        assert!(!pacing.before_attempt(10));
+        assert_eq!(pacing.after_failure(Some(10)), secs(15));
+        for want in [30, 60, 120] {
+            assert!(!pacing.before_attempt(0));
+            assert_eq!(pacing.after_failure(Some(0)), secs(want));
+        }
+        assert!(pacing.before_attempt(0), "out of dormant attempts: park");
+        pacing.woke(); // the park sees the knob above 0
+        assert!(!pacing.before_attempt(10));
+        assert_eq!(pacing.after_failure(Some(10)), secs(15));
+    }
+
+    /// No knob, no dormancy: nothing ever restarts the streak.
+    #[test]
+    fn without_a_knob_the_streak_only_grows() {
+        let mut pacing = UpgradePacing::new(Duration::from_secs(15), Duration::from_secs(300));
+        let waits: Vec<u64> = (0..4)
+            .map(|_| pacing.after_failure(None).as_secs())
+            .collect();
+        assert_eq!(waits, [15, 30, 60, 120]);
     }
 }

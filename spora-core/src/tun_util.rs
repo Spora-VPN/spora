@@ -1,4 +1,4 @@
-use crate::IpTransport;
+use crate::{FLOW_LOG_TARGET, IpTransport, STATS_LOG_TARGET};
 use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
 use log::{debug, error, info, trace};
@@ -92,6 +92,7 @@ impl TunnelStats {
         let elapsed = self.last_report.elapsed();
         if elapsed.as_secs() >= STATS_INTERVAL_SECS {
             debug!(
+                target: STATS_LOG_TARGET,
                 "Tunnel stats ({}s): rx {} pkts/{} bytes, tx {} pkts/{} bytes",
                 elapsed.as_secs(),
                 self.rx_packets,
@@ -120,7 +121,7 @@ pub async fn start(
             res = transport.next() => {
                 match res {
                     Some(Ok(pkt)) => {
-                        trace!("tunnel ← peer: {}", describe_ip_packet(&pkt));
+                        trace!(target: FLOW_LOG_TARGET, "tunnel ← peer: {}", describe_ip_packet(&pkt));
                         stats.record_rx(pkt.len());
                         // Use write() not write_all(): TUN writes are
                         // packet-atomic — one write() = one IP packet.
@@ -142,7 +143,7 @@ pub async fn start(
             res = tun.read(&mut buffer) => {
                 match res {
                     Ok(n) if n > 0 => {
-                        trace!("tunnel → peer: {}", describe_ip_packet(&buffer[..n]));
+                        trace!(target: FLOW_LOG_TARGET, "tunnel → peer: {}", describe_ip_packet(&buffer[..n]));
                         stats.record_tx(n);
                         if let Err(e) = transport.send(buffer[..n].to_vec()).await {
                             error!("Error sending packet to remote peer: {}", e);
@@ -328,7 +329,7 @@ async fn start_fd_inner(
             res = transport.next() => {
                 match res {
                     Some(Ok(pkt)) => {
-                        trace!("tunnel ← peer: {}", describe_ip_packet(&pkt));
+                        trace!(target: FLOW_LOG_TARGET, "tunnel ← peer: {}", describe_ip_packet(&pkt));
                         stats.record_rx(pkt.len());
                         if tun_write_tx.send(pkt).await.is_err() {
                             info!("TUN writer thread exited.");
@@ -347,7 +348,7 @@ async fn start_fd_inner(
             pkt = tun_read_rx.recv() => {
                 match pkt {
                     Some(data) => {
-                        trace!("tunnel → peer: {}", describe_ip_packet(&data));
+                        trace!(target: FLOW_LOG_TARGET, "tunnel → peer: {}", describe_ip_packet(&data));
                         stats.record_tx(data.len());
                         if let Err(e) = transport.send(data).await {
                             error!("Error sending packet to remote peer: {}", e);

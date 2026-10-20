@@ -81,7 +81,10 @@ through it.
 
 ## Disconnecting
 
-Ctrl+C, SIGTERM, closing the console window on Windows: all of them
-restore routes, resolver, and interface before the process exits. If the
-process is killed outright, the interface disappears with it, and the next
-`spora use` cleans up whatever else was left.
+Ctrl+C, SIGTERM, SIGHUP (the terminal closed, the SSH session dropped),
+closing the console window on Windows: all of them restore routes,
+resolver, and interface before the process exits. They work while
+`spora use` is still connecting too, and stop the attempt there. If the
+process is killed outright (or you press Ctrl+C a third time, which ends
+it at once), the interface disappears with it, and the next `spora use`
+cleans up whatever else was left.

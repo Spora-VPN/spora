@@ -234,7 +234,10 @@ impl Sink<AnyIpPktFrame> for Stack {
 
         let addr_allowed = self.ip_filters.is_allowed(&src_ip, &dst_ip);
         if !addr_allowed {
-            trace!("IP packet {src_ip} -> {dst_ip} (allowed? {addr_allowed}) throwing away",);
+            trace!(
+                target: crate::FLOW_TARGET,
+                "IP packet {src_ip} -> {dst_ip} (allowed? {addr_allowed}) throwing away",
+            );
             return Ok(());
         }
 

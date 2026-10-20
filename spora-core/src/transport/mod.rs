@@ -115,6 +115,9 @@ pub(crate) const RECONNECT_DELAY: std::time::Duration = std::time::Duration::fro
 
 pub(crate) type DialFuture = Pin<Box<dyn Future<Output = io::Result<IpTransport>> + Send>>;
 type Dialer = Box<dyn FnMut() -> DialFuture + Send>;
+/// Called each time the connected transport dies, at that moment — before
+/// the reconnect pause, so whatever it records precedes the redial.
+pub(crate) type DeathHook = Box<dyn FnMut() + Send>;
 
 /// The client's dormancy knob + its wake channel, shared with the keepalive
 /// layer. Knob 0 = dormant (screen off); the reconnect loop parks instead of
@@ -149,6 +152,7 @@ pub struct ReconnectTransport {
     state: ReconnectState,
     delay: std::time::Duration,
     dormancy: Option<Dormancy>,
+    on_death: Option<DeathHook>,
 }
 
 impl ReconnectTransport {
@@ -163,7 +167,22 @@ impl ReconnectTransport {
             state: ReconnectState::Connected(initial),
             delay,
             dormancy,
+            on_death: None,
         }
+    }
+
+    /// Call `hook` each time the connected transport dies.
+    pub(crate) fn with_death_hook(mut self, hook: DeathHook) -> Self {
+        self.on_death = Some(hook);
+        self
+    }
+
+    /// The connected transport died: say so, then pace the redial.
+    fn died(&mut self) {
+        if let Some(hook) = self.on_death.as_mut() {
+            hook();
+        }
+        self.begin_sleep();
     }
 
     fn begin_sleep(&mut self) {
@@ -226,12 +245,12 @@ impl Stream for ReconnectTransport {
                         Poll::Ready(Some(Ok(pkt))) => return Poll::Ready(Some(Ok(pkt))),
                         Poll::Ready(Some(Err(e))) => {
                             warn!("Inner transport error, reconnecting: {}", e);
-                            this.begin_sleep();
+                            this.died();
                             continue;
                         }
                         Poll::Ready(None) => {
                             info!("Inner transport stream ended, reconnecting");
-                            this.begin_sleep();
+                            this.died();
                             continue;
                         }
                         Poll::Pending => return Poll::Pending,
@@ -292,7 +311,7 @@ impl Sink<Vec<u8>> for ReconnectTransport {
             ReconnectState::Connected(inner) => {
                 if let Err(e) = Pin::new(inner).start_send(item) {
                     warn!("start_send failed: {}. Reconnecting...", e);
-                    this.begin_sleep();
+                    this.died();
                 }
                 Ok(())
             }
@@ -308,11 +327,12 @@ impl Sink<Vec<u8>> for ReconnectTransport {
             ReconnectState::Connected(inner) => match Pin::new(inner).poll_flush(cx) {
                 Ready(Err(e)) => {
                     warn!("poll_flush failed: {}. Reconnecting...", e);
-                    // begin_sleep (not begin_dial) so this reconnect path also
-                    // honors the dormancy park + reconnect-delay pacing that
-                    // the Sleeping->dial_or_park transition applies. (Latent:
-                    // the current inner chain never errors on flush/close.)
-                    this.begin_sleep();
+                    // died -> begin_sleep (not begin_dial) so this reconnect
+                    // path also honors the dormancy park + reconnect-delay
+                    // pacing that the Sleeping->dial_or_park transition
+                    // applies. (Latent: the current inner chain never errors
+                    // on flush/close.)
+                    this.died();
                     Ready(Ok(()))
                 }
                 p => p,
@@ -329,7 +349,7 @@ impl Sink<Vec<u8>> for ReconnectTransport {
             ReconnectState::Connected(inner) => match Pin::new(inner).poll_close(cx) {
                 Ready(Err(e)) => {
                     warn!("poll_close failed: {}. Reconnecting...", e);
-                    this.begin_sleep(); // see poll_flush
+                    this.died(); // see poll_flush
                     Ready(Ok(()))
                 }
                 p => p,
@@ -412,6 +432,54 @@ mod tests {
             dial_count.load(Ordering::SeqCst) >= 1,
             "dialer should have been called"
         );
+    }
+
+    /// The death hook hears of each death once, at the death — before the
+    /// paced redial, so what it records comes first.
+    #[tokio::test]
+    async fn death_hook_runs_once_per_death_before_the_redial() {
+        tokio::time::pause();
+        let (local, handle) = mock_transport();
+        handle.close();
+
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let dial_order = order.clone();
+        let handles: Arc<Mutex<Vec<MockTransportHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let handles_clone = handles.clone();
+        let dialer: Dialer = Box::new(move || {
+            let order = dial_order.clone();
+            let handles = handles_clone.clone();
+            Box::pin(async move {
+                order.lock().unwrap().push("dial");
+                let (new_local, new_handle) = mock_transport();
+                handles.lock().unwrap().push(new_handle);
+                Ok(Box::new(new_local) as IpTransport)
+            })
+        });
+        let hook_order = order.clone();
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY, None)
+            .with_death_hook(Box::new(move || hook_order.lock().unwrap().push("death")));
+
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
+        assert_eq!(*order.lock().unwrap(), ["death"]);
+        tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
+        assert_eq!(*order.lock().unwrap(), ["death", "dial"]);
+
+        // The redialled transport dies too: one more death, then one more dial.
+        handles.lock().unwrap().pop().unwrap().close();
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
+        tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
+        assert_eq!(*order.lock().unwrap(), ["death", "dial", "death", "dial"]);
     }
 
     #[tokio::test]

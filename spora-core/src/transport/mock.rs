@@ -12,6 +12,7 @@ pub struct MockTransport {
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
     tx: mpsc::UnboundedSender<Vec<u8>>,
     error_rx: mpsc::UnboundedReceiver<io::Error>,
+    send_error_rx: mpsc::UnboundedReceiver<io::Error>,
 }
 
 /// Handle for controlling a `MockTransport` from tests.
@@ -22,6 +23,7 @@ pub struct MockTransportHandle {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
     error_tx: mpsc::UnboundedSender<io::Error>,
+    send_error_tx: mpsc::UnboundedSender<io::Error>,
 }
 
 impl MockTransportHandle {
@@ -40,6 +42,11 @@ impl MockTransportHandle {
         let _ = self.error_tx.send(err);
     }
 
+    /// Make the transport's next `Sink::start_send` fail with `err`.
+    pub fn inject_send_error(&self, err: io::Error) {
+        let _ = self.send_error_tx.send(err);
+    }
+
     /// Close the transport by dropping the sender, causing the transport's `Stream` to yield `None`.
     pub fn close(self) {
         drop(self.tx);
@@ -51,17 +58,20 @@ pub fn mock_transport() -> (MockTransport, MockTransportHandle) {
     let (handle_tx, transport_rx) = mpsc::unbounded_channel();
     let (transport_tx, handle_rx) = mpsc::unbounded_channel();
     let (error_tx, error_rx) = mpsc::unbounded_channel();
+    let (send_error_tx, send_error_rx) = mpsc::unbounded_channel();
 
     let transport = MockTransport {
         rx: transport_rx,
         tx: transport_tx,
         error_rx,
+        send_error_rx,
     };
 
     let handle = MockTransportHandle {
         tx: handle_tx,
         rx: handle_rx,
         error_tx,
+        send_error_tx,
     };
 
     (transport, handle)
@@ -73,16 +83,20 @@ pub fn mock_transport_pair() -> (MockTransport, MockTransport) {
     let (tx_b, rx_a) = mpsc::unbounded_channel();
     let (_err_tx_a, err_rx_a) = mpsc::unbounded_channel();
     let (_err_tx_b, err_rx_b) = mpsc::unbounded_channel();
+    let (_send_err_tx_a, send_err_rx_a) = mpsc::unbounded_channel();
+    let (_send_err_tx_b, send_err_rx_b) = mpsc::unbounded_channel();
     (
         MockTransport {
             rx: rx_a,
             tx: tx_a,
             error_rx: err_rx_a,
+            send_error_rx: send_err_rx_a,
         },
         MockTransport {
             rx: rx_b,
             tx: tx_b,
             error_rx: err_rx_b,
+            send_error_rx: send_err_rx_b,
         },
     )
 }
@@ -121,7 +135,10 @@ impl Sink<Vec<u8>> for MockTransport {
         Poll::Ready(Ok(()))
     }
 
-    fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
+    fn start_send(mut self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
+        if let Ok(err) = self.send_error_rx.try_recv() {
+            return Err(err);
+        }
         self.tx
             .send(item)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "receiver dropped"))

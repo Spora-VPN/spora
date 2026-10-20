@@ -3,12 +3,38 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use log::{debug, error, info};
+use std::sync::{Arc, Mutex};
+
+use futures_util::{FutureExt, Sink, SinkExt, Stream, StreamExt};
+use log::{debug, info};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use super::IpTransport;
+use crate::record::{Fault, Reason};
+
+/// What ended the router's transport, once it has: the error it forwarded
+/// (classified where it was born — a QUIC close reason gives its code back
+/// through [`Fault::from_io`]) or the transport's end of stream. The first
+/// word wins. The sink side reads it: without it, a send after the router
+/// stopped could only say "router task gone", and whoever counts the
+/// session's end from that send would count a peer's orderly close as a
+/// broken pipe.
+type EndCause = Arc<Mutex<Option<Fault>>>;
+
+fn note_end(end: &EndCause, cause: impl FnOnce() -> Fault) {
+    let mut slot = end.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        *slot = Some(cause());
+    }
+}
+
+/// The transport's stream ended: what the router notes, and what the
+/// keepalive layer notes for the same end seen from the stream side.
+fn stream_ended() -> Fault {
+    Fault::new(Reason::TransportClosed, "the transport ended")
+}
 
 /// How long the router waits for an in-flight upgrade after the inner
 /// transport dies before propagating the failure
@@ -59,6 +85,8 @@ struct UpgradeRequest {
 #[derive(Clone)]
 pub struct UpgradeSender {
     inner: mpsc::UnboundedSender<UpgradeRequest>,
+    /// Cancelled when the router task ends (see [`UpgradeSender::ended`]).
+    ended: CancellationToken,
 }
 
 #[derive(Debug)]
@@ -80,6 +108,14 @@ impl UpgradeSender {
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
+
+    /// A token cancelled when the router task ends — the session's end,
+    /// across any upgrades — for a watcher that must not hold this sender:
+    /// a live sender keeps an upgrade possible, so a dead transport would
+    /// wait out the rescue grace before its death reached anyone.
+    pub fn ended(&self) -> CancellationToken {
+        self.ended.clone()
+    }
 }
 
 /// Create an upgradable transport backed by channel indirection.
@@ -99,18 +135,27 @@ pub fn upgradable_transport(
     let (in_tx, in_rx) = mpsc::unbounded_channel::<io::Result<Vec<u8>>>();
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (upgrade_tx, upgrade_rx) = mpsc::unbounded_channel::<UpgradeRequest>();
+    let ended = CancellationToken::new();
+    // Fires however the router ends: returning, or aborted.
+    let ended_guard = ended.clone().drop_guard();
+    let end: EndCause = Arc::default();
+    let router_end = end.clone();
 
-    let handle = tokio::spawn(transport_router(
-        initial,
-        rescue_grace,
-        upgrade_rx,
-        in_tx,
-        out_rx,
-    ));
+    let handle = tokio::spawn(async move {
+        let _ended = ended_guard;
+        transport_router(initial, rescue_grace, upgrade_rx, in_tx, out_rx, router_end).await
+    });
 
-    let transport = UpgradableTransport { in_rx, out_tx };
+    let transport = UpgradableTransport { in_rx, out_tx, end };
 
-    (transport, UpgradeSender { inner: upgrade_tx }, handle)
+    (
+        transport,
+        UpgradeSender {
+            inner: upgrade_tx,
+            ended,
+        },
+        handle,
+    )
 }
 
 /// Background task that bridges between the real transport and the channels.
@@ -124,10 +169,20 @@ async fn transport_router(
     mut upgrade_rx: mpsc::UnboundedReceiver<UpgradeRequest>,
     in_tx: mpsc::UnboundedSender<io::Result<Vec<u8>>>,
     mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    end: EndCause,
 ) {
     let mut current = initial;
     loop {
-        match route_one(current, rescue_grace, &mut upgrade_rx, &in_tx, &mut out_rx).await {
+        match route_one(
+            current,
+            rescue_grace,
+            &mut upgrade_rx,
+            &in_tx,
+            &mut out_rx,
+            &end,
+        )
+        .await
+        {
             RouteResult::Upgraded { transport, applied } => {
                 info!("Transport upgraded to direct connection");
                 current = transport;
@@ -159,6 +214,7 @@ async fn route_one(
     upgrade_rx: &mut mpsc::UnboundedReceiver<UpgradeRequest>,
     in_tx: &mpsc::UnboundedSender<io::Result<Vec<u8>>>,
     out_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    end: &EndCause,
 ) -> RouteResult {
     let (mut sink, mut stream) = transport.split();
 
@@ -176,7 +232,7 @@ async fn route_one(
                         // UpgradeSender dropped — no more upgrades.
                         // Keep draining with current transport.
                         debug!("Upgrade channel closed, continuing with current transport");
-                        drain_loop(&mut sink, &mut stream, in_tx, out_rx).await;
+                        drain_loop(&mut sink, &mut stream, in_tx, out_rx, end).await;
                         return RouteResult::Done;
                     }
                 }
@@ -210,6 +266,7 @@ async fn route_one(
                                 applied: upgrade.applied,
                             };
                         }
+                        note_end(end, || Fault::from_io(&e));
                         if in_tx.send(Err(e)).is_err() {
                             debug!("Tunnel consumer dropped, router exiting");
                             return RouteResult::Done;
@@ -229,6 +286,7 @@ async fn route_one(
                             };
                         }
                         debug!("Inner transport stream ended, router exiting");
+                        note_end(end, stream_ended);
                         return RouteResult::Done;
                     }
                 }
@@ -250,7 +308,7 @@ async fn route_one(
                                     applied: upgrade.applied,
                                 };
                             }
-                            error!("Router sink send error: {}", e);
+                            end_on_send_error(&mut stream, in_tx, end, e);
                             return RouteResult::Done;
                         }
                     }
@@ -270,24 +328,31 @@ async fn drain_loop(
     stream: &mut futures_util::stream::SplitStream<IpTransport>,
     in_tx: &mpsc::UnboundedSender<io::Result<Vec<u8>>>,
     out_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    end: &EndCause,
 ) {
     loop {
         tokio::select! {
             pkt = stream.next() => {
                 match pkt {
                     Some(result) => {
+                        if let Err(e) = &result {
+                            note_end(end, || Fault::from_io(e));
+                        }
                         if in_tx.send(result).is_err() {
                             return;
                         }
                     }
-                    None => return,
+                    None => {
+                        note_end(end, stream_ended);
+                        return;
+                    }
                 }
             }
             pkt = out_rx.recv() => {
                 match pkt {
                     Some(data) => {
                         if let Err(e) = sink.send(data).await {
-                            error!("Router sink send error (drain): {}", e);
+                            end_on_send_error(stream, in_tx, end, e);
                             return;
                         }
                     }
@@ -298,6 +363,38 @@ async fn drain_loop(
     }
 }
 
+/// The current transport failed a send and no upgrade is coming to replace
+/// it: end the tunnel with the best account of why, rather than just
+/// stopping — a consumer that sees the stream merely end can only call it
+/// "the transport ended". Whatever the transport's stream already has ready
+/// goes first: its reader may have queued the end in its own words (a QUIC
+/// close reason) a moment before the send hit the same closed connection.
+/// Without such an error, the send's own does.
+fn end_on_send_error(
+    stream: &mut futures_util::stream::SplitStream<IpTransport>,
+    in_tx: &mpsc::UnboundedSender<io::Result<Vec<u8>>>,
+    end: &EndCause,
+    send_err: io::Error,
+) {
+    info!("Router: send failed, ending the tunnel: {send_err}");
+    while let Some(Some(item)) = stream.next().now_or_never() {
+        match item {
+            Ok(data) => {
+                if in_tx.send(Ok(data)).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                note_end(end, || Fault::from_io(&e));
+                let _ = in_tx.send(Err(e));
+                return;
+            }
+        }
+    }
+    note_end(end, || Fault::from_io(&send_err));
+    let _ = in_tx.send(Err(send_err));
+}
+
 /// A `Transport` that delegates to a background router task via channels.
 ///
 /// The router can hot-swap the actual inner transport without this type
@@ -305,6 +402,21 @@ async fn drain_loop(
 pub struct UpgradableTransport {
     in_rx: mpsc::UnboundedReceiver<io::Result<Vec<u8>>>,
     out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    end: EndCause,
+}
+
+impl UpgradableTransport {
+    /// The router is gone: why, as far as it knew — a broken pipe that still
+    /// carries the transport's own end (see [`EndCause`]).
+    fn gone(&self) -> io::Error {
+        let cause = self
+            .end
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| Fault::new(Reason::TransportClosed, "router task gone"));
+        io::Error::new(io::ErrorKind::BrokenPipe, cause)
+    }
 }
 
 impl Stream for UpgradableTransport {
@@ -320,19 +432,14 @@ impl Sink<Vec<u8>> for UpgradableTransport {
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if self.out_tx.is_closed() {
-            Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "router task gone",
-            )))
+            Poll::Ready(Err(self.gone()))
         } else {
             Poll::Ready(Ok(()))
         }
     }
 
     fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
-        self.out_tx
-            .send(item)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "router task gone"))
+        self.out_tx.send(item).map_err(|_| self.gone())
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -546,6 +653,83 @@ mod tests {
         .await
         .expect("timeout");
         assert!(result.is_none(), "expected stream to end after inner close");
+    }
+
+    /// A peer's close, as the QUIC carrier's reader and sender both report
+    /// it: an io error that carries its classification.
+    fn peer_closed() -> io::Error {
+        io::Error::from(Fault::new(Reason::PeerClosed, "closed by peer (code 0)"))
+    }
+
+    /// The end a consumer sees, classified the way the keepalive layer
+    /// classifies it.
+    async fn end_seen(transport: &mut UpgradableTransport) -> Option<Reason> {
+        match tokio::time::timeout(GRACE * 4, transport.next()).await {
+            Ok(Some(Err(e))) => Some(Fault::from_io(&e).reason),
+            other => panic!("expected the tunnel to end with an error, got {other:?}"),
+        }
+    }
+
+    /// A send that hits the closed transport before its reader reports the
+    /// close must not end the tunnel wordlessly: the send's own (classified)
+    /// error is the end, for the consumer and for later sends alike —
+    /// whether or not an upgrade could still have come.
+    #[tokio::test]
+    async fn a_failed_send_ends_the_tunnel_with_its_cause() {
+        for upgrades_possible in [true, false] {
+            let (local, handle) = mock_transport();
+            let (mut transport, upgrade_tx, router) = upgradable_transport(Box::new(local), GRACE);
+            if !upgrades_possible {
+                drop(upgrade_tx);
+                tokio::time::sleep(Duration::from_millis(5)).await; // into drain mode
+            }
+            handle.inject_send_error(peer_closed());
+            Pin::new(&mut transport).send(vec![1]).await.unwrap();
+
+            assert_eq!(end_seen(&mut transport).await, Some(Reason::PeerClosed));
+            // The router is gone; a send says why.
+            router.await.unwrap();
+            let err = Pin::new(&mut transport).send(vec![2]).await.unwrap_err();
+            assert_eq!(Fault::from_io(&err).reason, Reason::PeerClosed);
+        }
+    }
+
+    /// The reader had already queued the transport's end when a send failed:
+    /// that end — in the transport's own words — reaches the consumer first.
+    #[tokio::test]
+    async fn a_failed_send_forwards_the_end_the_reader_queued() {
+        for upgrades_possible in [true, false] {
+            let (local, handle) = mock_transport();
+            let (mut transport, upgrade_tx, router) = upgradable_transport(Box::new(local), GRACE);
+            if !upgrades_possible {
+                drop(upgrade_tx);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            handle.inject_error(peer_closed());
+            handle.inject_send_error(io::Error::other("send failed"));
+            Pin::new(&mut transport).send(vec![1]).await.unwrap();
+
+            assert_eq!(end_seen(&mut transport).await, Some(Reason::PeerClosed));
+            router.await.unwrap();
+            let err = Pin::new(&mut transport).send(vec![2]).await.unwrap_err();
+            assert_eq!(Fault::from_io(&err).reason, Reason::PeerClosed);
+        }
+    }
+
+    /// A transport whose stream just ended: a later send says so, instead of
+    /// a bare broken pipe that would read as a connection reset.
+    #[tokio::test]
+    async fn a_send_after_the_stream_ended_says_it_ended() {
+        let (local, handle) = mock_transport();
+        let (mut transport, upgrade_tx, router) = upgradable_transport(Box::new(local), GRACE);
+        drop(upgrade_tx);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        handle.close();
+        let end = tokio::time::timeout(Duration::from_millis(100), transport.next()).await;
+        assert!(matches!(end, Ok(None)), "{end:?}");
+        router.await.unwrap();
+        let err = Pin::new(&mut transport).send(vec![1]).await.unwrap_err();
+        assert_eq!(Fault::from_io(&err).reason, Reason::TransportClosed);
     }
 
     #[tokio::test]

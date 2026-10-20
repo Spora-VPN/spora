@@ -31,7 +31,8 @@
 //! [`crate::share`] (exit) — from the first action to teardown, reconnects and
 //! all. On disk it is an append-only stream of JSON lines
 //! (`open`, `step`…, `sample`…, `close`), so a process that is killed mid-run
-//! still leaves everything it had learned up to that instant. Readers fold the
+//! still leaves everything it had learned up to that instant; nothing is
+//! recorded after the `close`, whatever the teardown races. Readers fold the
 //! stream back into a [`Record`] document; [`Recorder::snapshot`] produces the
 //! same document in memory without touching the disk.
 //!
@@ -41,15 +42,18 @@
 //! same format — which is exactly why the vocabulary lives here in the core
 //! rather than in test scaffolding.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::{debug, warn};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::transport::keepalive::LinkCounters;
 
 /// Bump when the meaning of existing fields changes. Adding a step kind, a
 /// reason code or an optional field does **not** require a bump: readers are
@@ -231,8 +235,18 @@ vocabulary! {
         /// The liveness probe cycle: a failure here is a tunnel that stopped
         /// carrying traffic without anyone closing it.
         Liveness => "liveness",
-        /// A session ended, with the reason it ended.
+        /// A session ended, always with the reason it ended. `ok` when it
+        /// ended the ordinary way — the peer closed it (`peer_closed`), a
+        /// newer session replaced it (`replaced`), this end stopped
+        /// (`local_shutdown`) — and `failed` when it died (`idle_timeout`,
+        /// `keepalive_timeout`, `connect_reset`, `transport_closed`, …).
         SessionEnd => "session_end",
+
+        // -- the device ------------------------------------------------------
+        /// The network underneath changed, as the platform reports it; the
+        /// step carries the new [`NetworkState`]. Instantaneous and always
+        /// `ok`: it records a fact about the device, not an attempt.
+        Network => "network",
 
         Unknown => "unknown",
     }
@@ -263,7 +277,10 @@ vocabulary! {
 vocabulary! {
     /// Why something failed or was skipped — the closed vocabulary that makes
     /// failures countable. Grouped by where the trouble was, because "did it
-    /// reach the peer at all" is the first question anyone asks.
+    /// reach the peer at all" is the first question anyone asks. A
+    /// `session_end` carries one even when it concluded `ok`: then it says
+    /// which ordinary ending it was (`peer_closed`, `replaced`,
+    /// `local_shutdown`).
     Reason, fallback = Unknown, {
         // -- what we were told to do ----------------------------------------
         /// No relay endpoints were configured at all.
@@ -330,9 +347,14 @@ vocabulary! {
         /// Liveness probes stopped being answered while the session was
         /// nominally up — the classic "connected but dead" tunnel.
         KeepaliveTimeout => "keepalive_timeout",
-        /// The peer closed the session.
+        /// The peer closed the session: its application ended it on
+        /// purpose (a client disconnecting, an exit stopping or taking a
+        /// newer client), which a `session_end` records as `ok`. A peer
+        /// that closes a session because it found it dead says so with
+        /// another close code, and that is no `peer_closed`.
         PeerClosed => "peer_closed",
-        /// The transport closed under us for some other reason.
+        /// The transport closed under us for some other reason — including
+        /// a peer that closed the session because it had died on its side.
         TransportClosed => "transport_closed",
         /// Sending failed.
         SendFailed => "send_failed",
@@ -375,6 +397,12 @@ vocabulary! {
         /// Storage the run depends on could not be used.
         StorageError => "storage_error",
 
+        // -- the process ----------------------------------------------------------
+        /// The process panicked: the run ended because the program failed,
+        /// not because anyone asked it to. A crash report, when one was
+        /// written, names the run. (See [`note_process_panic`].)
+        Crashed => "crashed",
+
         /// We genuinely do not know. Used rather than the nearest plausible
         /// code; `detail` may say more.
         Unknown => "unknown",
@@ -392,7 +420,9 @@ vocabulary! {
         Lost => "lost",
         /// We closed it.
         ClosedLocally => "closed_locally",
-        /// The peer closed it.
+        /// The peer closed it: no session was up at the end, and the last one
+        /// ended by the peer's own close (`session_end` `peer_closed`) — a
+        /// client that left, or an exit that stopped or took another client.
         ClosedByPeer => "closed_by_peer",
         /// A newer session replaced it.
         Replaced => "replaced",
@@ -424,6 +454,28 @@ vocabulary! {
         Quic => "quic",
         /// A liveness probe through the tunnel and back.
         Keepalive => "keepalive",
+        Unknown => "unknown",
+    }
+}
+
+vocabulary! {
+    /// What kind of network the device is on, as the platform reports it —
+    /// the network underneath, never a VPN riding on it (Spora's own
+    /// included). Coarse on purpose: it is there to tell "no usable network
+    /// at all" from "network up, everything blocked" in a run that never
+    /// learned its own outside address.
+    #[derive(Default)]
+    NetworkKind, fallback = Unknown, {
+        /// No usable network at all.
+        None => "none",
+        Wifi => "wifi",
+        Cellular => "cellular",
+        Ethernet => "ethernet",
+        /// A network, but none of the above (tethering over Bluetooth or
+        /// USB, a satellite link, …).
+        Other => "other",
+        // The default too, so a description that names no kind still parses.
+        #[default]
         Unknown => "unknown",
     }
 }
@@ -464,9 +516,14 @@ impl Fault {
         self
     }
 
-    /// Classify a socket-level error.
+    /// Classify a socket-level error — or recover the code of one that was
+    /// made from a `Fault` (see `From<Fault> for io::Error`), which knew
+    /// better than its `ErrorKind` can say.
     pub fn from_io(e: &std::io::Error) -> Self {
         use std::io::ErrorKind::*;
+        if let Some(f) = e.get_ref().and_then(|inner| inner.downcast_ref::<Fault>()) {
+            return f.clone();
+        }
         let reason = match e.kind() {
             ConnectionRefused => Reason::ConnectRefused,
             ConnectionReset | BrokenPipe => Reason::ConnectReset,
@@ -538,6 +595,30 @@ impl Fault {
         Self::new(reason, e.to_string())
     }
 
+    /// Classify why an established session's connection closed — what its
+    /// `session_end` records. Unlike [`from_quinn`](Self::from_quinn), a
+    /// close made by this end (`LocallyClosed`: teardown, or the keepalive
+    /// layer giving up first) says nothing about why the session ended, and a
+    /// peer's transport-level close names a QUIC error rather than a decision
+    /// to end the session; both are `transport_closed`. The peer's
+    /// application close with code 0 — how a Spora end closes a session it
+    /// is done with — is `peer_closed`; with any other code (a peer that
+    /// found the session dead closes it with
+    /// [`SESSION_DEAD_CODE`](crate::transport::quic::SESSION_DEAD_CODE)) the
+    /// session did not end on purpose, and that is `transport_closed` too.
+    pub fn from_quinn_session(e: &quinn::ConnectionError) -> Self {
+        use quinn::ConnectionError as C;
+        match e {
+            C::ApplicationClosed(c) if c.error_code == quinn::VarInt::from_u32(0) => {
+                Self::new(Reason::PeerClosed, e.to_string())
+            }
+            C::LocallyClosed | C::ConnectionClosed(_) | C::ApplicationClosed(_) => {
+                Self::new(Reason::TransportClosed, e.to_string())
+            }
+            _ => Self::from_quinn(e),
+        }
+    }
+
     /// Classify quinn's refusal to even start a connection — a local or
     /// configuration problem, never something the network did.
     pub fn from_quinn_connect(e: &quinn::ConnectError) -> Self {
@@ -567,9 +648,12 @@ impl From<Fault> for String {
     }
 }
 
+/// The `io::Error` prints the detail, as before, and carries the `Fault`
+/// itself, so [`Fault::from_io`] gets the code back on the far side of an
+/// `io::Result` boundary.
 impl From<Fault> for std::io::Error {
     fn from(f: Fault) -> std::io::Error {
-        std::io::Error::other(f.detail)
+        std::io::Error::other(f)
     }
 }
 
@@ -621,6 +705,20 @@ pub struct EndpointRef {
     pub addr: Option<String>,
 }
 
+/// The network underneath a run, as the platform describes it. The local
+/// interface address is deliberately not part of it: what the record knows of
+/// its own vantage is the outside address STUN reported, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkState {
+    #[serde(default)]
+    pub kind: NetworkKind,
+    /// The operating system confirmed this network reaches the internet
+    /// (Android's `NET_CAPABILITY_VALIDATED`). `None`: the platform cannot
+    /// tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validated: Option<bool>,
+}
+
 /// Opens a record: everything that is true of the whole run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Open {
@@ -650,6 +748,11 @@ pub struct Open {
     /// a support ticket, a test run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+    /// The network underneath when the run started, as the platform reported
+    /// it. Absent when the platform reported nothing; later changes are
+    /// `network` steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkState>,
 }
 
 /// One thing that was attempted, and how it came out.
@@ -688,6 +791,9 @@ pub struct Step {
     pub local: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer: Option<String>,
+    /// `network` steps only: the network the platform now reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkState>,
     /// Human-readable extra. **Never** the basis of analysis: it is not
     /// stable and it is not a vocabulary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -714,7 +820,8 @@ pub struct Sample {
     pub rx_bytes: u64,
     pub tx_pkts: u64,
     pub rx_pkts: u64,
-    /// Rates over the interval since the previous sample.
+    /// Rates over the interval since the same session's previous sample;
+    /// absent on a session's first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_bps: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -772,7 +879,11 @@ pub struct Close {
     pub direct_ms: Option<u64>,
     /// Total time a usable tunnel existed.
     pub connected_ms: u64,
-    /// Total tunnel traffic over the run, from the last sample taken.
+    /// Total tunnel traffic over the run: every session's, read from the
+    /// sessions' own counters as the record closes — so a run shorter than
+    /// the sample interval still reports what it carried. (A run whose
+    /// sessions were sampled by hand, without counters, reports its last
+    /// sample's figures.)
     pub tx_bytes: u64,
     pub rx_bytes: u64,
 }
@@ -920,6 +1031,15 @@ pub struct RecordConfig {
     pub label: Option<String>,
     /// Identifier tying this run to something outside it.
     pub correlation_id: Option<String>,
+    /// The network underneath as the run starts, when the platform can say;
+    /// copied into the record's `open`. Changes during the run go through
+    /// [`Recorder::network`], or a [`NetworkFeed`].
+    pub network: Option<NetworkState>,
+    /// The platform's network reports. A run started with a feed opens on
+    /// the feed's current state (falling back to `network`) and records
+    /// every later report as a `network` step until it closes — including
+    /// the reports that arrive while `connect()` is still dialing.
+    pub network_feed: Option<NetworkFeed>,
     /// In-process consumer of entries as they happen.
     pub subscriber: Option<RecordSubscriber>,
 }
@@ -935,6 +1055,8 @@ impl Default for RecordConfig {
             max_entries: 4096,
             label: None,
             correlation_id: None,
+            network: None,
+            network_feed: None,
             subscriber: None,
         }
     }
@@ -964,10 +1086,111 @@ impl RecordConfig {
         self
     }
 
+    pub fn with_network(mut self, state: NetworkState) -> Self {
+        self.network = Some(state);
+        self
+    }
+
+    pub fn with_network_feed(mut self, feed: NetworkFeed) -> Self {
+        self.network_feed = Some(feed);
+        self
+    }
+
     pub fn with_subscriber(mut self, sub: RecordSubscriber) -> Self {
         self.subscriber = Some(sub);
         self
     }
+}
+
+/// A platform's reports of the network underneath, shared by every run that
+/// should hear them: the platform calls [`NetworkFeed::set`] whenever the
+/// network changes, and each run started with the feed (see
+/// [`RecordConfig::network_feed`]) records the change — from the moment its
+/// record opens, so a change during a dial that then fails is not lost.
+/// Cloning is cheap; clones are the same feed. A record's subscriber hears
+/// the opening and these steps with the feed held, so it must not report
+/// into the feed itself.
+#[derive(Clone, Default)]
+pub struct NetworkFeed(Arc<Mutex<FeedState>>);
+
+#[derive(Default)]
+struct FeedState {
+    current: Option<NetworkState>,
+    /// Records opened with this feed that may still be open. Weak: the feed
+    /// never keeps a run's record alive.
+    runs: Vec<Weak<Inner>>,
+}
+
+impl NetworkFeed {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The network is now `state`: kept for runs that start later, and
+    /// recorded as a `network` step in every open record that started with
+    /// this feed (a state a record already has records nothing there).
+    pub fn set(&self, state: NetworkState) {
+        let live: Vec<Arc<Inner>> = {
+            let mut feed = self.lock();
+            feed.current = Some(state);
+            let live: Vec<Arc<Inner>> = feed
+                .runs
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter(|inner| !inner.closed.load(Ordering::SeqCst))
+                .collect();
+            feed.runs = live.iter().map(Arc::downgrade).collect();
+            // Reported under the feed's lock, so two racing reports reach
+            // every record in the same order.
+            for inner in &live {
+                Recorder {
+                    inner: Some(inner.clone()),
+                    session: None,
+                    cycle: None,
+                }
+                .network(state);
+            }
+            live
+        };
+        // `live` may hold the last handle to a run that just ended; its
+        // inferred ending is written here, without the feed held.
+        drop(live);
+    }
+
+    /// The state last reported, if any.
+    pub fn current(&self) -> Option<NetworkState> {
+        self.lock().current
+    }
+
+    fn lock(&self) -> MutexGuard<'_, FeedState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Set once the process is going down with a panic; see
+/// [`note_process_panic`].
+static PROCESS_PANICKED: AtomicBool = AtomicBool::new(false);
+
+/// Tell the recorder this process panicked. A platform's panic hook calls
+/// it, so that the records closed by the teardown that follows say
+/// [`Reason::Crashed`] instead of passing for an ordinary shutdown — on
+/// whichever thread drops them: an async runtime tears its tasks down on
+/// worker threads that are not themselves panicking, which
+/// `std::thread::panicking` alone cannot see. Only endings nobody asked for
+/// are affected (a record dropped without a close, a share loop ended
+/// without a stop); an explicit close or stop still says what it says.
+///
+/// For a panic that ends the process (under `#[tokio::main]`, one on the
+/// main thread). A panic the runtime catches inside one task leaves the
+/// process running, and noting it would label every later unplanned ending
+/// in the process a crash.
+pub fn note_process_panic() {
+    PROCESS_PANICKED.store(true, Ordering::SeqCst);
+}
+
+/// Whether an unplanned ending happening now is the program failing.
+pub(crate) fn crashing() -> bool {
+    std::thread::panicking() || PROCESS_PANICKED.load(Ordering::SeqCst)
 }
 
 // ---------------------------------------------------------------------------
@@ -992,11 +1215,18 @@ struct Inner {
     seq: AtomicU64,
     closed: AtomicBool,
     state: Mutex<State>,
+    /// The network as last reported. A report is judged and given its `seq`
+    /// under this lock, so two racing reports keep their order.
+    network: Mutex<Option<NetworkState>>,
     sink: Option<Sink>,
     subscriber: Option<RecordSubscriber>,
     max_entries: usize,
     sample_interval: Duration,
 }
+
+/// A recorder handle's (session, cycle) tags: which session its samples
+/// describe.
+type SessionKey = (Option<u32>, Option<u32>);
 
 struct State {
     open: Open,
@@ -1006,18 +1236,105 @@ struct State {
     close: Option<Close>,
     /// Entries not kept in memory (the disk still has them).
     dropped_in_memory: u64,
-    /// Previous sample's (at_ms, tx_bytes, rx_bytes), for interval rates.
-    last_sample: Option<(u64, u64, u64)>,
+    /// Each session's previous sample (at_ms, tx_bytes, rx_bytes), for
+    /// interval rates. Keyed by the sampling handle's (session, cycle): the
+    /// counters are per session, so a rate across two sessions would be
+    /// noise.
+    last_samples: HashMap<SessionKey, (u64, u64, u64)>,
+    /// Session traffic, for the closing totals.
+    traffic: Traffic,
     /// Bookkeeping for the closing summary.
     sessions: u32,
     reconnects: u32,
     first_connect_ms: Option<u64>,
     direct_ms: Option<u64>,
     connected_ms: u64,
-    /// When the current session came up, if one is up.
+    /// Sessions up right now. More than one while an exit's new session has
+    /// come up and the one it replaces has not yet recorded its end.
+    live: u32,
+    /// When the current stretch of being up began (`live` went above 0).
     up_since_ms: Option<u64>,
+    /// The reason on the last `session_end`, for the ending of a run that
+    /// has none up: the peer closing it is not losing it.
+    last_end: Option<Reason>,
+    /// The last sample's figures: the closing totals of a run that counts
+    /// no session (see [`Traffic::counted`]).
     tx_bytes: u64,
     rx_bytes: u64,
+}
+
+impl State {
+    /// The outcome of a run ending now, from what happened in it: `if_up`
+    /// while a session is up; otherwise by how the last session ended —
+    /// `closed_by_peer` by the peer's close, `closed_locally` by this end
+    /// stopping (its `session_end` can land just ahead of the close),
+    /// `lost` any other way — and `never_connected` when there never was one.
+    fn derived_outcome(&self, if_up: Outcome) -> Outcome {
+        if self.live > 0 {
+            return if_up;
+        }
+        if self.sessions == 0 {
+            return Outcome::NeverConnected;
+        }
+        match self.last_end {
+            Some(Reason::PeerClosed) => Outcome::ClosedByPeer,
+            Some(Reason::LocalShutdown) => Outcome::ClosedLocally,
+            _ => Outcome::Lost,
+        }
+    }
+}
+
+/// The run's traffic, kept so the close can report the total over the whole
+/// run rather than whatever the last sample happened to see.
+#[derive(Default)]
+struct Traffic {
+    /// Final figures of the sessions that have ended.
+    ended_tx: u64,
+    ended_rx: u64,
+    /// Sessions still counting, by slot; read when the record closes.
+    live: Vec<(u64, Arc<LinkCounters>)>,
+    next_slot: u64,
+    /// Whether any session was counted. A run that never was (an embedder
+    /// sampling by hand) closes on its last sample's figures.
+    counted: bool,
+}
+
+impl Traffic {
+    fn total(&self) -> Option<(u64, u64)> {
+        self.counted.then(|| {
+            self.live
+                .iter()
+                .fold((self.ended_tx, self.ended_rx), |(tx, rx), (_, c)| {
+                    (
+                        tx + c.tx_bytes.load(Ordering::Relaxed),
+                        rx + c.rx_bytes.load(Ordering::Relaxed),
+                    )
+                })
+        })
+    }
+}
+
+/// One session's traffic, counted toward its run's total while this lives;
+/// dropping it (the session is over) folds the session's final figures in.
+/// See [`Recorder::count_traffic`].
+pub(crate) struct TrafficCount {
+    rec: Recorder,
+    slot: u64,
+}
+
+impl Drop for TrafficCount {
+    fn drop(&mut self) {
+        let Some(inner) = self.rec.inner.as_ref() else {
+            return;
+        };
+        let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = st.traffic.live.iter().position(|(s, _)| *s == self.slot) {
+            let (_, c) = st.traffic.live.swap_remove(i);
+            st.traffic.ended_tx += c.tx_bytes.load(Ordering::Relaxed);
+            st.traffic.ended_rx += c.rx_bytes.load(Ordering::Relaxed);
+        }
+        st.last_samples.remove(&(self.rec.session, self.rec.cycle));
+    }
 }
 
 impl Recorder {
@@ -1047,6 +1364,18 @@ impl Recorder {
     ) -> Self {
         let id = new_id();
         let at_unix_ms = unix_ms();
+        // The file first, outside the feed: opening it sweeps the directory,
+        // and a platform reporting the network must not wait on that.
+        let sink = cfg
+            .dir
+            .as_ref()
+            .and_then(|dir| Sink::open(dir, cfg, role, at_unix_ms, &id));
+
+        // Held until the record is on the feed's list: the record opens on
+        // the feed's state of this instant, and no report can fall between
+        // reading it and being listed.
+        let feed = cfg.network_feed.as_ref().map(NetworkFeed::lock);
+        let network = feed.as_ref().and_then(|f| f.current).or(cfg.network);
         let open = Open {
             v: FORMAT_VERSION,
             id: id.clone(),
@@ -1058,12 +1387,8 @@ impl Recorder {
             upgrade_enabled,
             label: cfg.label.clone(),
             correlation_id: cfg.correlation_id.clone(),
+            network,
         };
-
-        let sink = cfg
-            .dir
-            .as_ref()
-            .and_then(|dir| Sink::open(dir, cfg, role, at_unix_ms, &id));
 
         let inner = Arc::new(Inner {
             id,
@@ -1077,16 +1402,20 @@ impl Recorder {
                 gaps: Vec::new(),
                 close: None,
                 dropped_in_memory: 0,
-                last_sample: None,
+                last_samples: HashMap::new(),
+                traffic: Traffic::default(),
                 sessions: 0,
                 reconnects: 0,
                 first_connect_ms: None,
                 direct_ms: None,
                 connected_ms: 0,
+                live: 0,
                 up_since_ms: None,
+                last_end: None,
                 tx_bytes: 0,
                 rx_bytes: 0,
             }),
+            network: Mutex::new(network),
             sink,
             subscriber: cfg.subscriber.clone(),
             max_entries: cfg.max_entries.max(64),
@@ -1094,11 +1423,15 @@ impl Recorder {
         });
 
         let rec = Self {
-            inner: Some(inner),
+            inner: Some(inner.clone()),
             session: None,
             cycle: None,
         };
         rec.emit(Entry::Open(open));
+        if let Some(mut feed) = feed {
+            feed.runs.retain(|run| run.strong_count() > 0);
+            feed.runs.push(Arc::downgrade(&inner));
+        }
         rec
     }
 
@@ -1159,6 +1492,7 @@ impl Recorder {
             via: None,
             local: None,
             peer: None,
+            network: None,
             detail: None,
             done: false,
         }
@@ -1182,6 +1516,34 @@ impl Recorder {
         h
     }
 
+    /// Record the network underneath as the platform now reports it: an
+    /// instantaneous `network` step carrying the state.
+    ///
+    /// Platforms report on their own schedule, so two reports record
+    /// nothing: one identical to the last state known (platforms re-announce
+    /// an unchanged network freely, e.g. Android's capability callbacks fire
+    /// for changes this description does not cover), and one that arrives
+    /// after the record has closed. A platform with several runs at once
+    /// reports through a [`NetworkFeed`] instead, which reaches every run
+    /// from the moment its record opens.
+    pub fn network(&self, state: NetworkState) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        let step = {
+            let mut last = inner.network.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.closed.load(Ordering::SeqCst) || *last == Some(state) {
+                return;
+            }
+            *last = Some(state);
+            let mut h = self.mark(StepKind::Network);
+            h.network = Some(state);
+            h
+        };
+        // Written outside the lock: a subscriber may call back in.
+        step.ok();
+    }
+
     /// Take a quality sample.
     pub fn sample(&self, s: SampleInput) {
         let Some(inner) = self.inner.as_ref() else {
@@ -1192,16 +1554,20 @@ impl Recorder {
             let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
             st.tx_bytes = s.tx_bytes;
             st.rx_bytes = s.rx_bytes;
-            let rates = st.last_sample.and_then(|(prev_ms, prev_tx, prev_rx)| {
-                let dt = at_ms.saturating_sub(prev_ms);
-                (dt > 0).then(|| {
-                    (
-                        s.tx_bytes.saturating_sub(prev_tx) * 8 * 1000 / dt,
-                        s.rx_bytes.saturating_sub(prev_rx) * 8 * 1000 / dt,
-                    )
-                })
-            });
-            st.last_sample = Some((at_ms, s.tx_bytes, s.rx_bytes));
+            // Against this session's previous sample only: its first sample
+            // has no rate rather than one computed across sessions.
+            let rates = st
+                .last_samples
+                .insert((self.session, self.cycle), (at_ms, s.tx_bytes, s.rx_bytes))
+                .and_then(|(prev_ms, prev_tx, prev_rx)| {
+                    let dt = at_ms.saturating_sub(prev_ms);
+                    (dt > 0).then(|| {
+                        (
+                            s.tx_bytes.saturating_sub(prev_tx) * 8 * 1000 / dt,
+                            s.rx_bytes.saturating_sub(prev_rx) * 8 * 1000 / dt,
+                        )
+                    })
+                });
             match rates {
                 Some((tx, rx)) => (Some(tx), Some(rx)),
                 None => (None, None),
@@ -1231,6 +1597,26 @@ impl Recorder {
         }));
     }
 
+    /// Count one session's traffic toward the run's closing total, for as
+    /// long as the returned handle lives: the close reads the session's
+    /// counters as they stand then, and dropping the handle (the session is
+    /// over) folds its final figures in — so every session counts, and a run
+    /// shorter than the sample interval still reports what it carried.
+    pub(crate) fn count_traffic(&self, counters: Arc<LinkCounters>) -> TrafficCount {
+        let slot = self.inner.as_ref().map_or(0, |inner| {
+            let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let slot = st.traffic.next_slot;
+            st.traffic.next_slot += 1;
+            st.traffic.counted = true;
+            st.traffic.live.push((slot, counters));
+            slot
+        });
+        TrafficCount {
+            rec: self.clone(),
+            slot,
+        }
+    }
+
     /// Close the record. The first call wins; later ones are ignored, so
     /// several teardown paths racing each other is harmless.
     pub fn close(&self, outcome: Outcome, reason: Option<Reason>, detail: Option<String>) {
@@ -1242,19 +1628,17 @@ impl Recorder {
 
     /// Close a record whose run is ending in the ordinary way, deriving the
     /// outcome from what actually happened: a tunnel that was up when the
-    /// caller stopped is `closed_locally`, one that came up and went away is
-    /// `lost`, one that never came up is `never_connected`.
+    /// caller stopped (or whose last session this end stopped) is
+    /// `closed_locally`; one that came up and went away is `closed_by_peer`
+    /// when the peer closed it, `lost` otherwise; one that never came up is
+    /// `never_connected`.
     pub fn close_shutdown(&self, reason: Option<Reason>) {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
         let outcome = {
             let st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            match (st.up_since_ms.is_some(), st.sessions > 0) {
-                (true, _) => Outcome::ClosedLocally,
-                (false, true) => Outcome::Lost,
-                (false, false) => Outcome::NeverConnected,
-            }
+            st.derived_outcome(Outcome::ClosedLocally)
         };
         self.close(outcome, reason, None);
     }
@@ -1266,7 +1650,6 @@ impl Recorder {
             .map(|i| i.state.lock().unwrap_or_else(|e| e.into_inner()).sessions > 0)
             .unwrap_or(false)
     }
-
     /// The record as it stands, without reading anything back from disk.
     pub fn snapshot(&self) -> Option<Record> {
         let inner = self.inner.as_ref()?;
@@ -1308,14 +1691,25 @@ impl Recorder {
                 st.sessions += 1;
                 st.first_connect_ms.get_or_insert(step.at_ms);
                 st.up_since_ms.get_or_insert(step.at_ms);
+                st.live += 1;
             }
             (StepKind::SessionEnd, _) => {
-                if let Some(up) = st.up_since_ms.take() {
+                // An exit's replaced session records its end after its
+                // successor came up: the run is still up until the last one
+                // ends.
+                st.live = st.live.saturating_sub(1);
+                if st.live == 0
+                    && let Some(up) = st.up_since_ms.take()
+                {
                     st.connected_ms += step.at_ms.saturating_sub(up);
                 }
+                st.last_end = step.reason;
             }
             (StepKind::Reconnect, _) => {
+                // A client has one session at a time, and a redial means it
+                // is gone, whether or not its end made it into the record.
                 st.reconnects += 1;
+                st.live = 0;
                 if let Some(up) = st.up_since_ms.take() {
                     st.connected_ms += step.at_ms.saturating_sub(up);
                 }
@@ -1327,12 +1721,22 @@ impl Recorder {
         }
     }
 
+    /// Record an entry: into the in-memory record and onto the disk queue
+    /// under the state lock, then to the subscriber outside it (a subscriber
+    /// may call back in). Nothing follows the ending: an entry produced once
+    /// the record has closed — a step handle dropped late, a sample racing
+    /// the teardown — is not recorded at all. Because `closed` is judged
+    /// and the disk queue fed under the same lock [`finish`] queues the
+    /// close under, the close is the last line on disk.
     fn emit(&self, entry: Entry) {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
         {
             let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.closed.load(Ordering::SeqCst) {
+                return;
+            }
             match &entry {
                 Entry::Step(s) if s.outcome == StepOutcome::Started => {
                     if st.steps.len() < inner.max_entries {
@@ -1347,17 +1751,15 @@ impl Recorder {
                     if let Some(prev) = st.steps.iter_mut().rev().find(|p| p.seq == s.seq) {
                         *prev = s.clone();
                         fold_superseding(&mut st, s);
-                        drop(st);
-                        self.forward(entry);
-                        return;
-                    }
-                    self.account(&mut st, s);
-                    if st.steps.len() < inner.max_entries {
-                        st.steps.push(s.clone());
                     } else {
-                        // Keep the beginning of the story: that is where the
-                        // explanation usually is.
-                        st.dropped_in_memory += 1;
+                        self.account(&mut st, s);
+                        if st.steps.len() < inner.max_entries {
+                            st.steps.push(s.clone());
+                        } else {
+                            // Keep the beginning of the story: that is where
+                            // the explanation usually is.
+                            st.dropped_in_memory += 1;
+                        }
                     }
                 }
                 Entry::Sample(s) => {
@@ -1370,16 +1772,9 @@ impl Recorder {
                 Entry::Gap(g) => st.gaps.push(g.clone()),
                 Entry::Open(_) | Entry::Close(_) => {}
             }
-        }
-        self.forward(entry);
-    }
-
-    fn forward(&self, entry: Entry) {
-        let Some(inner) = self.inner.as_ref() else {
-            return;
-        };
-        if let Some(sink) = inner.sink.as_ref() {
-            sink.send(&inner.id, entry.at_ms(), entry.clone());
+            if let Some(sink) = inner.sink.as_ref() {
+                sink.send(&inner.id, entry.at_ms(), entry.clone());
+            }
         }
         if let Some(sub) = inner.subscriber.as_ref() {
             sub(&entry);
@@ -1400,6 +1795,7 @@ fn finish(inner: &Inner, outcome: Outcome, reason: Option<Reason>, detail: Optio
         if let Some(up) = st.up_since_ms.take() {
             st.connected_ms += at_ms.saturating_sub(up);
         }
+        let (tx_bytes, rx_bytes) = st.traffic.total().unwrap_or((st.tx_bytes, st.rx_bytes));
         let c = Close {
             id: inner.id.clone(),
             at_ms,
@@ -1412,18 +1808,19 @@ fn finish(inner: &Inner, outcome: Outcome, reason: Option<Reason>, detail: Optio
             first_connect_ms: st.first_connect_ms,
             direct_ms: st.direct_ms,
             connected_ms: st.connected_ms,
-            tx_bytes: st.tx_bytes,
-            rx_bytes: st.rx_bytes,
+            tx_bytes,
+            rx_bytes,
         };
         st.close = Some(c.clone());
-        c
+        let entry = Entry::Close(c);
+        // Queued under the lock, as `emit` queues: see there.
+        if let Some(sink) = inner.sink.as_ref() {
+            sink.send(&inner.id, at_ms, entry.clone());
+        }
+        entry
     };
-    let entry = Entry::Close(close);
-    if let Some(sink) = inner.sink.as_ref() {
-        sink.send(&inner.id, at_ms, entry.clone());
-    }
     if let Some(sub) = inner.subscriber.as_ref() {
-        sub(&entry);
+        sub(&close);
     }
 }
 
@@ -1431,25 +1828,26 @@ impl Drop for Inner {
     /// Nobody closed this record explicitly, and the last handle to it has
     /// gone — so the run is over whether or not anyone said so. The outcome
     /// is derived from what happened rather than assumed, and the detail
-    /// says plainly that the ending was inferred.
+    /// says plainly that the ending was inferred — and that the process
+    /// panicked, when it did (see [`note_process_panic`]).
     fn drop(&mut self) {
         if self.closed.load(Ordering::SeqCst) {
             return;
         }
         let outcome = {
             let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if st.sessions > 0 {
-                Outcome::Lost
-            } else {
-                Outcome::NeverConnected
-            }
+            // Up when nobody closed the record: nobody said why it ended.
+            st.derived_outcome(Outcome::Lost)
         };
-        finish(
-            self,
-            outcome,
-            None,
-            Some("no explicit ending: the recorder was dropped".into()),
-        );
+        let (reason, detail) = if crashing() {
+            (
+                Some(Reason::Crashed),
+                "no explicit ending: the process panicked",
+            )
+        } else {
+            (None, "no explicit ending: the recorder was dropped")
+        };
+        finish(self, outcome, reason, Some(detail.into()));
     }
 }
 
@@ -1586,6 +1984,7 @@ pub struct StepHandle {
     via: Option<String>,
     local: Option<String>,
     peer: Option<String>,
+    network: Option<NetworkState>,
     detail: Option<String>,
     done: bool,
 }
@@ -1629,6 +2028,13 @@ impl StepHandle {
 
     pub fn fail(self, reason: Reason, detail: impl Into<String>) {
         self.finish(StepOutcome::Failed, Some(reason), Some(detail.into()))
+    }
+
+    /// Concluded the ordinary way, for a reason worth counting — a
+    /// `session_end` the peer closed, say. `ok`, so it is no failure, but
+    /// with its code.
+    pub fn ok_because(self, reason: Reason, detail: impl Into<String>) {
+        self.finish(StepOutcome::Ok, Some(reason), Some(detail.into()))
     }
 
     /// Conclude from an error that already knows its code.
@@ -1680,6 +2086,7 @@ impl StepHandle {
             via: self.via.clone(),
             local: self.local.clone(),
             peer: self.peer.clone(),
+            network: self.network,
             detail: detail.or_else(|| self.detail.clone()),
         };
         self.rec.emit(Entry::Step(step));
@@ -2056,6 +2463,7 @@ mod tests {
         unique(PathKind::ALL, PathKind::as_str);
         unique(Role::ALL, Role::as_str);
         unique(RttSource::ALL, RttSource::as_str);
+        unique(NetworkKind::ALL, NetworkKind::as_str);
     }
 
     #[test]
@@ -2065,6 +2473,9 @@ mod tests {
         }
         for k in StepKind::ALL {
             assert_eq!(StepKind::from_code(k.as_str()), Some(*k));
+        }
+        for n in NetworkKind::ALL {
+            assert_eq!(NetworkKind::from_code(n.as_str()), Some(*n));
         }
     }
 
@@ -2078,6 +2489,95 @@ mod tests {
         };
         assert_eq!(step.kind, StepKind::Unknown);
         assert_eq!(step.reason, Some(Reason::Unknown));
+    }
+
+    /// A network kind this build has never heard of (or none at all) costs
+    /// the description its kind, not the record its opening line.
+    #[test]
+    fn unknown_network_kinds_degrade_instead_of_failing() {
+        let open = concat!(
+            r#"{"t":"open","v":1,"id":"a","role":"client","at_unix_ms":0,"#,
+            r#""build":{"version":"0","dirty":false,"target":"x","profile":"debug"},"#,
+            r#""upgrade_enabled":true,"network":{"kind":"satellite","validated":true}}"#,
+        );
+        let Entry::Open(open) = serde_json::from_str(open).expect("parses") else {
+            panic!("expected an open")
+        };
+        assert_eq!(
+            open.network,
+            Some(NetworkState {
+                kind: NetworkKind::Unknown,
+                validated: Some(true),
+            })
+        );
+
+        let step = r#"{"t":"step","id":"a","at_ms":1,"seq":0,"kind":"network","outcome":"ok","network":{}}"#;
+        let Entry::Step(step) = serde_json::from_str(step).expect("parses") else {
+            panic!("expected a step")
+        };
+        assert_eq!(step.kind, StepKind::Network);
+        assert_eq!(
+            step.network,
+            Some(NetworkState {
+                kind: NetworkKind::Unknown,
+                validated: None,
+            })
+        );
+    }
+
+    #[test]
+    fn the_network_is_recorded_at_the_start_and_on_change() {
+        let wifi = NetworkState {
+            kind: NetworkKind::Wifi,
+            validated: Some(true),
+        };
+        let cellular = NetworkState {
+            kind: NetworkKind::Cellular,
+            validated: None,
+        };
+        let cfg = RecordConfig::in_memory().with_network(wifi);
+        let rec = Recorder::start(&cfg, Role::Client, None, vec![], true);
+        // Not a change: the run started on this network.
+        rec.network(wifi);
+        rec.network(cellular);
+        rec.network(cellular);
+        rec.network(NetworkState {
+            kind: NetworkKind::None,
+            validated: None,
+        });
+        rec.close(Outcome::NeverConnected, None, None);
+        rec.network(wifi);
+
+        let snap = rec.snapshot().unwrap();
+        assert_eq!(snap.open.network, Some(wifi));
+        let changes: Vec<&Step> = snap.steps_of(StepKind::Network).collect();
+        assert_eq!(changes.len(), 2, "one step per change, none after close");
+        assert_eq!(changes[0].outcome, StepOutcome::Ok);
+        assert_eq!(changes[0].dur_ms, None, "instantaneous");
+        assert_eq!(changes[0].network, Some(cellular));
+        assert_eq!(changes[1].network.map(|n| n.kind), Some(NetworkKind::None));
+
+        let json = serde_json::to_string(&Entry::Open(snap.open.clone())).unwrap();
+        assert!(json.contains(r#""network":{"kind":"wifi","validated":true}"#));
+        let Entry::Open(back) = serde_json::from_str(&json).unwrap() else {
+            panic!("expected an open")
+        };
+        assert_eq!(back.network, Some(wifi));
+
+        let json = serde_json::to_string(&Entry::Step(changes[0].clone())).unwrap();
+        assert!(json.contains(r#""kind":"network""#));
+        assert!(json.contains(r#""network":{"kind":"cellular"}"#), "{json}");
+        let Entry::Step(back) = serde_json::from_str(&json).unwrap() else {
+            panic!("expected a step")
+        };
+        assert_eq!(back.network, Some(cellular));
+
+        // Nothing reported: nothing written, not a guess.
+        let rec = Recorder::start(&RecordConfig::in_memory(), Role::Exit, None, vec![], true);
+        let snap = rec.snapshot().unwrap();
+        assert_eq!(snap.open.network, None);
+        let json = serde_json::to_string(&Entry::Open(snap.open)).unwrap();
+        assert!(!json.contains("network"));
     }
 
     #[test]
@@ -2144,6 +2644,116 @@ mod tests {
         assert_eq!(snap.failure_reasons(), vec![Reason::NoResponse]);
     }
 
+    /// A run whose last session the peer closed was not lost — and its
+    /// `session_end` is no failure — while one whose session died was.
+    #[test]
+    fn a_session_the_peer_closed_is_not_a_lost_one() {
+        let start = || Recorder::start(&RecordConfig::in_memory(), Role::Exit, None, vec![], true);
+
+        let closed = start();
+        closed.mark(StepKind::SessionUp).ok();
+        closed.mark(StepKind::SessionEnd).ok_because(
+            Reason::PeerClosed,
+            "closed by peer: transport dropped (code 0)",
+        );
+        closed.close_shutdown(Some(Reason::LocalShutdown));
+        let snap = closed.snapshot().unwrap();
+        assert_eq!(snap.outcome(), Outcome::ClosedByPeer);
+        assert_eq!(snap.first_failure().map(|s| s.kind), None);
+        let end = snap.steps_of(StepKind::SessionEnd).next().unwrap();
+        assert_eq!(
+            (end.outcome, end.reason),
+            (StepOutcome::Ok, Some(Reason::PeerClosed))
+        );
+
+        let died = start();
+        died.mark(StepKind::SessionUp).ok();
+        died.mark(StepKind::SessionEnd)
+            .fail(Reason::IdleTimeout, "timed out");
+        died.close_shutdown(Some(Reason::LocalShutdown));
+        assert_eq!(died.snapshot().unwrap().outcome(), Outcome::Lost);
+
+        // The peer closed one session, but a later one died: lost.
+        let both = start();
+        both.mark(StepKind::SessionUp).ok();
+        both.mark(StepKind::SessionEnd)
+            .ok_because(Reason::PeerClosed, "closed by peer");
+        both.mark(StepKind::SessionUp).ok();
+        both.mark(StepKind::SessionEnd)
+            .fail(Reason::KeepaliveTimeout, "silent");
+        both.close_shutdown(Some(Reason::LocalShutdown));
+        assert_eq!(both.snapshot().unwrap().outcome(), Outcome::Lost);
+
+        // Dropped without a close, the derivation is the same.
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let sink = entries.clone();
+        let cfg = RecordConfig::in_memory().with_subscriber(Arc::new(move |e: &Entry| {
+            sink.lock().unwrap().push(e.clone());
+        }));
+        let dropped = Recorder::start(&cfg, Role::Exit, None, vec![], true);
+        dropped.mark(StepKind::SessionUp).ok();
+        dropped
+            .mark(StepKind::SessionEnd)
+            .ok_because(Reason::PeerClosed, "closed by peer");
+        drop(dropped);
+        let close = closing(&entries).expect("an ending was written");
+        assert_eq!(close.outcome, Outcome::ClosedByPeer);
+    }
+
+    /// Only a deliberate close — application code 0 — is the peer's ordinary
+    /// end of a session. A peer that closed it because it found it dead, a
+    /// transport-level close and this end's own close are not, and a session
+    /// that went quiet keeps its own code.
+    #[test]
+    fn a_session_close_is_peer_closed_only_when_the_peer_meant_it() {
+        use quinn::{ApplicationClose, ConnectionClose, ConnectionError as C, TransportErrorCode};
+        let app = |code: u32, reason: &'static [u8]| {
+            C::ApplicationClosed(ApplicationClose {
+                error_code: quinn::VarInt::from_u32(code),
+                reason: bytes::Bytes::from_static(reason),
+            })
+        };
+        let reason = |e: C| Fault::from_quinn_session(&e).reason;
+
+        assert_eq!(reason(app(0, b"transport dropped")), Reason::PeerClosed);
+        assert_eq!(reason(app(0, b"share-cancelled")), Reason::PeerClosed);
+        assert_eq!(
+            reason(app(
+                crate::transport::quic::SESSION_DEAD_CODE,
+                b"session-dead"
+            )),
+            Reason::TransportClosed
+        );
+        assert_eq!(reason(app(1, b"auth-error")), Reason::TransportClosed);
+        assert_eq!(
+            reason(C::ConnectionClosed(ConnectionClose {
+                error_code: TransportErrorCode::NO_ERROR,
+                frame_type: None,
+                reason: bytes::Bytes::new(),
+            })),
+            Reason::TransportClosed
+        );
+        assert_eq!(reason(C::LocallyClosed), Reason::TransportClosed);
+        assert_eq!(reason(C::TimedOut), Reason::IdleTimeout);
+        assert_eq!(reason(C::Reset), Reason::ConnectReset);
+    }
+
+    /// An exit's new session comes up before the one it replaces records its
+    /// end: the run stays up — and connected — until the last one ends.
+    #[test]
+    fn an_overlapping_replacement_keeps_the_run_up() {
+        let rec = Recorder::start(&RecordConfig::in_memory(), Role::Exit, None, vec![], true);
+        rec.for_session(1).mark(StepKind::SessionUp).ok();
+        rec.for_session(2).mark(StepKind::SessionUp).ok();
+        rec.for_session(1)
+            .mark(StepKind::SessionEnd)
+            .ok_because(Reason::Replaced, "a newer session took its place");
+        rec.close_shutdown(Some(Reason::LocalShutdown));
+        let close = rec.snapshot().unwrap().close.unwrap();
+        assert_eq!(close.outcome, Outcome::ClosedLocally);
+        assert_eq!(close.sessions, 2);
+    }
+
     /// Closing twice must not produce two endings — several teardown paths
     /// racing each other is normal.
     #[test]
@@ -2158,9 +2768,17 @@ mod tests {
     #[test]
     fn a_written_record_reads_back_the_same() {
         let dir = std::env::temp_dir().join(format!("spora-record-test-{}", new_id()));
-        let cfg = RecordConfig::in_dir(&dir);
+        let ethernet = NetworkState {
+            kind: NetworkKind::Ethernet,
+            validated: None,
+        };
+        let cfg = RecordConfig::in_dir(&dir).with_network(ethernet);
         let rec = Recorder::start(&cfg, Role::Exit, Some(&[1, 2, 3]), vec![], false);
         rec.mark(StepKind::ListenerBind).local("0.0.0.0:41234").ok();
+        rec.network(NetworkState {
+            kind: NetworkKind::Wifi,
+            validated: Some(false),
+        });
         rec.step(StepKind::Register)
             .via("192.0.2.1:443")
             .fail(Reason::NoResponse, "no ack");
@@ -2196,6 +2814,17 @@ mod tests {
         assert_eq!(from_disk.samples[0].rtt_ms, Some(42.0));
         assert!(!from_disk.truncated);
         assert_eq!(from_disk.open.role, Role::Exit);
+        assert_eq!(from_disk.open.network, Some(ethernet));
+        assert_eq!(
+            from_disk
+                .steps_of(StepKind::Network)
+                .map(|s| s.network)
+                .collect::<Vec<_>>(),
+            vec![Some(NetworkState {
+                kind: NetworkKind::Wifi,
+                validated: Some(false),
+            })]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2245,12 +2874,212 @@ mod tests {
         assert!(close.detail.as_deref().unwrap_or("").contains("dropped"));
     }
 
+    fn networks(rec: &Record) -> Vec<Option<NetworkState>> {
+        rec.steps_of(StepKind::Network).map(|s| s.network).collect()
+    }
+
+    fn closing(entries: &Mutex<Vec<Entry>>) -> Option<Close> {
+        entries.lock().unwrap().iter().find_map(|e| match e {
+            Entry::Close(c) => Some(c.clone()),
+            _ => None,
+        })
+    }
+
+    /// A platform's reports reach every run started with the feed, from the
+    /// moment its record opens (a run still dialing included), and stop at
+    /// each run's close. The feed never keeps a run alive.
+    #[test]
+    fn a_network_feed_reaches_every_open_run_until_it_closes() {
+        let wifi = NetworkState {
+            kind: NetworkKind::Wifi,
+            validated: Some(false),
+        };
+        let cellular = NetworkState {
+            kind: NetworkKind::Cellular,
+            validated: Some(true),
+        };
+        let none = NetworkState {
+            kind: NetworkKind::None,
+            validated: None,
+        };
+        let feed = NetworkFeed::new();
+        assert_eq!(feed.current(), None);
+        let cfg = RecordConfig::in_memory()
+            .with_network(wifi)
+            .with_network_feed(feed.clone());
+
+        // Nothing reported yet: the run opens on the config's own state.
+        let first = Recorder::start(&cfg, Role::Client, None, vec![], true);
+        feed.set(cellular);
+        assert_eq!(feed.current(), Some(cellular));
+        // Reported since: a later run opens on the feed's state.
+        let second = Recorder::start(&cfg, Role::Exit, None, vec![], true);
+        first.close(Outcome::NeverConnected, None, None);
+        feed.set(none);
+        feed.set(none);
+
+        let snap = first.snapshot().unwrap();
+        assert_eq!(snap.open.network, Some(wifi));
+        assert_eq!(
+            networks(&snap),
+            vec![Some(cellular)],
+            "none after its close"
+        );
+        let snap = second.snapshot().unwrap();
+        assert_eq!(snap.open.network, Some(cellular));
+        assert_eq!(
+            networks(&snap),
+            vec![Some(none)],
+            "a repeat records nothing"
+        );
+
+        // A run whose last handle goes still gets its inferred ending.
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let sink = entries.clone();
+        let cfg = cfg.with_subscriber(Arc::new(move |e: &Entry| {
+            sink.lock().unwrap().push(e.clone());
+        }));
+        drop(Recorder::start(&cfg, Role::Client, None, vec![], true));
+        assert!(closing(&entries).is_some(), "the feed held the run open");
+        feed.set(wifi);
+    }
+
+    /// The close is the record's last entry: whatever the teardown races
+    /// past it — a step handle dropped late, a sample, a network report —
+    /// is not recorded.
+    #[test]
+    fn nothing_is_recorded_after_the_close() {
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let sink = entries.clone();
+        let cfg = RecordConfig::in_memory().with_subscriber(Arc::new(move |e: &Entry| {
+            sink.lock().unwrap().push(e.clone());
+        }));
+        let rec = Recorder::start(&cfg, Role::Client, None, vec![], true);
+        let in_flight = rec.step(StepKind::Punch);
+        rec.close(Outcome::ClosedLocally, None, None);
+        drop(in_flight);
+        rec.mark(StepKind::Mtu).ok();
+        rec.sample(SampleInput::default());
+        rec.network(NetworkState {
+            kind: NetworkKind::Wifi,
+            validated: None,
+        });
+
+        let snap = rec.snapshot().unwrap();
+        assert!(snap.steps.is_empty(), "{:?}", snap.steps);
+        assert!(snap.samples.is_empty());
+        let seen = entries.lock().unwrap();
+        assert!(matches!(seen.last(), Some(Entry::Close(_))), "{seen:?}");
+    }
+
+    /// Interval rates compare a session with its own previous sample: the
+    /// counters are per session, so a rate across two sessions is noise.
+    #[test]
+    fn sample_rates_are_per_session() {
+        let rec = Recorder::start(&RecordConfig::in_memory(), Role::Exit, None, vec![], true);
+        let (a, b) = (rec.for_session(1), rec.for_session(2));
+        let traffic = |tx_bytes| SampleInput {
+            tx_bytes,
+            rx_bytes: tx_bytes,
+            ..Default::default()
+        };
+        let pause = || std::thread::sleep(Duration::from_millis(15));
+        a.sample(traffic(100_000));
+        pause();
+        b.sample(traffic(10));
+        pause();
+        a.sample(traffic(200_000));
+        pause();
+        b.sample(traffic(1_010));
+
+        let rates: Vec<_> = rec
+            .snapshot()
+            .unwrap()
+            .samples
+            .iter()
+            .map(|s| (s.session, s.tx_bps.map(|r| r > 0)))
+            .collect();
+        assert_eq!(
+            rates,
+            vec![
+                (Some(1), None),
+                // Not a rate measured against session 1's counters.
+                (Some(2), None),
+                (Some(1), Some(true)),
+                (Some(2), Some(true)),
+            ]
+        );
+    }
+
+    /// The close totals every session's traffic, read from the counters as
+    /// the record closes — so a run shorter than the sample interval, or one
+    /// whose last sample came from an earlier session, reports what it
+    /// carried.
+    #[test]
+    fn the_close_totals_every_sessions_traffic() {
+        let rec = Recorder::start(&RecordConfig::in_memory(), Role::Client, None, vec![], true);
+        let earlier = Arc::new(LinkCounters::default());
+        let current = Arc::new(LinkCounters::default());
+        let counting = rec.for_cycle(0).count_traffic(earlier.clone());
+        earlier.tx_bytes.fetch_add(100, Ordering::Relaxed);
+        earlier.rx_bytes.fetch_add(200, Ordering::Relaxed);
+        drop(counting); // that session is over
+        let _counting = rec.for_cycle(1).count_traffic(current.clone());
+        current.tx_bytes.fetch_add(10, Ordering::Relaxed);
+        current.rx_bytes.fetch_add(20, Ordering::Relaxed);
+        // A sample from the earlier session must not decide the total.
+        rec.for_cycle(0).sample(SampleInput {
+            tx_bytes: 100,
+            rx_bytes: 200,
+            ..Default::default()
+        });
+        rec.close(Outcome::ClosedLocally, None, None);
+        let close = rec.snapshot().unwrap().close.unwrap();
+        assert_eq!((close.tx_bytes, close.rx_bytes), (110, 220));
+
+        // Sampled by hand, no session counted: the last sample's figures.
+        let rec = Recorder::start(&RecordConfig::in_memory(), Role::Client, None, vec![], true);
+        rec.sample(SampleInput {
+            tx_bytes: 7,
+            rx_bytes: 9,
+            ..Default::default()
+        });
+        rec.close(Outcome::ClosedLocally, None, None);
+        let close = rec.snapshot().unwrap().close.unwrap();
+        assert_eq!((close.tx_bytes, close.rx_bytes), (7, 9));
+    }
+
+    /// A record whose last handle goes down with a panicking thread says the
+    /// program failed, rather than passing for an ordinary ending.
+    #[test]
+    fn a_record_dropped_by_a_panic_says_it_crashed() {
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let sink = entries.clone();
+        let cfg = RecordConfig::in_memory().with_subscriber(Arc::new(move |e: &Entry| {
+            sink.lock().unwrap().push(e.clone());
+        }));
+        let rec = Recorder::start(&cfg, Role::Client, None, vec![], true);
+        let panicked = std::thread::spawn(move || {
+            let _rec = rec;
+            panic!("deliberate, to test the record's ending");
+        })
+        .join();
+        assert!(panicked.is_err());
+        let close = closing(&entries).expect("an ending was written");
+        assert_eq!(close.reason, Some(Reason::Crashed));
+        assert!(close.detail.as_deref().unwrap_or("").contains("panicked"));
+    }
+
     #[test]
     fn disabled_recording_costs_nothing_and_says_nothing() {
         let rec = Recorder::disabled();
         assert!(!rec.is_enabled());
         rec.step(StepKind::RelayDial).ok();
         rec.for_session(1).mark(StepKind::Accept).ok();
+        rec.network(NetworkState {
+            kind: NetworkKind::Wifi,
+            validated: Some(true),
+        });
         rec.close(Outcome::Connected, None, None);
         assert!(rec.snapshot().is_none());
     }

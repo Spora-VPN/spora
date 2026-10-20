@@ -36,7 +36,9 @@ spora log query --ip 203.0.113.5 --from 2026-08-01 --to 2026-08-28
 spora log sessions
 ```
 
-The log lives at `~/.local/state/spora/connlog/<routing-key>/`, keeps 90
+The log lives at `~/.local/state/spora/connlog/<routing-key>/` (in root's
+home for a share run with sudo, such as `--os-routing` below: read that
+one with `sudo spora log`), keeps 90
 days by default (`--conn-log-retention-days`), and never leaves your
 machine. `spora log hold` pins a time range against retention if you have
 been asked to preserve records. `--no-conn-log` disables logging entirely,
@@ -92,7 +94,9 @@ User=spora
 WantedBy=multi-user.target
 ```
 
-`systemctl stop` sends SIGTERM, which the CLI handles cleanly.
+`systemctl stop` sends SIGTERM, which the CLI handles cleanly, as it
+does Ctrl+C and the SIGHUP of a closed terminal or a dropped SSH
+session.
 
 ## The kernel exit
 

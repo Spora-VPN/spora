@@ -34,8 +34,9 @@ fn main() {
 /// seconds even under netem; margin for CI contention).
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Direct upgrade: STUN + endpoint exchange + punch + fresh QUIC handshake,
-/// with initiator retries every 15s (default timings) after a failed
-/// attempt — 60s covers the first attempt plus several retries.
+/// with initiator retries backing off from 15s (default timings: 15s, 30s,
+/// … after consecutive failed attempts) — 60s covers the first attempt plus
+/// one retry.
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn svc_ip() -> Ipv4Addr {

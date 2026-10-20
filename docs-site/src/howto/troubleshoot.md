@@ -3,7 +3,12 @@
 You do not have to reproduce a failure with more logging: every run of
 `share` and `use` keeps a diagnostic record of what it attempted, what
 failed, and why. When someone says "it did not work", the record is the
-thing to look at, and to send.
+thing to look at, and `spora report` is how to send it (see below).
+
+A run made with sudo (`sudo spora use`, `sudo spora share --os-routing`)
+keeps its files in root's home, so read them with sudo too: `sudo spora
+record list`. (Records that earlier versions left in your own home are
+covered in [Files and directories](../reference/files.md).)
 
 ```bash
 spora record list
@@ -21,7 +26,7 @@ people looking at two records can compare them meaningfully.
 
 ```bash
 spora record show 6a9ec9d2
-spora record export -o run.json     # attach this when asking for help
+spora record export -o run.json     # one record, as JSON, for someone else
 ```
 
 ## Reading the common outcomes
@@ -47,6 +52,16 @@ at the quality samples (`spora record show --samples`): probe loss and
 round trip time while the tunnel was up are recorded, and tell you whether
 the problem is the path or the endpoints.
 
+**`closed_locally` with reason `permission_denied` or `misconfigured`.**
+The tunnel came up, but this machine would not take it: a TUN interface
+it may not attach, a route or resolver change that was refused. The
+record's detail quotes the error. The network is not at fault.
+
+**`unknown (cut)` in `spora record list`.** The record has no ending: the
+process was killed outright (SIGKILL, a crash of the whole machine, a
+power cut) before it could write one. Ctrl+C, SIGTERM and SIGHUP all end
+a run properly, at any point.
+
 **`spora use` refuses to start.** The error names the cause directly:
 missing privileges (run with sudo, or elevate the console), another
 running instance (only one managed tunnel at a time), or on Windows a
@@ -54,7 +69,31 @@ missing `wintun.dll`.
 
 ## When you report a problem
 
-Send three things: the record (`spora record export`), the exact command
-line, and `spora build-info --json` from both ends. The build info names
-the exact source the binary was built from, so nobody debugs the wrong
-version.
+```bash
+sudo spora report --note "use stopped connecting after the router restarted"
+```
+
+This writes one zip file with the records, the diagnostic log and any
+crash reports of the last three days (`--hours` changes that), plus the
+exact build. Email it to support@spora.to with the command line you ran.
+It needs no account and no network, and telemetry does not have to be on.
+If uploads are on, the report names this machine's device id, so support
+can also find what has reached Spora already.
+
+Run it the way you ran the failing command: `sudo spora report` for
+`sudo spora use` (the zip then belongs to root, and the command prints how
+to hand it to your own account), plain `spora report` for a `spora share`
+started without sudo. On Windows an elevated console keeps your own
+files, so plain `spora report` covers both. A run that kept its records
+somewhere else (`--record-dir`) needs that directory named again:
+`spora report --record-dir ~/spora-runs`. So do the records that runs
+with sudo left in your own home under earlier versions (on macOS, say):
+`sudo spora report --record-dir ~/.local/state/spora/records`.
+
+If the report could not read a directory, it says which one and why, and
+its `manifest.json` lists it as left out.
+
+When you ask the person at the other end instead, send them the record
+(`spora record export`), the exact command line, and `spora build-info
+--json` from both ends. The build info names the exact source the binary
+was built from, so nobody debugs the wrong version.

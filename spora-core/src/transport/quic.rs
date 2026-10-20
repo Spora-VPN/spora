@@ -40,6 +40,80 @@ pub fn generate_self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'s
     (cert_der, key_der, fingerprint)
 }
 
+/// The application close code of a session this end found dead — its
+/// keepalive gave up on the peer, the client's tunnel died under its
+/// reconnect layer, an exit's handler stopped on its own — as opposed to code
+/// 0, which every deliberate end uses (a client or an exit stopping, an exit
+/// taking a newer client, the old path of an upgrade swap, and
+/// [`QuicPeerTransport`]'s `Drop`). The peer's record tells the two apart
+/// (`peer_closed` is an ordinary end, this is a failure; see
+/// [`Fault::from_quinn_session`](crate::record::Fault::from_quinn_session)).
+/// Code 1 is the handshake's refusals (`e2e`).
+pub const SESSION_DEAD_CODE: u32 = 2;
+
+/// Close `conn` as a session this end found dead (see [`SESSION_DEAD_CODE`]).
+/// A connection that is already closed — the peer's close, an idle timeout —
+/// keeps the close it had: quinn ignores a second one.
+pub(crate) fn close_dead(conn: &Connection) {
+    conn.close(SESSION_DEAD_CODE.into(), b"session-dead");
+}
+
+/// Close `conn` on purpose (code 0, `reason`), and give the CONNECTION_CLOSE
+/// up to `grace` to be handed to the socket — for a process that is about to
+/// exit, whose runtime would otherwise drop the connection's driver before it
+/// ever sends the close, so the peer would hear nothing and declare the
+/// session dead only when its keepalive gives up. Returns at once when the
+/// peer closed it or it timed out (there is nothing to send).
+pub(crate) async fn close_and_flush(conn: &Connection, reason: &[u8], grace: Duration) {
+    match conn.close_reason() {
+        None => {}
+        // Closed here already — the transport was dropped first, whose own
+        // close is queued with the driver woken to send it, but nothing says
+        // when it has: give it a moment.
+        Some(quinn::ConnectionError::LocallyClosed) => {
+            tokio::time::sleep(grace.min(Duration::from_millis(50))).await;
+            return;
+        }
+        Some(_) => return,
+    }
+    // quinn counts a datagram when it builds it, inside the same driver
+    // pass that hands it to the socket — so a count past this one, read
+    // under the connection lock, is a CONNECTION_CLOSE already sent.
+    let sent_before = conn.stats().udp_tx.datagrams;
+    conn.close(0u32.into(), reason);
+    let flushed = tokio::time::timeout(grace, async {
+        while conn.stats().udp_tx.datagrams == sent_before {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+    if flushed.is_err() {
+        debug!("QUIC close not sent within {grace:?}");
+    }
+}
+
+/// How a session's connection closed, for the log: an orderly close is part
+/// of normal lifecycle, a peer that found the session dead is worth a
+/// warning, everything else (timeouts, resets, transport errors, unexpected
+/// codes) keeps ERROR severity.
+fn close_severity(e: &quinn::ConnectionError) -> log::Level {
+    match e {
+        // Our own side going first.
+        quinn::ConnectionError::LocallyClosed => log::Level::Info,
+        quinn::ConnectionError::ApplicationClosed(c)
+            if c.error_code == quinn::VarInt::from_u32(0) =>
+        {
+            log::Level::Info
+        }
+        quinn::ConnectionError::ApplicationClosed(c)
+            if c.error_code == quinn::VarInt::from_u32(SESSION_DEAD_CODE) =>
+        {
+            log::Level::Warn
+        }
+        _ => log::Level::Error,
+    }
+}
+
 /// A `Transport` that carries IP packets as QUIC datagrams over a P2P connection.
 pub struct QuicPeerTransport {
     rx: mpsc::UnboundedReceiver<io::Result<Vec<u8>>>,
@@ -83,13 +157,10 @@ impl QuicPeerTransport {
                         // `LocallyClosed` is our own side going first. Logging
                         // those at ERROR buries the closes that DO matter —
                         // timeouts, resets, transport errors, unexpected close
-                        // codes — which keep ERROR severity.
-                        let orderly = matches!(&e, quinn::ConnectionError::LocallyClosed)
-                            || matches!(
-                                &e,
-                                quinn::ConnectionError::ApplicationClosed(c)
-                                    if c.error_code == quinn::VarInt::from_u32(0)
-                            );
+                        // codes — which keep ERROR severity. A peer that found
+                        // the session dead (`SESSION_DEAD_CODE`) is a warning:
+                        // the failure is its own, and its log has it.
+                        let severity = close_severity(&e);
                         let stats = read_conn.stats();
                         let msg = format!(
                             "P2P QUIC connection {}: {}. \
@@ -97,7 +168,11 @@ impl QuicPeerTransport {
                              sent_pkts={}, lost_pkts={}, lost_bytes={}, \
                              pmtud_sent={}, pmtud_lost={}, black_holes={}, \
                              datagrams_tx={}, datagrams_rx={}",
-                            if orderly { "closed" } else { "died" },
+                            if severity == log::Level::Info {
+                                "closed"
+                            } else {
+                                "died"
+                            },
                             e,
                             stats.path.current_mtu,
                             read_conn.max_datagram_size(),
@@ -111,15 +186,15 @@ impl QuicPeerTransport {
                             stats.frame_tx.datagram,
                             stats.frame_rx.datagram,
                         );
-                        if orderly {
-                            info!("{msg}");
-                        } else {
-                            error!("{msg}");
-                        }
-                        let _ = tx.send(Err(io::Error::other(format!(
-                            "QUIC read_datagram error: {}",
-                            e
-                        ))));
+                        log::log!(severity, "{msg}");
+                        // Classified here, where the reason is first-hand:
+                        // once this end drops the transport, quinn reports
+                        // the connection as locally closed whatever ended it.
+                        // The keepalive layer keeps it as the session's end.
+                        let _ = tx.send(Err(io::Error::from(
+                            crate::record::Fault::from_quinn_session(&e)
+                                .context("QUIC read_datagram error"),
+                        )));
                         break;
                     }
                 }
@@ -129,7 +204,9 @@ impl QuicPeerTransport {
         // lost_pkts accruing under a sustained transfer is the bufferbloat /
         // congestion-collapse signature. Per-2s deltas for datagrams/loss;
         // stops when the connection closes. Enable with
-        // `RUST_LOG=spora_core::transport::quic=debug`.
+        // `RUST_LOG=spora_core::stats=debug`. The diagnostic log file never
+        // keeps this target: the connection record's samples carry the same
+        // figures every 30s.
         let stats_conn = conn.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -146,6 +223,7 @@ impl QuicPeerTransport {
                     s.path.lost_packets,
                 );
                 debug!(
+                    target: crate::STATS_LOG_TARGET,
                     "QUIC path stats: rtt={:?} cwnd={} mtu={} mds={:?} | \
                      datagrams tx={} (+{}) rx={} (+{}) | lost_pkts={} (+{}) black_holes={}",
                     s.path.rtt,
@@ -257,7 +335,9 @@ impl Drop for QuicPeerTransport {
         // relay-via connection drains and times out". Closing sends
         // CONNECTION_CLOSE and unblocks the reader (`read_datagram` -> Err) and
         // stats (`close_reason()` -> Some) tasks so they exit and release the
-        // connection.
+        // connection. Code 0 says the session ended on purpose; a session
+        // that died was closed with `SESSION_DEAD_CODE` before its transport
+        // was dropped (`close_dead`), and quinn keeps that first close.
         self.conn.close(0u32.into(), b"transport dropped");
         self._reader.abort();
     }
@@ -277,6 +357,18 @@ fn send_datagram_logged(conn: &Connection, pkt: Vec<u8>) -> io::Result<()> {
                 conn.max_datagram_size(),
             );
             Ok(())
+        }
+        // The connection is gone: say why the way the reader does, because
+        // this error can reach the session's end first (a send racing the
+        // reader to the close) and the end is classified from it.
+        Err(quinn::SendDatagramError::ConnectionLost(ce)) => {
+            log::log!(
+                close_severity(&ce),
+                "P2P QUIC send_datagram: connection lost: {ce}"
+            );
+            Err(io::Error::from(
+                crate::record::Fault::from_quinn_session(&ce).context("QUIC send_datagram error"),
+            ))
         }
         Err(e) => {
             let stats = conn.stats();

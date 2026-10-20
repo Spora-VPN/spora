@@ -59,7 +59,7 @@ Keep the session on its initial relay/carrier path instead of attempting a direc
 Capability token authorizing this sharer to use the relay(s), when the relay requires one. Accepts a base64url token (as printed by `spora-issuer issue`) or a path to a file containing it. Not needed for open-mode relays
 
 **`--no-conn-log`** *(default `false`)*  
-Disable the connection log. By default the sharer keeps a local per-flow record (who connected to which destination, when) at $XDG_STATE_HOME/spora/connlog/\<routing-key\>/, the sharer's own egress accountability record for answering abuse reports
+Disable the connection log. By default the sharer keeps a local per-flow record (who connected to which destination, when) at $XDG_STATE_HOME/spora/connlog/\<routing-key\>/ (in root's home for a run with sudo), the sharer's own egress accountability record for answering abuse reports
 
 **`--dns-upstream <DNS_UPSTREAM>`** *(repeatable)*  
 Answer clients' DNS queries from these servers (ip or ip:port, repeatable, in preference order) instead of this host's own resolvers. Used exclusively: no public fallback
@@ -80,13 +80,16 @@ Log sessions only (who was connected and when), without per-flow destination rec
 Don't keep a diagnostic record of how each connection went
 
 **`--record-dir <RECORD_DIR>`**  
-Override the diagnostic-record directory (default: $XDG_STATE_HOME/spora/records/)
+Override the diagnostic-record directory (default: $XDG_STATE_HOME/spora/records/, in root's home for a run with sudo). Uploads only take the default directory; `spora report --record-dir` bundles another
 
 **`--record-label <RECORD_LABEL>`**  
 Label this machine in every record it writes
 
 **`--record-id <RECORD_ID>`**  
 Tie the records from this run to something outside it: a ticket, a test run
+
+**`--no-diag-log`** *(default `false`)*  
+Don't write the diagnostic log to disk. By default it is also kept at $XDG_STATE_HOME/spora/log/ (in root's home for a run with sudo; at most 16 MiB and 14 days, with any crash reports), so `spora report` can bundle it
 
 **`--json`** *(default `false`)*  
 Emit newline-delimited JSON lifecycle events on stdout
@@ -139,13 +142,16 @@ Pin the interface MTU (576..=1500) instead of following the path's discovered bu
 Don't keep a diagnostic record of how the connection went
 
 **`--record-dir <RECORD_DIR>`**  
-Override the diagnostic-record directory (default: $XDG_STATE_HOME/spora/records/)
+Override the diagnostic-record directory (default: $XDG_STATE_HOME/spora/records/, in root's home for a run with sudo). Uploads only take the default directory; `spora report --record-dir` bundles another
 
 **`--record-label <RECORD_LABEL>`**  
 Label this machine in every record it writes
 
 **`--record-id <RECORD_ID>`**  
 Tie this run's record to something outside it: a ticket, a test run
+
+**`--no-diag-log`** *(default `false`)*  
+Don't write the diagnostic log to disk. By default it is also kept at $XDG_STATE_HOME/spora/log/ (in root's home for a run with sudo; at most 16 MiB and 14 days, with any crash reports), so `spora report` can bundle it
 
 **`--json`** *(default `false`)*  
 Emit newline-delimited JSON lifecycle events on stdout
@@ -163,7 +169,7 @@ Emit the complete build identity as JSON
 
 ## `spora log`
 
-Inspect the share's connection log (see docs/connection-logging.md)
+Inspect the share's connection log: which client reached which destination, and when. It stays on this machine
 
 ```text
 spora log <COMMAND>
@@ -371,7 +377,7 @@ spora log help help
 
 ## `spora record`
 
-Read the diagnostic records of past connections: what was attempted, what failed, and why (see docs/diagnostic-record.md)
+Read the diagnostic records of past connections: what was attempted, what failed, and why
 
 ```text
 spora record <COMMAND>
@@ -386,7 +392,7 @@ spora record list [OPTIONS]
 ```
 
 **`--dir <DIR>`**  
-Record directory (default: $XDG_STATE_HOME/spora/records/)
+Record directory (default: $XDG_STATE_HOME/spora/records/, in root's home for a run with sudo)
 
 **`--count <COUNT>`** *(default `20`)*  
 How many records to list, newest first
@@ -469,6 +475,120 @@ Print this message or the help of the given subcommand(s)
 spora record help help
 ```
 
+## `spora report`
+
+Bundle the recent diagnostic records, diagnostic log and crash reports of this machine into one zip file to send with a bug report. Works offline and whether or not telemetry is on; manifest.json inside lists everything included and everything left out. The files of runs made with sudo (such as `sudo spora use`) belong to root: bundle those with `sudo spora report`
+
+```text
+spora report [OPTIONS]
+```
+
+**`--out <OUT>`**  
+Where to write the zip (default: spora-report-\<time\>.zip in the current directory)
+
+**`--note <NOTE>`**  
+A few words for whoever reads the report: what you were doing, what went wrong
+
+**`--hours <HOURS>`** *(default `72`)*  
+How far back to look, in hours
+
+**`--record-dir <RECORD_DIR>`** *(repeatable)*  
+Also bundle the records in this directory: one a run's --record-dir pointed at. The default directory is always included
+
+## `spora telemetry`
+
+Telemetry: whether this machine sends its diagnostic records, diagnostic log and crash reports to Spora. They show where and how networks block Spora, and help fix problems. They include network addresses: the public address your network shows, the addresses of the peers, relays and other servers this machine connects with, and the address each upload comes from. Off unless you turn it on. Either way everything is still kept on this machine, for `spora report`. For runs made with sudo (such as `sudo spora use`), use `sudo spora telemetry`
+
+```text
+spora telemetry <COMMAND>
+```
+
+## `spora telemetry status`
+
+Whether uploads are on, whether your account requires them, this machine's device id, and how the last upload went
+
+```text
+spora telemetry status [OPTIONS]
+```
+
+**`--json`** *(default `false`)*  
+Machine-readable JSON output
+
+## `spora telemetry on`
+
+Turn uploads on. `spora share` and `spora use` send what is pending in the background (running ones within 15 minutes) and once more as they stop
+
+```text
+spora telemetry on
+```
+
+## `spora telemetry off`
+
+Turn uploads off: nothing more is uploaded. A machine registered earlier still asks the API once a day whether its account requires telemetry. Refused while your account requires telemetry
+
+```text
+spora telemetry off
+```
+
+## `spora telemetry upload`
+
+With uploads on, send everything not sent yet, now, and say what went. Registers this machine with the API first if it has not been. Without --api or $SPORA_API that is Spora's built-in API, and its registration keeps working at whatever addresses later versions give that API. --api and $SPORA_API name another API, even at the built-in address: this machine registers anew there, the token it gets goes only to the addresses that issued it, and the other registration is kept for when its API is used again
+
+```text
+spora telemetry upload [OPTIONS]
+```
+
+**`--api <API>`** *(repeatable)*  
+API base URL (repeat for fallbacks, tried in order). Overrides $SPORA_API (a comma-separated list) and the built-in API
+
+## `spora telemetry help`
+
+Print this message or the help of the given subcommand(s)
+
+```text
+spora telemetry help [COMMAND]
+```
+
+## `spora telemetry help status`
+
+Whether uploads are on, whether your account requires them, this machine's device id, and how the last upload went
+
+```text
+spora telemetry help status
+```
+
+## `spora telemetry help on`
+
+Turn uploads on. `spora share` and `spora use` send what is pending in the background (running ones within 15 minutes) and once more as they stop
+
+```text
+spora telemetry help on
+```
+
+## `spora telemetry help off`
+
+Turn uploads off: nothing more is uploaded. A machine registered earlier still asks the API once a day whether its account requires telemetry. Refused while your account requires telemetry
+
+```text
+spora telemetry help off
+```
+
+## `spora telemetry help upload`
+
+With uploads on, send everything not sent yet, now, and say what went. Registers this machine with the API first if it has not been. Without --api or $SPORA_API that is Spora's built-in API, and its registration keeps working at whatever addresses later versions give that API. --api and $SPORA_API name another API, even at the built-in address: this machine registers anew there, the token it gets goes only to the addresses that issued it, and the other registration is kept for when its API is used again
+
+```text
+spora telemetry help upload
+```
+
+## `spora telemetry help help`
+
+Print this message or the help of the given subcommand(s)
+
+```text
+spora telemetry help help
+```
+
 ## `spora help`
 
 Print this message or the help of the given subcommand(s)
@@ -503,7 +623,7 @@ spora help build-info
 
 ## `spora help log`
 
-Inspect the share's connection log (see docs/connection-logging.md)
+Inspect the share's connection log: which client reached which destination, and when. It stays on this machine
 
 ```text
 spora help log [COMMAND]
@@ -559,7 +679,7 @@ spora help log hold remove
 
 ## `spora help record`
 
-Read the diagnostic records of past connections: what was attempted, what failed, and why (see docs/diagnostic-record.md)
+Read the diagnostic records of past connections: what was attempted, what failed, and why
 
 ```text
 spora help record [COMMAND]
@@ -587,6 +707,54 @@ Write records out as JSON, for handing to someone else
 
 ```text
 spora help record export
+```
+
+## `spora help report`
+
+Bundle the recent diagnostic records, diagnostic log and crash reports of this machine into one zip file to send with a bug report. Works offline and whether or not telemetry is on; manifest.json inside lists everything included and everything left out. The files of runs made with sudo (such as `sudo spora use`) belong to root: bundle those with `sudo spora report`
+
+```text
+spora help report
+```
+
+## `spora help telemetry`
+
+Telemetry: whether this machine sends its diagnostic records, diagnostic log and crash reports to Spora. They show where and how networks block Spora, and help fix problems. They include network addresses: the public address your network shows, the addresses of the peers, relays and other servers this machine connects with, and the address each upload comes from. Off unless you turn it on. Either way everything is still kept on this machine, for `spora report`. For runs made with sudo (such as `sudo spora use`), use `sudo spora telemetry`
+
+```text
+spora help telemetry [COMMAND]
+```
+
+## `spora help telemetry status`
+
+Whether uploads are on, whether your account requires them, this machine's device id, and how the last upload went
+
+```text
+spora help telemetry status
+```
+
+## `spora help telemetry on`
+
+Turn uploads on. `spora share` and `spora use` send what is pending in the background (running ones within 15 minutes) and once more as they stop
+
+```text
+spora help telemetry on
+```
+
+## `spora help telemetry off`
+
+Turn uploads off: nothing more is uploaded. A machine registered earlier still asks the API once a day whether its account requires telemetry. Refused while your account requires telemetry
+
+```text
+spora help telemetry off
+```
+
+## `spora help telemetry upload`
+
+With uploads on, send everything not sent yet, now, and say what went. Registers this machine with the API first if it has not been. Without --api or $SPORA_API that is Spora's built-in API, and its registration keeps working at whatever addresses later versions give that API. --api and $SPORA_API name another API, even at the built-in address: this machine registers anew there, the token it gets goes only to the addresses that issued it, and the other registration is kept for when its API is used again
+
+```text
+spora help telemetry upload
 ```
 
 ## `spora help help`

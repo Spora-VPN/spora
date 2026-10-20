@@ -1,0 +1,35 @@
+[package]
+name = "spora-service"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+description = "Spora's service layer: the on-device diagnostic log, crash capture, bug-report bundles and the telemetry uploader"
+
+[lib]
+name = "spora_service"
+
+[dependencies]
+spora-core = { path = "../spora-core" }
+log = { version = "0.4.29", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# One codec for both compressed formats this crate writes: gzip request bodies
+# and the bug-report zip's deflate entries (pure-Rust miniz_oxide backend).
+flate2 = "1.1"
+# Blocking HTTP for the uploader thread, so no caller has to lend it a tokio
+# runtime. The `rustls` feature is rustls with the ring provider and the
+# webpki-roots trust anchors; default features off also drops ureq's response
+# decompression, which nothing here needs (responses are a few bytes of JSON).
+ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+
+# Unix: opening a listed file without following a symlink swapped in since
+# (O_NOFOLLOW, whose value differs per architecture; fsutil::open_listed).
+# Android also: std's File::try_lock is Unsupported there (std leaves it out
+# of its flock targets); bionic has flock(2), called directly
+# (fsutil::try_lock, tested on Linux against std's).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

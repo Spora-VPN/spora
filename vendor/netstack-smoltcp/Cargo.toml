@@ -1,7 +1,11 @@
 # Vendored fork of netstack-smoltcp 0.2.0 (https://github.com/cavivie/netstack-smoltcp).
 # Vendored so spora can carry fixes the upstream crate hasn't released:
 #   - half-closed inbound TCP streams no longer drop their tail (tcp.rs),
-#   - share-side TCP sockets use Cubic congestion control (tcp.rs).
+#   - share-side TCP sockets use Cubic congestion control (tcp.rs),
+#   - every log line naming a flow's address logs on spora's flow target
+#     (`FLOW_TARGET` = "spora_core::flow", lib.rs), which spora keeps off its
+#     diagnostic log file; the socket-cap warning is split into an
+#     address-free warning plus the latest refused SYN on that target.
 # See git history for the exact diffs from upstream 0.2.0. Library only — the
 # upstream example and its dev-dependencies are not vendored.
 [package]

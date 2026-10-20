@@ -73,7 +73,10 @@ impl Stream for ReadHalf {
                 let packet = match UdpPacket::new_checked(payload) {
                     Ok(p) => p,
                     Err(err) => {
-                        error!("invalid err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, payload: {payload:?}");
+                        error!(
+                            target: crate::FLOW_TARGET,
+                            "invalid err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, payload: {payload:?}"
+                        );
                         return None;
                     }
                 };
@@ -83,7 +86,12 @@ impl Stream for ReadHalf {
                 let src_addr = SocketAddr::new(src_ip, src_port);
                 let dst_addr = SocketAddr::new(dst_ip, dst_port);
 
-                trace!("created UDP socket for {} <-> {}", src_addr, dst_addr);
+                trace!(
+                    target: crate::FLOW_TARGET,
+                    "created UDP socket for {} <-> {}",
+                    src_addr,
+                    dst_addr
+                );
 
                 Some((packet.payload().to_vec(), src_addr, dst_addr))
             })

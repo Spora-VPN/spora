@@ -56,7 +56,7 @@ use log::{debug, info, warn};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 
-use crate::SocketProtector;
+use crate::{FLOW_LOG_TARGET, SocketProtector};
 
 /// The synthetic resolver address a client sets as its DNS server. Inside the
 /// tunnel only; the exit answers it by rewriting to a real upstream. CGNAT
@@ -696,12 +696,15 @@ pub async fn forward_query(
                 });
             }
             Err(Attempt::Timeout) => {
-                debug!("dns forwarder: {up} did not answer within {timeout:?}");
+                // Per attempt, so per client query: the flow target (see
+                // `crate::FLOW_LOG_TARGET`). The upstream's health changes
+                // (`DnsForwarder::timed_out`/`failed`) log on their own.
+                debug!(target: FLOW_LOG_TARGET, "dns forwarder: {up} did not answer within {timeout:?}");
                 fwd.timed_out(up);
                 last = Some(io::Error::new(io::ErrorKind::TimedOut, "no answer"));
             }
             Err(Attempt::Io(e)) => {
-                debug!("dns forwarder: {up}: {e}");
+                debug!(target: FLOW_LOG_TARGET, "dns forwarder: {up}: {e}");
                 fwd.failed(up);
                 last = Some(e);
             }
@@ -789,12 +792,12 @@ pub async fn dial_tcp(
                 return Ok((stream, up, egress));
             }
             Ok(Err(e)) => {
-                debug!("dns forwarder: tcp {up}: {e}");
+                debug!(target: FLOW_LOG_TARGET, "dns forwarder: tcp {up}: {e}");
                 fwd.failed(up);
                 last = Some(e);
             }
             Err(_) => {
-                debug!("dns forwarder: tcp {up}: connect timed out");
+                debug!(target: FLOW_LOG_TARGET, "dns forwarder: tcp {up}: connect timed out");
                 fwd.timed_out(up);
                 last = Some(io::Error::new(io::ErrorKind::TimedOut, "connect timed out"));
             }
@@ -828,8 +831,13 @@ pub async fn serve_udp(sock: UdpSocket, fwd: Arc<DnsForwarder>, protector: Socke
                 continue;
             }
         };
+        // Lines naming the client go to the flow target (see
+        // `crate::FLOW_LOG_TARGET`), like the netstack's.
         let Ok(permit) = inflight.clone().try_acquire_owned() else {
-            debug!("dns forwarder: {MAX_INFLIGHT} queries in flight; dropping one from {src}");
+            debug!(
+                target: FLOW_LOG_TARGET,
+                "dns forwarder: {MAX_INFLIGHT} queries in flight; dropping one from {src}"
+            );
             continue;
         };
         let query = buf[..n].to_vec();
@@ -839,10 +847,10 @@ pub async fn serve_udp(sock: UdpSocket, fwd: Arc<DnsForwarder>, protector: Socke
             match forward_query(&fwd, &query, &protector).await {
                 Ok(answer) => {
                     if let Err(e) = sock.send_to(&answer.response, src).await {
-                        debug!("dns forwarder: reply to {src}: {e}");
+                        debug!(target: FLOW_LOG_TARGET, "dns forwarder: reply to {src}: {e}");
                     }
                 }
-                Err(e) => debug!("dns forwarder: query from {src}: {e}"),
+                Err(e) => debug!(target: FLOW_LOG_TARGET, "dns forwarder: query from {src}: {e}"),
             }
         });
     }
@@ -862,7 +870,10 @@ pub async fn serve_tcp(listener: TcpListener, fwd: Arc<DnsForwarder>, protector:
             }
         };
         let Ok(permit) = inflight.clone().try_acquire_owned() else {
-            debug!("dns forwarder: {MAX_INFLIGHT} tcp connections in flight; refusing {peer}");
+            debug!(
+                target: FLOW_LOG_TARGET,
+                "dns forwarder: {MAX_INFLIGHT} tcp connections in flight; refusing {peer}"
+            );
             continue;
         };
         let (fwd, protector) = (fwd.clone(), protector.clone());
@@ -872,10 +883,10 @@ pub async fn serve_tcp(listener: TcpListener, fwd: Arc<DnsForwarder>, protector:
                 Ok((mut upstream, up, _egress)) => {
                     if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await
                     {
-                        debug!("dns forwarder: tcp relay {peer} <-> {up}: {e}");
+                        debug!(target: FLOW_LOG_TARGET, "dns forwarder: tcp relay {peer} <-> {up}: {e}");
                     }
                 }
-                Err(e) => debug!("dns forwarder: tcp from {peer}: {e}"),
+                Err(e) => debug!(target: FLOW_LOG_TARGET, "dns forwarder: tcp from {peer}: {e}"),
             }
         });
     }

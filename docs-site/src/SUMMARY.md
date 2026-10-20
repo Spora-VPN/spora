@@ -12,6 +12,7 @@
 - [Run your own relay](howto/relay.md)
 - [Drive the CLI from scripts](howto/automation.md)
 - [Find out why a connection failed](howto/troubleshoot.md)
+- [Send diagnostics to Spora](howto/telemetry.md)
 
 # Reference
 

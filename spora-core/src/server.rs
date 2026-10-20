@@ -1,17 +1,13 @@
-use crate::SocketProtector;
 use crate::connlog::{FlowGuard, SessionLog};
 use crate::dns::{self, DnsForwarder};
 use crate::transport::IpTransport;
+use crate::{FLOW_LOG_TARGET, STATS_LOG_TARGET, SocketProtector};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use log::{debug, error, info, trace, warn};
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-
-/// How many distinct blocked destinations a session reports at warn level
-/// before further ones are only logged at debug.
-const BLOCKED_SEEN_CAP: usize = 256;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +22,10 @@ const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 
 const EGRESS_CHANNEL_CAPACITY: usize = 4096;
+
+/// How many distinct blocked destinations a session reports at warn level,
+/// per protocol, before further ones are only logged at trace.
+const BLOCKED_SEEN_CAP: usize = 256;
 
 /// Guard that aborts a set of tasks when dropped.
 struct AbortOnDrop(Vec<AbortHandle>);
@@ -78,36 +78,47 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
     // two directions and works around a waker bug in the upstream Sink impl
     // (poll_ready / poll_flush return Pending without registering a waker when
     // the internal tcp_tx channel is full, which permanently parks the caller).
-    let stack_driver =
-        tokio::spawn(async move {
-            use std::future::Future;
-            use std::pin::Pin;
-            use std::task::Poll;
+    let stack_driver = tokio::spawn(async move {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::Poll;
 
-            let mut pending_ingress: Option<Vec<u8>> = None;
+        let mut pending_ingress: Option<Vec<u8>> = None;
 
-            // --- Diagnostic counters ---
-            let mut ingress_delivered: u64 = 0; // packets pushed into stack
-            let mut ingress_flush_pending: u64 = 0; // times poll_flush returned Pending
-            let mut ingress_ready_pending: u64 = 0; // times poll_ready returned Pending
-            let mut egress_produced: u64 = 0; // packets emitted by stack
-            let mut egress_dropped: u64 = 0; // egress_tx.try_send failures
+        // --- Diagnostic counters ---
+        let mut ingress_delivered: u64 = 0; // packets pushed into stack
+        let mut ingress_flush_pending: u64 = 0; // times poll_flush returned Pending
+        let mut ingress_ready_pending: u64 = 0; // times poll_ready returned Pending
+        let mut egress_produced: u64 = 0; // packets emitted by stack
+        let mut egress_dropped: u64 = 0; // egress_tx.try_send failures
+        // egress_dropped as of the last stats tick: a full channel drops
+        // packets by the thousand, so the first drop of an interval is
+        // a warning and the rest are summed into one line at the tick.
+        let mut egress_dropped_reported: u64 = 0;
 
-            let stats_timer = tokio::time::sleep(std::time::Duration::from_secs(10));
-            tokio::pin!(stats_timer);
+        let stats_timer = tokio::time::sleep(std::time::Duration::from_secs(10));
+        tokio::pin!(stats_timer);
 
-            futures_util::future::poll_fn(|cx| {
+        futures_util::future::poll_fn(|cx| {
             // --- Periodic stats ---
             if stats_timer.as_mut().poll(cx).is_ready() {
                 info!(
+                    target: STATS_LOG_TARGET,
                     "Stack driver: ingress_delivered={}, egress_produced={}, egress_dropped={}, \
                      flush_pending={}, ready_pending={}, pending_ingress={}",
                     ingress_delivered, egress_produced, egress_dropped,
                     ingress_flush_pending, ingress_ready_pending, pending_ingress.is_some(),
                 );
-                stats_timer.as_mut().reset(
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(10),
-                );
+                if egress_dropped > egress_dropped_reported + 1 {
+                    warn!(
+                        "Egress channel full: dropped {} packets in the last 10s",
+                        egress_dropped - egress_dropped_reported
+                    );
+                }
+                egress_dropped_reported = egress_dropped;
+                stats_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + std::time::Duration::from_secs(10));
             }
 
             // --- Egress: drain stack output → bounded egress channel ---
@@ -123,7 +134,13 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
                         let len = pkt.len();
                         if egress_tx.try_send(pkt).is_err() {
                             egress_dropped += 1;
-                            warn!("Egress channel full, dropping packet ({} bytes)", len);
+                            if egress_dropped == egress_dropped_reported + 1 {
+                                warn!(
+                                    "Egress channel full, dropping packet ({} bytes); \
+                                     further drops are summed every 10s",
+                                    len
+                                );
+                            }
                         }
                     }
                     Poll::Ready(Some(Err(e))) => {
@@ -204,16 +221,16 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
             Poll::Pending
         })
         .await;
-            info!(
-                "Stack driver ended. Final stats: ingress_delivered={}, egress_produced={}, \
+        info!(
+            "Stack driver ended. Final stats: ingress_delivered={}, egress_produced={}, \
              egress_dropped={}, flush_pending={}, ready_pending={}",
-                ingress_delivered,
-                egress_produced,
-                egress_dropped,
-                ingress_flush_pending,
-                ingress_ready_pending,
-            );
-        });
+            ingress_delivered,
+            egress_produced,
+            egress_dropped,
+            ingress_flush_pending,
+            ingress_ready_pending,
+        );
+    });
 
     // Task 3 — Egress writer: bounded channel → transport.
     let egress = tokio::spawn(async move {
@@ -409,6 +426,10 @@ async fn handle_tcp_streams(
     cancel: CancellationToken,
     slog: Option<Arc<SessionLog>>,
 ) {
+    // Destinations already reported as blocked, as for UDP (see
+    // `handle_inbound_datagram`): a client retrying an SMB share or a
+    // printer on its own LAN opens one connection after another.
+    let mut blocked_seen: HashSet<IpAddr> = HashSet::new();
     while let Some((mut stream, local, remote)) = tcp_listener.next().await {
         // DNS over TCP aimed at the forwarder's synthetic address is dialed to
         // an upstream of the exit's choosing — ahead of the private-destination
@@ -419,10 +440,19 @@ async fn handle_tcp_streams(
             .filter(|_| dns::is_proxy_target(remote))
             .cloned();
         if dns_fwd.is_none() && block_local && is_local_address(remote.ip()) {
-            warn!(
-                "blocked TCP connection to local address: {:?} => {:?}",
-                local, remote
-            );
+            if blocked_seen.len() < BLOCKED_SEEN_CAP && blocked_seen.insert(remote.ip()) {
+                warn!(
+                    target: FLOW_LOG_TARGET,
+                    "blocked TCP connection to local address: {:?} => {:?} (further connections to this address are logged at trace level)",
+                    local, remote
+                );
+            } else {
+                trace!(
+                    target: FLOW_LOG_TARGET,
+                    "blocked TCP connection to local address: {:?} => {:?}",
+                    local, remote
+                );
+            }
             if let Some(sl) = &slog {
                 sl.flow_blocked(PROTO_TCP, local, remote);
             }
@@ -443,7 +473,7 @@ async fn handle_tcp_streams(
         let cancel = cancel.clone();
         let slog = slog.clone();
         tokio::spawn(async move {
-            info!("new tcp connection: {:?} => {:?}", local, remote);
+            info!(target: FLOW_LOG_TARGET, "new tcp connection: {:?} => {:?}", local, remote);
             // Race the proxy against teardown so the connection (and its OS
             // socket) is dropped when the session ends, rather than leaking.
             // On teardown the FlowGuard is dropped un-closed and records the
@@ -476,7 +506,10 @@ async fn handle_tcp_streams(
                             if !stash.is_empty()
                                 && let Err(e) = counted.write_all(&stash).await
                             {
-                                warn!("failed to forward early bytes {:?}=>{:?}, err: {:?}", local, remote, e);
+                                warn!(
+                                    target: FLOW_LOG_TARGET,
+                                    "failed to forward early bytes {:?}=>{:?}, err: {:?}", local, remote, e
+                                );
                                 if let Some(f) = &flow {
                                     f.close("error", Duration::ZERO);
                                 }
@@ -489,7 +522,10 @@ async fn handle_tcp_streams(
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("failed to copy tcp stream {:?}=>{:?}, err: {:?}", local, remote, e);
+                                    warn!(
+                                        target: FLOW_LOG_TARGET,
+                                        "failed to copy tcp stream {:?}=>{:?}, err: {:?}", local, remote, e
+                                    );
                                     if let Some(f) = &flow {
                                         f.close("error", Duration::ZERO);
                                     }
@@ -499,13 +535,19 @@ async fn handle_tcp_streams(
                         Dialed::Abandoned => {
                             // Routine under client retry storms — the whole
                             // point is that these DON'T pile up; not a warning.
-                            info!("client left before {:?}=>{:?} connected; dial abandoned", local, remote);
+                            info!(
+                                target: FLOW_LOG_TARGET,
+                                "client left before {:?}=>{:?} connected; dial abandoned", local, remote
+                            );
                             if let Some(f) = &flow {
                                 f.close("abandoned", Duration::ZERO);
                             }
                         }
                         Dialed::Failed { error: e, .. } => {
-                            warn!("failed to new tcp stream {:?}=>{:?}, err: {:?}", local, remote, e);
+                            warn!(
+                                target: FLOW_LOG_TARGET,
+                                "failed to new tcp stream {:?}=>{:?}, err: {:?}", local, remote, e
+                            );
                             if let Some(f) = &flow {
                                 f.close("connect_failed", Duration::ZERO);
                             }
@@ -534,7 +576,7 @@ async fn dial_dns_upstream(
         tried.push(up);
         match dial_watching_inner(inner, up, protector, stash).await {
             Dialed::Failed { error, stash: kept } => {
-                debug!("dns forwarder: tcp {up}: {error}");
+                debug!(target: FLOW_LOG_TARGET, "dns forwarder: tcp {up}: {error}");
                 fwd.failed(up);
                 stash = kept;
                 last = Some((error, up));
@@ -642,6 +684,7 @@ async fn forward_dns_query(
                 f.close("closed", Duration::ZERO);
             }
             trace!(
+                target: FLOW_LOG_TARGET,
                 "dns forwarder: {local} -> {} answered ({} bytes, attempt {})",
                 answer.upstream,
                 answer.response.len(),
@@ -658,7 +701,7 @@ async fn forward_dns_query(
                 f.add_up(query.len() as u64);
                 f.close("error", Duration::ZERO);
             }
-            debug!("dns forwarder: query from {local}: {e}");
+            debug!(target: FLOW_LOG_TARGET, "dns forwarder: query from {local}: {e}");
         }
     }
 }
@@ -712,6 +755,7 @@ async fn handle_inbound_datagram(
                     // dropped and the client's stub retries.
                     let Ok(permit) = dns_inflight.clone().try_acquire_owned() else {
                         debug!(
+                            target: FLOW_LOG_TARGET,
                             "dns forwarder: {} queries in flight; dropping one from {local}",
                             dns::MAX_INFLIGHT
                         );
@@ -730,17 +774,24 @@ async fn handle_inbound_datagram(
                 }
                 if block_local && is_local_address(remote.ip()) {
                     // The first datagram to a blocked destination is worth a
-                    // warning; the rest go to debug. A Windows client's
+                    // warning; the rest go to trace. A Windows client's
                     // NetBIOS name registrations (UDP 137 to the tunnel
-                    // subnet's broadcast address, a burst per bring-up) would
-                    // otherwise flood the log with one line per packet.
+                    // subnet's broadcast address, a burst per bring-up) and
+                    // any client's LAN discovery would otherwise flood
+                    // stderr and logcat with one line per packet. (The
+                    // diagnostic log file keeps no flow lines at all.)
                     if blocked_seen.len() < BLOCKED_SEEN_CAP && blocked_seen.insert(remote.ip()) {
                         warn!(
-                            "blocked UDP datagram to local address: {:?} => {:?} (further datagrams to this address are logged at debug level)",
+                            target: FLOW_LOG_TARGET,
+                            "blocked UDP datagram to local address: {:?} => {:?} (further datagrams to this address are logged at trace level)",
                             local, remote
                         );
                     } else {
-                        debug!("blocked UDP datagram to local address: {:?} => {:?}", local, remote);
+                        trace!(
+                            target: FLOW_LOG_TARGET,
+                            "blocked UDP datagram to local address: {:?} => {:?}",
+                            local, remote
+                        );
                     }
                     if let Some(sl) = &slog {
                         sl.flow_blocked(PROTO_UDP, local, remote);
@@ -791,6 +842,7 @@ async fn handle_inbound_datagram(
                                                 }
                                                 Err(e) => {
                                                     warn!(
+                                                        target: FLOW_LOG_TARGET,
                                                         "failed to recv udp datagram {:?}<->{:?}: {:?}",
                                                         local, remote, e
                                                     );
@@ -815,7 +867,10 @@ async fn handle_inbound_datagram(
                             );
                         }
                         Err(e) => {
-                            warn!("failed to create udp socket for {:?}<->{:?}: {:?}", local, remote, e);
+                            warn!(
+                                target: FLOW_LOG_TARGET,
+                                "failed to create udp socket for {:?}<->{:?}: {:?}", local, remote, e
+                            );
                         }
                     }
                 }
@@ -823,7 +878,7 @@ async fn handle_inbound_datagram(
             _ = sweep_interval.tick() => {
                 entries.retain(|key, entry| {
                     if entry.last_activity.elapsed() > UDP_NAT_TIMEOUT {
-                        trace!("UDP NAT entry expired: {:?} => {:?}", key.0, key.1);
+                        trace!(target: FLOW_LOG_TARGET, "UDP NAT entry expired: {:?} => {:?}", key.0, key.1);
                         entry.close_flow("idle");
                         entry.task.abort();
                         false
@@ -857,6 +912,7 @@ fn insert_bounded(
         evicted.close_flow("evicted");
         evicted.task.abort();
         trace!(
+            target: FLOW_LOG_TARGET,
             "UDP NAT table full, evicted {:?} => {:?}",
             oldest.0, oldest.1
         );
@@ -907,7 +963,9 @@ pub enum TunnelError {
 /// `crate::dns`) ahead of the `block_local` check. `slog`, when set,
 /// receives per-flow connection-log records (TCP at accept/close with byte
 /// counts and the egress source address; UDP per NAT-table flow; forwarded
-/// DNS per query, against the upstream used).
+/// DNS per query, against the upstream used). That log is the only per-flow
+/// record: every log line that names a flow's addresses goes to
+/// [`FLOW_LOG_TARGET`], which the diagnostic log file never keeps.
 pub(crate) async fn start_tunnel(
     transport: IpTransport,
     protector: SocketProtector,

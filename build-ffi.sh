@@ -79,10 +79,29 @@ cargo run --bin uniffi-bindgen generate \
 [ -s "$KOUT/uniffi/spora_ffi/spora_ffi.kt" ] || { echo "bindgen produced no spora_ffi.kt" >&2; exit 1; }
 
 if [ -z "$OUT" ]; then
-  # dev loop: install straight into the sibling Android app checkout
-  cp -r "$JNIDIR"/ ../spora-android/app/src/main/
+  # dev loop: install straight into the sibling Android app checkout. Only
+  # the ABIs built now: $JNIDIR keeps other ABIs from earlier builds, whose
+  # libraries no longer match the bindings generated below. The app's copies
+  # of those are removed (jniLibs is gitignored build output): an APK
+  # packaging them would fail UniFFI's checksum check at its first call on
+  # that ABI, whereas a missing library fails plainly.
+  APPJNI=../spora-android/app/src/main/jniLibs
+  for abi in "${ABIS[@]}"; do
+    mkdir -p "$APPJNI/$abi"
+    cp -r "$JNIDIR/$abi"/. "$APPJNI/$abi"/
+  done
+  for dir in "$APPJNI"/*/; do
+    abi="$(basename "$dir")"
+    case " ${ABIS[*]} " in
+      *" $abi "*) ;;
+      *) if [ -f "$dir/libspora_ffi.so" ]; then
+           rm -f "$dir/libspora_ffi.so"
+           echo "removed $APPJNI/$abi/libspora_ffi.so: an earlier build that does not match the new bindings (build without --abi for all four ABIs)" >&2
+         fi ;;
+    esac
+  done
   cp -r "$KOUT"/uniffi ../spora-android/app/src/main/java/
-  echo "installed $PROFILE jniLibs + bindings into ../spora-android"
+  echo "installed $PROFILE jniLibs (${ABIS[*]}) + bindings into ../spora-android"
 else
   echo "bundle assembled under $OUT"
 fi

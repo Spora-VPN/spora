@@ -12,7 +12,7 @@ into the stream.
 |---|---|---|
 | `share_ready` | share | The share is up and registered. Fields: `url`, `routing_key`, `identity_file`, `tun_name` (with `--os-routing`, else `null`), `record_dir`, `upgrade_enabled`. |
 | `tunnel_ready` | use | The tunnel interface is up and pumping. Fields: `mode` (`"vpn"` or `"attached"`), `tun_name`, `record_dir`, `upgrade_enabled`; in `vpn` mode also `tun_addr`, `tun_addr6` (`null` with `--no-ipv6`), `mtu`, `mtu_policy` (`"auto"` or `"fixed"`), `routes`, `dns`, `dns_method` (`null` when the resolver was left alone). |
-| `stopping` | both | Shutdown has begun (Ctrl+C, SIGTERM, or console close). |
+| `stopping` | both | Shutdown has begun (Ctrl+C, SIGTERM, SIGHUP, or console close). From `use` it can also come before any `tunnel_ready`: a signal stops a dial that is still under way. |
 | `session_ended` | share | The client session ended. Field: `reason`. |
 
 ## Paths and transports
@@ -22,7 +22,7 @@ into the stream.
 | `relay_session_established` | both | The relay-path session is up. Field: `peer`. |
 | `path_activated` | both | A transport can now carry tunnel traffic. Fields: `carrier` (`quic`, `tcp_tls`, `nz`), `path` (`relay`, `direct_advertised`, `direct_punched`), `local`, `peer`. Fires for the initial path and again after an acknowledged switch to a punched path, so automation never infers the active transport from log prose. |
 | `direct_upgrade_succeeded` | both | A direct path replaced the relay path. Fields: `local`, `peer`. |
-| `direct_upgrade_failed` | both | One direct-path attempt failed; the session stays on its current path and retries. Fields: `code` (a stable reason code), `reason` (human text). |
+| `direct_upgrade_failed` | both | One direct-path attempt failed; the session stays on its current path and retries: after 15 s, then twice as long after each further failure, up to 5 minutes. A reconnect starts again at 15 s. Fields: `code` (a stable reason code), `reason` (human text). |
 | `reconnecting` | use | The transport died; the client is redialing. |
 | `reconnected` | use | The redial succeeded. |
 

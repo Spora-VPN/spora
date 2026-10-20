@@ -10,9 +10,11 @@ spora-core = { path = "../spora-core" }
 # The client VPN mode (`spora use`): TUN, routes, resolver, MTU, outer-socket
 # bypass — shared with the Windows service.
 spora-vpn = { path = "../spora-vpn" }
+# The diagnostic log, crash files, bug-report bundles and the telemetry
+# uploader (`spora report`, `spora telemetry`).
+spora-service = { path = "../spora-service" }
 clap = { version = "4.5.52", features = ["derive"] }
 tokio = "1.48.0"
-tokio-util = "0.7.17"
 env_logger = "0.11.8"
 futures-util = "0.3.31"
 humantime = "2"
@@ -25,6 +27,11 @@ url = "2.5.7"
 # Linux-only `spora use --tun-name` attach mode; the VPN mode's own TUN
 # handling lives in spora-vpn.
 tokio-tun = "0.12.1"
+
+# geteuid() and getpwuid_r(): whether this run is root's, and root's home
+# (`sudo spora use` keeps its state there, whatever HOME sudo passed on).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # jemalloc-sys does not build on (at least) aarch64-musl; the static musl
 # release binaries use the system allocator instead (see main.rs GLOBAL).

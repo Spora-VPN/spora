@@ -358,11 +358,23 @@ impl RelayEndpoint {
 /// session, and the sharer registers with all of them. A hostname that
 /// resolves to both A and AAAA records behaves as two separate endpoints
 /// (the expansion happens at resolve time, on each side independently).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Token {
     pub routing_key: [u8; ROUTING_KEY_LEN],
     pub secret: [u8; SECRET_LEN],
     pub relays: Vec<RelayEndpoint>,
+}
+
+/// Written by hand so the secret never reaches a log: formatted with `{:?}`
+/// it would be a byte list no URL redactor recognizes.
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Token")
+            .field("routing_key", &self.routing_key)
+            .field("secret", &"<redacted>")
+            .field("relays", &self.relays)
+            .finish()
+    }
 }
 
 impl Token {
@@ -391,14 +403,15 @@ impl Token {
     /// Parse a share URL back into a token. Collects every `?r=` value (a
     /// single-relay URL is the back-compatible degenerate case); at least one
     /// is required.
+    ///
+    /// No error echoes the path: a mangled link (`/S/…`, `/s%2F…`, a doubled
+    /// slash) still carries the secret there, and the error ends up in the
+    /// connection record and the diagnostic log.
     pub fn from_url(url: &Url) -> Result<Self, String> {
-        let blob_b64 = url.path().strip_prefix(URL_PATH_PREFIX).ok_or_else(|| {
-            format!(
-                "URL path must start with {}, got {}",
-                URL_PATH_PREFIX,
-                url.path()
-            )
-        })?;
+        let blob_b64 = url
+            .path()
+            .strip_prefix(URL_PATH_PREFIX)
+            .ok_or_else(|| format!("URL path must start with {URL_PATH_PREFIX}"))?;
         if blob_b64.is_empty() {
             return Err("URL path is missing the token after /s/".into());
         }
@@ -536,6 +549,38 @@ mod tests {
             url.as_str().ends_with("?r=relay.spora.dev:443"),
             "got {url}"
         );
+    }
+
+    /// A link mangled on its way to the user still carries the secret; the
+    /// parse error (which lands in the connection record) must not repeat it,
+    /// and neither may a Token formatted with `{:?}`.
+    #[test]
+    fn neither_parse_errors_nor_debug_output_carry_the_secret() {
+        let token = Token {
+            routing_key: [0x42u8; ROUTING_KEY_LEN],
+            secret: [0x99u8; SECRET_LEN],
+            relays: vec![relay("127.0.0.1", 9)],
+        };
+        let url = token.to_url();
+        let blob = url
+            .path()
+            .strip_prefix(URL_PATH_PREFIX)
+            .unwrap()
+            .to_string();
+        for mangled in [
+            url.as_str().replace("/s/", "/S/"),
+            url.as_str().replace("/s/", "/s%2F"),
+            url.as_str().replace("/s/", "//s/"),
+            url.as_str().replace("/s/", "/x/"),
+        ] {
+            let err = Token::from_url(&Url::parse(&mangled).unwrap()).unwrap_err();
+            // The blob's tail is the secret's encoding.
+            assert!(!err.contains(&blob[28..]), "{mangled}: {err}");
+        }
+
+        let debug = format!("{token:?}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(!debug.contains("153"), "secret bytes (0x99) in {debug}");
     }
 
     #[test]

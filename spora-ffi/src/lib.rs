@@ -1,15 +1,18 @@
 uniffi::setup_scaffolding!();
 
+mod service;
+
 use crate::ConnectError::InvalidUrl;
 use log::info;
 use once_cell::sync::Lazy;
-use spora_core;
+use spora_core::record::{NetworkFeed, NetworkState, RecordConfig};
 use spora_core::tun_util;
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -147,52 +150,108 @@ struct ShareSessionEntry {
 static SHARE_SESSIONS: Lazy<Mutex<HashMap<i32, ShareSessionEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// A poisoned lock still guards consistent data here (nothing panics while
+/// holding one), and a panic must not cross into the app.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[derive(uniffi::Record)]
 pub struct ShareResult {
     pub handle: i32,
     pub url: String,
 }
 
-#[cfg(target_os = "android")]
-#[uniffi::export]
-pub fn init_android_logging() {
-    use android_logger::FilterBuilder;
-    use log::LevelFilter;
-    let filter = FilterBuilder::new()
-        .filter_module("quinn", LevelFilter::Warn)
-        .filter_module("quinn_proto", LevelFilter::Warn)
-        .filter_module("quinn_udp", LevelFilter::Warn)
-        .filter_module("tracing", LevelFilter::Warn)
-        .filter_module("smoltcp", LevelFilter::Warn)
-        .filter_level(LevelFilter::Debug)
-        .build();
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_tag("spora")
-            .with_max_level(LevelFilter::Trace)
-            .with_filter(filter),
-    );
+/// The kind of network underneath the tunnel, as the platform reports it
+/// (spora-core's `record::NetworkKind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NetworkKind {
+    /// No usable network at all.
+    None,
+    Wifi,
+    Cellular,
+    Ethernet,
+    Other,
 }
 
-/// Initialize logging on Apple platforms. Routes the `log` crate into the
-/// unified logging system (visible in Console.app and `log stream --predicate
-/// 'subsystem == "to.spora"'`). Safe to call more than once. This is the
-/// Apple counterpart to [`init_android_logging`]; a macOS/iOS client calls it
-/// once at startup (and again from the tunnel extension process, which is
-/// separate).
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl From<NetworkKind> for spora_core::record::NetworkKind {
+    fn from(k: NetworkKind) -> Self {
+        use spora_core::record::NetworkKind as K;
+        match k {
+            NetworkKind::None => K::None,
+            NetworkKind::Wifi => K::Wifi,
+            NetworkKind::Cellular => K::Cellular,
+            NetworkKind::Ethernet => K::Ethernet,
+            NetworkKind::Other => K::Other,
+        }
+    }
+}
+
+/// The platform's network reports ([`set_network_state`]), shared by every
+/// run's record: a record opens on the latest report and takes each later
+/// one as a step until it closes — from the moment it opens, so a change
+/// while `connect` is still dialing is recorded, whether the dial then
+/// succeeds or fails.
+static NETWORK: Lazy<NetworkFeed> = Lazy::new(NetworkFeed::new);
+
+/// Taken around each report, so whether it changed anything is judged
+/// against the report before it.
+static NETWORK_REPORT: Mutex<()> = Mutex::new(());
+
+/// Record directories this process has written to, for a bug report made
+/// without the service ([`export_bug_report`]).
+static RECORD_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+pub(crate) fn record_dirs() -> Vec<PathBuf> {
+    lock(&RECORD_DIRS).clone()
+}
+
+/// Report the network underneath the tunnel: the underlying non-VPN network
+/// that has internet, or `None` when there is none. `validated` = the OS
+/// confirmed it reaches the internet (Android's `NET_CAPABILITY_VALIDATED`);
+/// `null` when the platform cannot tell. Kept for the records of runs that
+/// start later, and recorded as a step in every open run's record — runs
+/// still inside `connect`/`share` included. A change also nudges the
+/// uploader: a new network is when a failed upload is worth retrying.
+/// Repeating an unchanged state records nothing and nudges nothing.
 #[uniffi::export]
-pub fn init_apple_logging() {
-    use log::LevelFilter;
-    // Ignore the error if a logger is already installed (idempotent across the
-    // app and extension calling in, and across repeated starts).
-    let _ = oslog::OsLogger::new("to.spora")
-        .level_filter(LevelFilter::Debug)
-        .category_level_filter("quinn", LevelFilter::Warn)
-        .category_level_filter("quinn_proto", LevelFilter::Warn)
-        .category_level_filter("quinn_udp", LevelFilter::Warn)
-        .category_level_filter("smoltcp", LevelFilter::Warn)
-        .init();
+pub fn set_network_state(kind: NetworkKind, validated: Option<bool>) {
+    let state = NetworkState {
+        kind: kind.into(),
+        validated,
+    };
+    if report_network(state) {
+        spora_service::nudge();
+    }
+}
+
+/// Hand `state` to every run through the feed; whether it differs from the
+/// report before it.
+fn report_network(state: NetworkState) -> bool {
+    let _serial = lock(&NETWORK_REPORT);
+    let changed = NETWORK.current() != Some(state);
+    NETWORK.set(state);
+    changed
+}
+
+/// The record config for a run whose platform passed `record_dir`: the
+/// network feed, and a subscriber that stamps diagnostic-log lines with the
+/// run's id and nudges the uploader when the record closes.
+fn record_config(record_dir: Option<String>) -> Option<RecordConfig> {
+    let dir = PathBuf::from(record_dir?);
+    {
+        let mut dirs = lock(&RECORD_DIRS);
+        if !dirs.contains(&dir) {
+            dirs.push(dir.clone());
+        }
+    }
+    // The subscriber hears network steps with the feed held, so it must
+    // never report into the feed itself (it only tracks runs and nudges).
+    Some(
+        RecordConfig::in_dir(dir)
+            .with_network_feed(NetworkFeed::clone(&NETWORK))
+            .with_subscriber(spora_service::record_subscriber()),
+    )
 }
 
 #[derive(Debug, uniffi::Error)]
@@ -237,13 +296,19 @@ pub fn make_identity() -> Vec<u8> {
 ///
 /// Fails if `conn_log_dir` is set but not writable — a default-on liability
 /// log must not silently degrade at startup.
-#[uniffi::export]
+///
+/// `record_dir` turns on the connection record (spora-core's `record`, the
+/// diagnostic account of this run) in that directory — one directory for
+/// every share and connect, not backed up (Android:
+/// `noBackupFilesDir/records`). `None` keeps no record.
+#[uniffi::export(default(record_dir = None))]
 pub fn share(
     identity_bytes: Vec<u8>,
     protector: Option<Box<dyn SocketProtectorCallback>>,
     conn_log_dir: Option<String>,
     conn_log_retention_days: Option<u32>,
     conn_log_sessions_only: bool,
+    record_dir: Option<String>,
 ) -> Result<ShareResult, ShareError> {
     let identity =
         spora_core::identity::Identity::from_bytes(&identity_bytes).map_err(ShareError::Generic)?;
@@ -263,6 +328,7 @@ pub fn share(
         protector: protector.and_then(wrap_protector),
         conn_log,
         dns_forwarder: Some(dns.clone()),
+        record: record_config(record_dir),
         ..spora_core::Config::default()
     };
     let session = RUNTIME
@@ -274,10 +340,7 @@ pub fn share(
     let task = session.task;
 
     let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    SHARE_SESSIONS
-        .lock()
-        .unwrap()
-        .insert(id, ShareSessionEntry { cancel, task, dns });
+    lock(&SHARE_SESSIONS).insert(id, ShareSessionEntry { cancel, task, dns });
 
     Ok(ShareResult { handle: id, url })
 }
@@ -306,7 +369,7 @@ pub fn dns_forwarder_address() -> String {
 /// spora-core's `dns`).
 #[uniffi::export]
 pub fn set_share_dns_servers(handle: i32, servers: Vec<String>) -> Result<(), TunnelError> {
-    let sessions = SHARE_SESSIONS.lock().unwrap();
+    let sessions = lock(&SHARE_SESSIONS);
     let entry = sessions.get(&handle).ok_or(TunnelError::InvalidHandle)?;
     let mut parsed = Vec::with_capacity(servers.len());
     for s in &servers {
@@ -326,8 +389,9 @@ pub fn set_share_dns_servers(handle: i32, servers: Vec<String>) -> Result<(), Tu
 /// Stops the share session associated with the given handle.
 #[uniffi::export]
 pub fn stop_share(handle: i32) -> Result<(), TunnelError> {
-    let mut sessions = SHARE_SESSIONS.lock().unwrap();
-    let entry = sessions.remove(&handle).ok_or(TunnelError::InvalidHandle)?;
+    let entry = lock(&SHARE_SESSIONS)
+        .remove(&handle)
+        .ok_or(TunnelError::InvalidHandle)?;
     entry.cancel.cancel();
     entry.task.abort();
     Ok(())
@@ -368,12 +432,16 @@ impl std::fmt::Display for TunnelError {
 /// The `protector` callback is invoked on every new socket fd so that
 /// Android can call `VpnService.protect()` to bypass VPN routing.
 /// Use `disconnect` to tear down the tunnel.
-#[uniffi::export]
+///
+/// `record_dir` turns on the connection record for this run, as for
+/// [`share`].
+#[uniffi::export(default(record_dir = None))]
 pub fn connect(
     url: String,
     tun_fd: RawFd,
     protector: Box<dyn SocketProtectorCallback>,
     mtu_callback: Option<Box<dyn MtuCallback>>,
+    record_dir: Option<String>,
 ) -> Result<i32, ConnectError> {
     info!("FFI connect() called with tun_fd={}", tun_fd);
 
@@ -392,6 +460,7 @@ pub fn connect(
     let config = spora_core::Config {
         protector: wrap_protector(protector),
         mtu_callback: mtu_cb,
+        record: record_config(record_dir),
         ..spora_core::Config::default()
     };
 
@@ -418,7 +487,7 @@ pub fn connect(
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     info!("FFI connect(): returning handle={}", handle);
-    SESSIONS.lock().unwrap().insert(
+    lock(&SESSIONS).insert(
         handle,
         TunnelSession {
             cancel,
@@ -443,13 +512,17 @@ pub fn connect(
 /// and returns a handle. The `tun_fd` ownership is transferred to Rust, which
 /// closes it when the tunnel ends (the caller must hand over a `dup()` of the
 /// provider's utun fd and not use it afterward).
-#[uniffi::export]
+///
+/// `record_dir` turns on the connection record for this run, as for
+/// [`share`].
+#[uniffi::export(default(record_dir = None))]
 pub fn connect_utun(
     url: String,
     tun_fd: RawFd,
     protector: Option<Box<dyn SocketProtectorCallback>>,
     mtu_callback: Option<Box<dyn MtuCallback>>,
     event_callback: Option<Box<dyn EventCallback>>,
+    record_dir: Option<String>,
 ) -> Result<i32, ConnectError> {
     info!("FFI connect_utun() called with tun_fd={}", tun_fd);
 
@@ -474,6 +547,7 @@ pub fn connect_utun(
         protector: protector.and_then(wrap_protector),
         mtu_callback: mtu_cb,
         event_hook: wrap_event_hook(event_callback),
+        record: record_config(record_dir),
         ..spora_core::Config::default()
     };
 
@@ -499,7 +573,7 @@ pub fn connect_utun(
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     info!("FFI connect_utun(): returning handle={}", handle);
-    SESSIONS.lock().unwrap().insert(
+    lock(&SESSIONS).insert(
         handle,
         TunnelSession {
             cancel,
@@ -516,8 +590,10 @@ pub fn connect_utun(
 #[uniffi::export]
 pub fn disconnect(handle: i32) -> Result<(), TunnelError> {
     info!("FFI disconnect() called with handle={}", handle);
-    let mut sessions = SESSIONS.lock().unwrap();
-    let session = sessions.remove(&handle).ok_or(TunnelError::InvalidHandle)?;
+    let session = lock(&SESSIONS)
+        .remove(&handle)
+        .ok_or(TunnelError::InvalidHandle)?;
+    update_dormancy();
     info!("FFI disconnect(): cancelling token...");
     session.cancel.cancel();
     info!("FFI disconnect(): aborting task...");
@@ -532,22 +608,262 @@ pub fn disconnect(handle: i32) -> Result<(), TunnelError> {
 /// - `interval_secs > 0`: always probe at that interval (e.g. 20 when screen is on).
 ///
 /// Transition from 0→N sends an immediate ping to detect dead connections.
+///
+/// The telemetry uploader follows: while every client tunnel's keepalive is
+/// 0 it sends nothing, and a change back to N > 0 lets it catch up.
 #[uniffi::export]
 pub fn set_keepalive(handle: i32, interval_secs: u32) -> Result<(), TunnelError> {
     info!(
         "FFI set_keepalive(handle={}, interval_secs={})",
         handle, interval_secs
     );
-    let sessions = SESSIONS.lock().unwrap();
-    let session = sessions.get(&handle).ok_or(TunnelError::InvalidHandle)?;
-    session
-        .keepalive_knob
-        .store(interval_secs as u64, Ordering::Relaxed);
-    // Wake the transport task so it notices the knob change immediately.
-    // Without this, a Dormant transport has no timers and would sleep until
-    // the next inbound/outbound packet.
-    if let Some(w) = session.keepalive_waker.lock().unwrap().take() {
-        w.wake();
+    {
+        let sessions = lock(&SESSIONS);
+        let session = sessions.get(&handle).ok_or(TunnelError::InvalidHandle)?;
+        session
+            .keepalive_knob
+            .store(interval_secs as u64, Ordering::Relaxed);
+        // Wake the transport task so it notices the knob change immediately.
+        // Without this, a Dormant transport has no timers and would sleep
+        // until the next inbound/outbound packet.
+        if let Some(w) = lock(&session.keepalive_waker).take() {
+            w.wake();
+        }
     }
+    update_dormancy();
     Ok(())
+}
+
+/// Taken around each dormancy update, so the service hears them in the
+/// order the table changed.
+static DORMANCY: Mutex<()> = Mutex::new(());
+
+/// Radio silence for the telemetry uploader ([`spora_service::set_dormant`])
+/// follows the client tunnels: dormant while there is at least one and every
+/// one of them has its keepalive at 0 (screen off, machine asleep), so a
+/// dormant phone is not woken by uploads either. Re-evaluated when a knob
+/// changes and when a tunnel goes; not when one comes, because a new
+/// tunnel's knob reads 0 until the app sets it, right after `connect`.
+fn update_dormancy() {
+    let _serial = lock(&DORMANCY);
+    let dormant = all_dormant(&lock(&SESSIONS));
+    spora_service::set_dormant(dormant);
+}
+
+fn all_dormant(sessions: &HashMap<i32, TunnelSession>) -> bool {
+    !sessions.is_empty()
+        && sessions
+            .values()
+            .all(|s| s.keepalive_knob.load(Ordering::Relaxed) == 0)
+}
+
+/// Held by tests that touch this crate's process-wide state.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spora_core::record::{NetworkKind as Kind, Outcome, Record, Recorder, Role, StepKind};
+    use std::time::{Duration, Instant};
+
+    fn network_steps(record: &Record) -> Vec<NetworkState> {
+        record
+            .steps
+            .iter()
+            .filter(|s| s.kind == StepKind::Network)
+            .filter_map(|s| s.network)
+            .collect()
+    }
+
+    fn snapshot(record: &Recorder) -> Record {
+        record.snapshot().unwrap()
+    }
+
+    fn tunnel(knob: u64) -> TunnelSession {
+        TunnelSession {
+            cancel: CancellationToken::new(),
+            task: RUNTIME.spawn(async {}),
+            keepalive_knob: Arc::new(AtomicU64::new(knob)),
+            keepalive_waker: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    struct NoProtector;
+
+    impl SocketProtectorCallback for NoProtector {
+        fn protect(&self, _fd: i32) {}
+    }
+
+    #[test]
+    fn network_kinds_map_onto_the_record_vocabulary() {
+        for (kind, code) in [
+            (NetworkKind::None, "none"),
+            (NetworkKind::Wifi, "wifi"),
+            (NetworkKind::Cellular, "cellular"),
+            (NetworkKind::Ethernet, "ethernet"),
+            (NetworkKind::Other, "other"),
+        ] {
+            assert_eq!(Kind::from(kind).as_str(), code);
+        }
+    }
+
+    #[test]
+    fn network_reports_reach_every_open_run() {
+        let _g = lock(&TEST_LOCK);
+        let wifi = NetworkState {
+            kind: Kind::Wifi,
+            validated: Some(true),
+        };
+        let cellular = NetworkState {
+            kind: Kind::Cellular,
+            validated: Some(false),
+        };
+        let none = NetworkState {
+            kind: Kind::None,
+            validated: None,
+        };
+        set_network_state(NetworkKind::Wifi, Some(true));
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = record_config(Some(dir.path().to_string_lossy().into_owned())).unwrap();
+        assert_eq!(cfg.dir.as_deref(), Some(dir.path()));
+        assert!(cfg.network_feed.is_some());
+        assert!(cfg.subscriber.is_some());
+        assert!(record_dirs().contains(&dir.path().to_path_buf()));
+        assert!(record_config(None).is_none());
+
+        // a run opens on the network last reported, and hears every change
+        // once from then on: no table entry needed, which a run still inside
+        // `connect`/`share` does not have yet
+        let client = Recorder::start(&cfg, Role::Client, None, vec![], false);
+        let exit = Recorder::start(&cfg, Role::Exit, None, vec![], false);
+        assert_eq!(snapshot(&client).open.network, Some(wifi));
+        // only a change nudges the uploader
+        assert!(report_network(cellular));
+        assert!(!report_network(cellular));
+        set_network_state(NetworkKind::Cellular, Some(false));
+        assert_eq!(network_steps(&snapshot(&client)), vec![cellular]);
+        assert_eq!(network_steps(&snapshot(&exit)), vec![cellular]);
+
+        // a closed run hears nothing more
+        client.close_shutdown(None);
+        set_network_state(NetworkKind::None, None);
+        assert_eq!(network_steps(&snapshot(&client)), vec![cellular]);
+        assert_eq!(network_steps(&snapshot(&exit)), vec![cellular, none]);
+        exit.close_shutdown(None);
+    }
+
+    /// The case the feed is for: the network changes while `connect` is
+    /// still dialing, and the dial fails.
+    #[test]
+    fn a_change_during_a_failing_dial_is_in_its_record() {
+        let _g = lock(&TEST_LOCK);
+        set_network_state(NetworkKind::Wifi, Some(false));
+        // a relay that takes the connection, sees the network go, and hangs
+        // up in the middle of the handshake
+        let relay = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = relay.local_addr().unwrap().port();
+        let hang_up = std::thread::spawn(move || {
+            let (conn, _) = relay.accept().unwrap();
+            set_network_state(NetworkKind::None, None);
+            drop(conn);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "https://example.invalid/s/{}?r=tcptls/127.0.0.1:{port}",
+            "A".repeat(48)
+        );
+        let result = connect(
+            url,
+            -1,
+            Box::new(NoProtector),
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        );
+        assert!(matches!(result, Err(ConnectError::Generic(_))));
+        hang_up.join().unwrap();
+
+        // the record is written on its own thread
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let record = loop {
+            let closed = Record::read_dir(dir.path())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, r)| r)
+                .find(|r| r.close.is_some());
+            if let Some(r) = closed {
+                break r;
+            }
+            assert!(Instant::now() < deadline, "no closed record");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let wifi = NetworkState {
+            kind: Kind::Wifi,
+            validated: Some(false),
+        };
+        let none = NetworkState {
+            kind: Kind::None,
+            validated: None,
+        };
+        assert_eq!(record.open.network, Some(wifi));
+        assert_eq!(network_steps(&record), vec![none]);
+        assert_eq!(record.close.unwrap().outcome, Outcome::NeverConnected);
+    }
+
+    #[test]
+    fn uploads_rest_while_every_client_tunnel_is_dormant() {
+        let _g = lock(&TEST_LOCK);
+        let mut sessions = HashMap::new();
+        assert!(!all_dormant(&sessions), "no tunnel to keep quiet for");
+        sessions.insert(1, tunnel(0));
+        assert!(all_dormant(&sessions));
+        sessions.insert(2, tunnel(20));
+        assert!(!all_dormant(&sessions));
+        sessions[&2].keepalive_knob.store(0, Ordering::Relaxed);
+        assert!(all_dormant(&sessions));
+
+        // the exported calls keep the table (and the service) in step
+        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        lock(&SESSIONS).insert(handle, tunnel(20));
+        set_keepalive(handle, 0).unwrap();
+        assert!(all_dormant(&lock(&SESSIONS)));
+        set_keepalive(handle, 20).unwrap();
+        assert!(!all_dormant(&lock(&SESSIONS)));
+        set_keepalive(handle, 0).unwrap();
+        disconnect(handle).unwrap();
+        assert!(!all_dormant(&lock(&SESSIONS)));
+        assert!(matches!(
+            set_keepalive(handle, 0),
+            Err(TunnelError::InvalidHandle)
+        ));
+        assert!(matches!(
+            disconnect(handle),
+            Err(TunnelError::InvalidHandle)
+        ));
+    }
+
+    #[test]
+    fn share_handles_are_checked() {
+        let _g = lock(&TEST_LOCK);
+        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        lock(&SHARE_SESSIONS).insert(
+            handle,
+            ShareSessionEntry {
+                cancel: CancellationToken::new(),
+                task: RUNTIME.spawn(async {}),
+                dns: spora_core::dns::DnsForwarder::system(),
+            },
+        );
+        set_share_dns_servers(handle, vec!["192.0.2.53".into(), "nonsense".into()]).unwrap();
+        stop_share(handle).unwrap();
+        assert!(matches!(
+            stop_share(handle),
+            Err(TunnelError::InvalidHandle)
+        ));
+        assert!(matches!(
+            set_share_dns_servers(handle, vec![]),
+            Err(TunnelError::InvalidHandle)
+        ));
+    }
 }

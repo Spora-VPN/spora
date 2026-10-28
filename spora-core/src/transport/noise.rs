@@ -26,6 +26,11 @@
 //!   adversarial review flagged as fatal.
 //! - `channel` (inside the AEAD): `0x00` IP packet, `0x01` signal (hole-punch,
 //!   Stage 2), `0x02` cert-auth (A's first message), `0x03` close.
+//! - Handshake loss: B repeats msg1 every 250 ms until it has msg2 AND the
+//!   cert-auth, and A answers a repeated msg1 of a session it already
+//!   accepted with both again (`HandshakeResend`). msg2 and the cert-auth
+//!   both start with `idx_B`; B tells them apart by msg2's exact length
+//!   (`NZ_MSG2_LEN`).
 //!
 //! Send path: each datagram goes straight out (`try_send_to`), no tunnel-layer
 //! pacer. A feedback pacer was tried and reverted — with the ring-accelerated
@@ -78,6 +83,17 @@ pub(crate) const DATA_MIN_LEN: usize = DATA_HEADER_LEN + 1 + NOISE_TAG_LEN;
 /// The relay recognises an nz handshake by a `routing_hash` prefix on a packet at
 /// least this long (routing_hash + idx + a full NNpsk0 msg1 = 20 + 4 + 48).
 pub(crate) const NZ_MSG1_MIN: usize = ROUTING_HASH_LEN + INDEX_LEN + 48;
+
+/// A handshake msg2's exact length: `idx_B | idx_A | NNpsk0 msg2` (A's
+/// ephemeral key + the tag of an empty payload). The cert-auth that follows
+/// it starts with the same `idx_B` and is far longer (it carries the cert),
+/// so the length is what tells B a msg2 from a cert-auth whose msg2 was lost.
+pub(crate) const NZ_MSG2_LEN: usize = 2 * INDEX_LEN + 32 + NOISE_TAG_LEN;
+
+/// Least time between two answers of A to a client's repeated msg1 (it
+/// repeats every 250 ms while it waits), so a burst of replayed msg1s
+/// costs at most one msg2 + cert-auth per gap.
+const HANDSHAKE_RESEND_GAP: Duration = Duration::from_millis(100);
 
 /// Fixed tunnel MTU reported to the netstack. A Noise datagram adds
 /// `header(12) + channel(1) + tag(16) = 29` over the inner IP packet; keeping
@@ -356,9 +372,9 @@ pub(crate) async fn noise_connect(
         let attempt = tokio::time::timeout(wait, async {
             loop {
                 match rx.recv().await {
-                    Some((d, _src))
-                        if d.len() >= 2 * INDEX_LEN && d[0..INDEX_LEN] == idx_b_bytes =>
-                    {
+                    // A cert-auth whose msg2 was lost also starts with idx_B:
+                    // only a msg2's length is a msg2.
+                    Some((d, _src)) if d.len() == NZ_MSG2_LEN && d[0..INDEX_LEN] == idx_b_bytes => {
                         return Some(d);
                     }
                     Some(_) => continue, // stray — skip
@@ -389,31 +405,47 @@ pub(crate) async fn noise_connect(
     let session = Arc::new(hs.into_session()?);
     let hp_key = derive_hp_key(&session.handshake_hash);
 
-    // cert-auth: A's first transport message (counter 0). Skip strays until a
-    // datagram deframes as an AUTH frame under our index.
-    let auth_pt = timeout(hs_timeout, async {
-        loop {
-            let (d, _) = match rx.recv().await {
-                Some(x) => x,
-                None => {
-                    return Err(Fault::new(
-                        Reason::TransportClosed,
-                        "nz: datagram source closed",
-                    ));
+    // cert-auth: A's first transport message (counter 0). Until it comes,
+    // keep repeating msg1 on the same cadence: A answers a msg1 it has
+    // already accepted with its msg2 and cert-auth again, so a lost cert-auth
+    // costs one more round trip, not the dial. Skip strays (and repeated
+    // msg2s) until a datagram deframes as an AUTH frame under our index.
+    let auth_deadline = tokio::time::Instant::now() + hs_timeout;
+    let auth_pt = loop {
+        let now = tokio::time::Instant::now();
+        if now >= auth_deadline {
+            return Err(Fault::new(
+                Reason::AuthTimeout,
+                format!("nz: no cert-auth within {hs_timeout:?}"),
+            ));
+        }
+        let attempt = timeout(MSG1_RESEND.min(auth_deadline - now), async {
+            loop {
+                let (d, _) = match rx.recv().await {
+                    Some(x) => x,
+                    None => {
+                        return Err(Fault::new(
+                            Reason::TransportClosed,
+                            "nz: datagram source closed",
+                        ));
+                    }
+                };
+                if let Ok((_c, CH_AUTH, pt)) = deframe_data(&session, &hp_key, idx_b, &d) {
+                    return Ok(pt);
                 }
-            };
-            if let Ok((_c, CH_AUTH, pt)) = deframe_data(&session, &hp_key, idx_b, &d) {
-                return Ok(pt);
+            }
+        })
+        .await;
+        match attempt {
+            Ok(result) => break result?,
+            Err(_) => {
+                socket
+                    .send_to(&shaper.obfuscate(&msg1, true), relay_addr)
+                    .await
+                    .map_err(|e| Fault::from_io(&e).context("nz send msg1"))?;
             }
         }
-    })
-    .await
-    .map_err(|_| {
-        Fault::new(
-            Reason::AuthTimeout,
-            format!("nz: no cert-auth within {hs_timeout:?}"),
-        )
-    })??;
+    };
     verify_cert_auth(&auth_pt, cert_hash, &session.handshake_hash)?;
 
     Ok(NoisePeerTransport::spawn(NoiseChannelInit {
@@ -429,6 +461,7 @@ pub(crate) async fn noise_connect(
         pump: Some(pump),
         idle,
         shaper,
+        resend: None,
     }))
 }
 
@@ -504,7 +537,35 @@ pub(crate) async fn noise_accept(
         pump,
         idle,
         shaper,
+        resend: Some(HandshakeResend {
+            routing_hash: identity.routing_hash,
+            idx_b,
+            msg2,
+            auth: auth_pkt,
+        }),
     }))
+}
+
+/// What A sent to finish a handshake, kept to send again: B repeats msg1
+/// until it has both msg2 and the cert-auth, so a repeated msg1 from B means
+/// one of them was lost. Only until B is heard on the session (it frames
+/// nothing before it has both), and only to the session's own peer address:
+/// a msg1 from anywhere else gets no answer.
+struct HandshakeResend {
+    routing_hash: [u8; ROUTING_HASH_LEN],
+    idx_b: u32,
+    /// Framed (not yet shaped): each send is shaped afresh.
+    msg2: Vec<u8>,
+    auth: Vec<u8>,
+}
+
+impl HandshakeResend {
+    /// `buf` is B's msg1 for this handshake again.
+    fn is_repeat(&self, buf: &[u8]) -> bool {
+        buf.len() >= NZ_MSG1_MIN
+            && buf[..ROUTING_HASH_LEN] == self.routing_hash
+            && buf[ROUTING_HASH_LEN..ROUTING_HASH_LEN + INDEX_LEN] == self.idx_b.to_be_bytes()
+    }
 }
 
 // ---- transport ------------------------------------------------------------
@@ -522,6 +583,8 @@ struct NoiseChannelInit {
     pump: Option<JoinHandle<()>>,
     idle: Duration,
     shaper: SharedShaper,
+    /// A's side: msg2 and the cert-auth, for B's repeated msg1.
+    resend: Option<HandshakeResend>,
 }
 
 /// A `Transport` carrying tunnel IP packets as Noise datagrams over UDP.
@@ -562,9 +625,12 @@ impl NoisePeerTransport {
             pump,
             idle,
             shaper,
+            mut resend,
         } = init;
 
         let send_counter = Arc::new(AtomicU64::new(send_counter_start));
+        let reader_socket = socket.clone();
+        let reader_shaper = shaper.clone();
         let (dec_tx, dec_rx) = mpsc::unbounded_channel();
         // Incoming hole-punch signaling (CH_SIGNAL) is split off to the signal
         // channel; the reader forwards payloads and never blocks on it.
@@ -576,6 +642,7 @@ impl NoisePeerTransport {
             for c in recv_seen {
                 replay.check_and_set(c);
             }
+            let mut last_resend: Option<tokio::time::Instant> = None;
             loop {
                 let next = timeout(idle, rx.recv()).await;
                 let (buf, _src) = match next {
@@ -589,10 +656,27 @@ impl NoisePeerTransport {
                     Ok(None) => break, // socket source gone -> Stream end
                     Ok(Some(x)) => x,
                 };
+                // B's msg1 again: it lacks our msg2 or cert-auth. Send both.
+                if let Some(r) = &resend
+                    && r.is_repeat(&buf)
+                {
+                    let now = tokio::time::Instant::now();
+                    if last_resend.is_none_or(|t| now - t >= HANDSHAKE_RESEND_GAP) {
+                        last_resend = Some(now);
+                        log::debug!("nz: B repeated its msg1; msg2 and cert-auth sent again");
+                        for framed in [&r.msg2, &r.auth] {
+                            let wire = reader_shaper.obfuscate(framed, false);
+                            let _ = reader_socket.send_to(&wire, peer_addr).await;
+                        }
+                    }
+                    continue;
+                }
                 // Malformed / not-ours packets deframe to Err and are dropped.
                 if let Ok((counter, channel, payload)) =
                     deframe_data(&reader_session, &reader_hp, local_index, &buf)
                 {
+                    // B frames nothing before it has msg2 and the cert-auth.
+                    resend = None;
                     if !replay.check_and_set(counter) {
                         continue; // replay or too old
                     }
@@ -849,6 +933,130 @@ mod tests {
         );
         let (b_res, a_res) = tokio::join!(connect, accept);
         (a_res.unwrap().expect("accept"), b_res.expect("connect"))
+    }
+
+    /// A forwarder B dials as its relay, which drops the A->B datagrams
+    /// `lose` picks by their order (0 = A's first: its msg2).
+    async fn lossy_relay(
+        a_addr: SocketAddr,
+        lose: impl Fn(usize) -> bool + Send + 'static,
+    ) -> SocketAddr {
+        let sock = udp("127.0.0.1:0").await;
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let mut b_addr = None;
+            let mut to_b = 0;
+            while let Ok((n, src)) = sock.recv_from(&mut buf).await {
+                if src == a_addr {
+                    let nth = to_b;
+                    to_b += 1;
+                    if let Some(b) = b_addr
+                        && !lose(nth)
+                    {
+                        let _ = sock.send_to(&buf[..n], b).await;
+                    }
+                } else {
+                    b_addr = Some(src);
+                    let _ = sock.send_to(&buf[..n], a_addr).await;
+                }
+            }
+        });
+        addr
+    }
+
+    /// A B<->A pair over [`lossy_relay`]: B's dial, as it ends.
+    async fn pair_over_lossy_relay(
+        identity: ShareIdentity,
+        lose: impl Fn(usize) -> bool + Send + 'static,
+    ) -> Result<(NoisePeerTransport, NoisePeerTransport), Fault> {
+        let a_sock = udp("127.0.0.1:0").await;
+        let b_sock = udp("127.0.0.1:0").await;
+        let relay = lossy_relay(a_sock.local_addr().unwrap(), lose).await;
+        let (rx_a, pump_a) = spawn_socket_pump(
+            a_sock.clone(),
+            nz_shaper(&identity.routing_hash, &identity.secret),
+        );
+        let id = identity.clone();
+        let accept = tokio::spawn(async move {
+            noise_accept(
+                a_sock,
+                rx_a,
+                rand::random(),
+                Some(pump_a),
+                &id,
+                Duration::from_secs(5),
+                DEFAULT_IDLE,
+            )
+            .await
+        });
+        let b = noise_connect(
+            b_sock,
+            relay,
+            &identity.cert_hash,
+            &identity.routing_hash,
+            &identity.secret,
+            Duration::from_secs(5),
+            DEFAULT_IDLE,
+        )
+        .await?;
+        let a = accept.await.unwrap().expect("accept");
+        Ok((a, b))
+    }
+
+    /// One lost packet from A must not cost B its dial. Not the msg2 (B
+    /// used to take the cert-auth behind it for its msg2 and fail on
+    /// decrypt), not the cert-auth (nobody sent it again), nor both: B
+    /// repeats msg1 until it has both, and A answers a msg1 it already
+    /// accepted with both again.
+    #[tokio::test]
+    async fn a_lost_msg2_or_cert_auth_costs_a_resend_not_the_dial() {
+        for (what, lost) in [
+            ("msg2", vec![0]),
+            ("cert-auth", vec![1]),
+            ("both", vec![0, 1]),
+        ] {
+            let started = tokio::time::Instant::now();
+            let (mut a, mut b) =
+                pair_over_lossy_relay(ShareIdentity::generate(), move |n| lost.contains(&n))
+                    .await
+                    .unwrap_or_else(|e| panic!("{what} lost: the dial failed: {e}"));
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{what} lost: one resend round, not a timeout ({:?})",
+                started.elapsed()
+            );
+            let p = ipv4_udp(64);
+            b.send(p.clone()).await.unwrap();
+            let got = timeout(Duration::from_secs(2), a.next())
+                .await
+                .expect("A receives")
+                .expect("stream open")
+                .expect("no error");
+            assert_eq!(got, p, "{what} lost: the session carries traffic");
+            a.send(p.clone()).await.unwrap();
+            let got = timeout(Duration::from_secs(2), b.next())
+                .await
+                .expect("B receives")
+                .expect("stream open")
+                .expect("no error");
+            assert_eq!(got, p, "{what} lost: both ways");
+        }
+    }
+
+    #[test]
+    fn a_msg2_is_told_from_a_cert_auth_by_its_length() {
+        let id = ShareIdentity::generate();
+        let mut b = NoiseHandshake::initiator(&id.routing_hash, &id.secret).unwrap();
+        let mut a = NoiseHandshake::responder(&id).unwrap();
+        a.read_message(&b.write_message(&[]).unwrap()).unwrap();
+        let msg2 = a.write_message(&[]).unwrap();
+        assert_eq!(2 * INDEX_LEN + msg2.len(), NZ_MSG2_LEN);
+        let session = a.into_session().unwrap();
+        let hp = derive_hp_key(&session.handshake_hash);
+        let auth = build_cert_auth(&id, &session.handshake_hash).unwrap();
+        let framed = frame_data(&session, &hp, 7, 0, CH_AUTH, &auth).unwrap();
+        assert!(framed.len() > NZ_MSG2_LEN, "{}", framed.len());
     }
 
     fn ipv4_udp(payload_len: usize) -> Vec<u8> {

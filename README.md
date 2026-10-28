@@ -48,7 +48,7 @@ For a kernel-level exit — packets routed and NATed by the kernel through a TUN
 
 ### Relays
 
-By default a new share is relay-less: `spora-cli share` finds the machine's public address with STUN, picks a random UDP port (10000 to 32767, kept in the share and printed on every run; let it through the firewall) and puts both in the URL, so clients dial the sharer straight, with no relay and no relay bandwidth. That needs an Internet-routable machine; behind a NAT it warns, and clients get in only if the NAT forwards the port. To name the address yourself, advertise a direct endpoint:
+By default a new share is relay-less: `spora-cli share` finds the machine's public address with STUN, picks a random UDP port (10000 to 32767, kept in the share and printed on every run; let it through the firewall) and puts both in the URL (later runs warn if the machine's public address has moved since; `--fresh` makes a share on the new one), so clients dial the sharer straight, with no relay and no relay bandwidth. That needs an Internet-routable machine; behind a NAT it warns, and clients get in only if the NAT forwards the port. To name the address yourself, advertise a direct endpoint:
 
 ```bash
 spora-cli share --direct your.public.host:51820

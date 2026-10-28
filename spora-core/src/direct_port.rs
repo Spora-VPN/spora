@@ -83,6 +83,26 @@ pub async fn find(stun_servers: &[String], query_timeout: Duration) -> Result<Di
     })
 }
 
+/// The address this host's IPv4 (with `v6`, IPv6) reaches the internet
+/// from, as STUN sees a fresh socket of that family. For checking that a
+/// stored relay-less share still names this host: its own port is the
+/// share's, in use by then.
+pub async fn public_ip(
+    v6: bool,
+    stun_servers: &[String],
+    query_timeout: Duration,
+) -> Result<IpAddr, String> {
+    let any: IpAddr = if v6 {
+        Ipv6Addr::UNSPECIFIED.into()
+    } else {
+        Ipv4Addr::UNSPECIFIED.into()
+    };
+    let socket = bind(SocketAddr::new(any, 0)).map_err(|e| format!("bind UDP: {e}"))?;
+    Ok(mapped_address(socket, stun_servers, query_timeout)
+        .await?
+        .ip())
+}
+
 /// A random port free on IPv4 and, where the host has IPv6, on IPv6 too,
 /// with a socket bound to it per family.
 fn pick_port() -> Result<(u16, UdpSocket, Option<UdpSocket>), String> {
@@ -229,6 +249,22 @@ mod tests {
         assert_eq!(v4.mapped, public);
         assert!(!v4.on_host);
         assert!(v4.behind_nat(found.port));
+    }
+
+    #[tokio::test]
+    async fn the_public_ip_is_what_stun_sees() {
+        let own = responder(None).await.to_string();
+        let ip = public_ip(false, std::slice::from_ref(&own), Duration::from_secs(2)).await;
+        assert_eq!(ip, Ok(IpAddr::from(Ipv4Addr::LOCALHOST)));
+        let nat = responder(Some("203.0.113.7:40000".parse().unwrap())).await;
+        let ip = public_ip(false, &[nat.to_string()], Duration::from_secs(2)).await;
+        assert_eq!(ip, Ok("203.0.113.7".parse().unwrap()));
+        // No STUN service of the family: an error, quickly.
+        assert!(
+            public_ip(true, &[own], Duration::from_secs(2))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

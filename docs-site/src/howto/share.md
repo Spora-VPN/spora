@@ -33,8 +33,11 @@ not one of the machine's own, the run says it is behind a NAT: clients
 then get in only if the NAT forwards that port to it, as a cloud server's
 usually does. An address family whose NAT changes the port is left out of
 the URL, as long as another family remains. `--direct host:port` names the address and port instead (a
-hostname, or a port your firewall already lets in). If the machine's public
-address changes, `spora share --fresh` makes a share on the new one.
+hostname, or a port your firewall already lets in). The address is fixed
+when the share is made, so every later run without relay flags asks STUN
+again once the share is up, and warns if the machine now reaches the
+internet from another address than the URL names; `spora share --fresh`
+then makes a share on the new one.
 
 To share through relays instead, pass `--spora-relays` for Spora's relays:
 the first run registers this machine with Spora's API and gets the relays

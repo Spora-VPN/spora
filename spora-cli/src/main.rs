@@ -817,8 +817,17 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
             } else {
                 WantedRelays::Exactly(relays)
             };
+            // A stored relay-less share served without relay flags: the
+            // addresses to check are still this machine's, once it is up.
+            // Addresses named with --direct are the user's to keep current.
+            let mut check_addresses = Vec::new();
             let share = match stored_share(&path, fresh, &device, &wanted) {
-                StoredShare::Serve(share) => share,
+                StoredShare::Serve(share) => {
+                    if wanted == WantedRelays::Any {
+                        check_addresses = advertised_ips(&share);
+                    }
+                    share
+                }
                 stored => {
                     if let StoredShare::Replace(why) = stored {
                         notice!(
@@ -911,6 +920,8 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
             // on once the share is up: setting up resolves and binds, and
             // never waits for a peer.
             let share_id = share.share_id;
+            let stun_servers = config.stun_servers.clone();
+            let stun_timeout = config.timings.stun_query_timeout;
             let session = spora_core::share(device, share, config).await?;
             // Renewed relay tokens reach the running share from now on.
             service.register_share(share_id, session.credentials.clone());
@@ -1005,6 +1016,14 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
                     ),
                 }
                 say!("Press Ctrl+C to stop sharing.");
+            }
+            if !check_addresses.is_empty() {
+                tokio::spawn(check_direct_addresses(
+                    check_addresses,
+                    stun_servers,
+                    stun_timeout,
+                    json,
+                ));
             }
             shutdown.requested().await;
             if json {
@@ -3338,6 +3357,75 @@ fn relayless_endpoints(
     (relays, notices)
 }
 
+/// The IP addresses a share's `Direct` endpoints name (a hostname's are
+/// not this run's to judge).
+fn advertised_ips(share: &Share) -> Vec<std::net::IpAddr> {
+    share
+        .relays
+        .iter()
+        .filter(|r| r.endpoint.protocol == spora_core::identity::RelayProtocol::Direct)
+        .filter_map(|r| r.endpoint.host.parse().ok())
+        .collect()
+}
+
+/// Ask STUN, for each family `advertised` has an address of, where this
+/// machine reaches the internet from now, and warn when that is not an
+/// address the share names. Runs beside the share; a family STUN cannot
+/// answer for says nothing (an outage of STUN is no reason to alarm).
+async fn check_direct_addresses(
+    advertised: Vec<std::net::IpAddr>,
+    stun_servers: Vec<String>,
+    query_timeout: std::time::Duration,
+    json: bool,
+) {
+    use spora_core::direct_port::public_ip;
+    let ask = |v6: bool| {
+        let wanted = advertised.iter().any(|a| a.is_ipv6() == v6);
+        let servers = &stun_servers;
+        async move {
+            if !wanted {
+                return None;
+            }
+            let found = public_ip(v6, servers, query_timeout).await;
+            if let Err(e) = &found {
+                log::info!(
+                    "relay-less address check, IPv{}: {e}",
+                    if v6 { 6 } else { 4 }
+                );
+            }
+            found.ok()
+        }
+    };
+    let (v4, v6) = tokio::join!(ask(false), ask(true));
+    let now: Vec<std::net::IpAddr> = v4.into_iter().chain(v6).collect();
+    log::debug!("relay-less address check: the URL names {advertised:?}, STUN sees {now:?}");
+    for line in stale_address_notices(&advertised, &now) {
+        notice!(json, "{line}");
+    }
+}
+
+/// A warning for each address in `now` whose family the share names only
+/// other addresses of.
+fn stale_address_notices(advertised: &[std::net::IpAddr], now: &[std::net::IpAddr]) -> Vec<String> {
+    now.iter()
+        .filter_map(|ip| {
+            let named: Vec<&std::net::IpAddr> = advertised
+                .iter()
+                .filter(|a| a.is_ipv6() == ip.is_ipv6())
+                .collect();
+            if named.is_empty() || named.contains(&ip) {
+                return None;
+            }
+            let family = if ip.is_ipv6() { "IPv6" } else { "IPv4" };
+            let named: Vec<String> = named.iter().map(ToString::to_string).collect();
+            Some(format!(
+                "This share's URL names {family} {}, but this machine's {family} now reaches the internet from {ip}. If clients cannot connect, run with --fresh for a new share (a new URL) on the current address.",
+                named.join(", ")
+            ))
+        })
+        .collect()
+}
+
 /// The relays a run asks for with its relay flags.
 #[derive(Debug, Clone, PartialEq)]
 enum WantedRelays {
@@ -3664,6 +3752,43 @@ mod identity_persistence_tests {
             relayless_endpoints(&direct(&[("203.0.113.7:41000", false)], 20000));
         assert_eq!(hosts(&relays), ["direct/203.0.113.7:20000"]);
         assert!(notices[0].contains("goes out as 41000"), "{notices:?}");
+    }
+
+    #[test]
+    fn a_moved_address_is_named_per_family() {
+        let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
+        let share = Share::new(
+            &DeviceIdentity::generate(),
+            hosts_to_direct(&["198.51.100.4", "2001:db8::4", "exit.example.net"]),
+        )
+        .unwrap();
+        let advertised = advertised_ips(&share);
+        assert_eq!(advertised, [ip("198.51.100.4"), ip("2001:db8::4")]);
+
+        assert!(stale_address_notices(&advertised, &advertised).is_empty());
+        let moved = stale_address_notices(&advertised, &[ip("198.51.100.9"), ip("2001:db8::4")]);
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(
+            moved[0].contains("names IPv4 198.51.100.4")
+                && moved[0].contains("now reaches the internet from 198.51.100.9"),
+            "{moved:?}"
+        );
+        // A family the share names nothing of is no concern of the URL's.
+        let v4_only = [ip("198.51.100.4")];
+        assert!(stale_address_notices(&v4_only, &[ip("2001:db8::9")]).is_empty());
+    }
+
+    fn hosts_to_direct(hosts: &[&str]) -> Vec<RelayEntry> {
+        hosts
+            .iter()
+            .map(|h| {
+                RelayEntry::open(spora_core::identity::RelayEndpoint::with_protocol(
+                    *h,
+                    20000,
+                    spora_core::identity::RelayProtocol::Direct,
+                ))
+            })
+            .collect()
     }
 
     #[test]

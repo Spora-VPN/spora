@@ -1203,55 +1203,83 @@ fn a_share_without_relay_flags_is_relayless() {
 
 /// A relay-less share whose public address is not one of its own (a fake
 /// STUN service says 203.0.113.7) still starts, on that address, and says it
-/// is behind a NAT. Under --json that goes to stderr: stdout carries events
-/// only.
+/// is behind a NAT. A later run, after the address moved (the service now
+/// says 203.0.113.8), serves the same URL and warns that it names the old
+/// one. Under --json all of that goes to stderr: stdout carries events only.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_relayless_share_behind_a_nat_says_so_off_the_event_stream() {
-    let stun = fake_stun(Some("203.0.113.7:40000".parse().unwrap()));
     let home = scratch("relayless-nat");
-    let mut share = spora(&home, &format!("http://{NOWHERE}"))
-        .args([
-            "share",
-            "--json",
-            "--stun",
-            &stun,
-            "--no-conn-log",
-            "--no-record",
-        ])
-        .spawn()
-        .expect("spawn spora share");
-    let out = lines(share.stdout.take().unwrap());
-    let err = lines(share.stderr.take().unwrap());
-    let ready = Instant::now() + Duration::from_secs(30);
     let event = |line: &str| -> serde_json::Value {
         serde_json::from_str(line)
             .unwrap_or_else(|e| panic!("not an event on stdout: {line:?} ({e})"))
     };
-    let url = loop {
-        let left = ready.saturating_duration_since(Instant::now());
-        let line = out.recv_timeout(left).unwrap_or_else(|_| {
-            panic!(
-                "share never got ready; stderr: {:?}",
-                err.try_iter().collect::<Vec<_>>()
-            )
-        });
-        let v = event(&line);
-        if v["event"] == "share_ready" {
-            break v["url"].as_str().unwrap().to_string();
+    // One run against a STUN service that sees `public`: its URL, and its
+    // stderr up to the first line holding `expect` (or all of it at exit).
+    let run = |public: &str, expect: &str| -> (String, Vec<String>) {
+        let stun = fake_stun(Some(public.parse().unwrap()));
+        let mut share = spora(&home, &format!("http://{NOWHERE}"))
+            .args([
+                "share",
+                "--json",
+                "--stun",
+                &stun,
+                "--no-conn-log",
+                "--no-record",
+            ])
+            .spawn()
+            .expect("spawn spora share");
+        let out = lines(share.stdout.take().unwrap());
+        let err = lines(share.stderr.take().unwrap());
+        let ready = Instant::now() + Duration::from_secs(30);
+        let url = loop {
+            let left = ready.saturating_duration_since(Instant::now());
+            let line = out.recv_timeout(left).unwrap_or_else(|_| {
+                panic!(
+                    "share never got ready; stderr: {:?}",
+                    err.try_iter().collect::<Vec<_>>()
+                )
+            });
+            let v = event(&line);
+            if v["event"] == "share_ready" {
+                break v["url"].as_str().unwrap().to_string();
+            }
+        };
+        let mut stderr = Vec::new();
+        while let Ok(line) = err.recv_timeout(ready.saturating_duration_since(Instant::now())) {
+            let done = line.contains(expect);
+            stderr.push(line);
+            if done {
+                break;
+            }
         }
+        interrupt(&share);
+        assert!(wait(&mut share, Duration::from_secs(30)).success());
+        for line in out.iter() {
+            event(&line);
+        }
+        stderr.extend(err.iter());
+        (url, stderr)
     };
+
+    let (url, stderr) = run("203.0.113.7:40000", "behind a NAT");
     assert!(url.contains("?r=direct/203.0.113.7:"), "{url}");
-    interrupt(&share);
-    assert!(wait(&mut share, Duration::from_secs(30)).success());
-    for line in out.iter() {
-        event(&line);
-    }
-    let stderr: Vec<String> = err.iter().collect();
     assert!(
         stderr
             .iter()
             .any(|l| l.contains("behind a NAT") && l.contains("203.0.113.7")),
+        "{stderr:?}"
+    );
+    assert!(
+        !stderr.iter().any(|l| l.contains("now reaches")),
+        "a new share has nothing to compare: {stderr:?}"
+    );
+
+    let (again, stderr) = run("203.0.113.8:40000", "now reaches");
+    assert_eq!(again, url, "the stored share serves the same URL");
+    assert!(
+        stderr.iter().any(|l| l.contains("names IPv4 203.0.113.7")
+            && l.contains("now reaches the internet from 203.0.113.8")),
         "{stderr:?}"
     );
     std::fs::remove_dir_all(&home).ok();

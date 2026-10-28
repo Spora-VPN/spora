@@ -57,7 +57,9 @@ enum Mode {
     /// $XDG_CONFIG_HOME/spora/share.bin (made on the first run), so the share
     /// URL stays the same across invocations. The relays are part of the
     /// share (and of its URL): relay flags that differ from the stored
-    /// share's make a new share, with a new URL.
+    /// share's make a new share, with a new URL. Without relay flags a new
+    /// share uses Spora's relays, which this machine gets from Spora's API
+    /// (registering it there) along with the token they want.
     Share {
         /// Override the share file path.
         #[arg(long, alias = "identity-file")]
@@ -775,13 +777,31 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
                         .into(),
                 );
             }
-            let device = load_device(&path)?;
+            // The device identity lives in the service's state, which also
+            // keeps the relay access a share on Spora's relays needs.
+            let service = spora_service::Telemetry::init_global(service_config(&[]))
+                .map_err(|e| format!("service state in {}: {e}", service_dir().display()))?;
+            let device = service.device_identity();
             let share = load_or_make_share(
                 &path,
                 fresh,
                 &device,
                 (!relays.is_empty()).then_some(relays),
+                &mut || spora_relays_share(service),
             )?;
+            if share
+                .relays
+                .iter()
+                .any(|r| r.credential == spora_core::identity::Credential::Spora)
+            {
+                service.set_relay_access(true);
+                config.relay_token = service.relay_token();
+                if config.relay_token.is_none() {
+                    say!(
+                        "No valid relay token yet: Spora's relays will refuse this share until one comes from the API."
+                    );
+                }
+            }
             if !stun.is_empty() {
                 for server in &stun {
                     parse_host_port(server).map_err(|e| format!("--stun: {}", e))?;
@@ -843,7 +863,10 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
             // A stop signal that comes while this sets up is kept and acted
             // on once the share is up: setting up resolves and binds, and
             // never waits for a peer.
+            let share_id = share.share_id;
             let session = spora_core::share(device, share, config).await?;
+            // Renewed relay tokens reach the running share from now on.
+            service.register_share(share_id, session.credentials.clone());
             if json {
                 let ready = emit_json_event(serde_json::json!({
                     "v": 1,
@@ -940,6 +963,7 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
                 say!("Stopping share session...");
             }
             session.stop().await;
+            service.unregister_share(&share_id);
             // `routing` (if any) drops here, after the session has stopped,
             // running OsRoute's cleanup. Dropping at scope end — rather than an
             // explicit call — means cleanup also runs if `share()` errored above
@@ -3178,34 +3202,32 @@ fn default_share_path() -> PathBuf {
     config_dir().join("share.bin")
 }
 
-/// The device identity the share at `share_path` is served under: kept
-/// beside it as `device.bin`, made on first use.
-fn load_device(share_path: &std::path::Path) -> Result<DeviceIdentity, Box<dyn std::error::Error>> {
-    let path = share_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("device.bin");
-    if let Ok(bytes) = std::fs::read(&path) {
-        return DeviceIdentity::from_bytes(&bytes)
-            .map_err(|e| format!("device identity {}: {e}", path.display()).into());
+/// A new share on Spora's relays (fetching them, with a relay token, when
+/// none are cached yet).
+fn spora_relays_share(
+    service: &spora_service::Telemetry,
+) -> Result<Share, Box<dyn std::error::Error>> {
+    if service.relay_access_status().advised.is_empty() {
+        tokio::task::block_in_place(|| service.refresh_relays()).map_err(|e| {
+            format!(
+                "cannot get Spora's relays from its API ({e}); pass --relay to share through a relay of your own"
+            )
+        })?;
     }
-    let device = DeviceIdentity::generate();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    write_private_atomically(&path, &device.to_bytes())?;
-    Ok(device)
+    Ok(service.make_share(Vec::new(), true)?)
 }
 
 /// The share at `path`, or a new one (written there) when there is none,
 /// `fresh` asks for one, it was made under another device, or `relays` (the
 /// relay flags, if any were given) are not the ones it was made with: the
-/// relays are in the URL, so other relays are another share.
+/// relays are in the URL, so other relays are another share. A new share
+/// without relay flags is `default_share`'s.
 fn load_or_make_share(
     path: &std::path::Path,
     fresh: bool,
     device: &DeviceIdentity,
     relays: Option<Vec<RelayEntry>>,
+    default_share: &mut dyn FnMut() -> Result<Share, Box<dyn std::error::Error>>,
 ) -> Result<Share, Box<dyn std::error::Error>> {
     if !fresh && let Ok(bytes) = std::fs::read(path) {
         let why_new = match Share::from_blob(&bytes) {
@@ -3227,13 +3249,10 @@ fn load_or_make_share(
             );
         }
     }
-    let relays = relays.unwrap_or_else(|| {
-        vec![RelayEntry::open(spora_core::identity::RelayEndpoint::new(
-            spora_core::DEFAULT_RELAY.0,
-            spora_core::DEFAULT_RELAY.1,
-        ))]
-    });
-    let share = Share::new(device, relays)?;
+    let share = match relays {
+        Some(relays) => Share::new(device, relays)?,
+        None => default_share()?,
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -3336,30 +3355,46 @@ mod identity_persistence_tests {
         ))]
     }
 
+    /// A share over `relay(9)` of `device`, standing in for one on
+    /// Spora's relays.
+    fn spora_default(
+        device: &DeviceIdentity,
+    ) -> impl FnMut() -> Result<Share, Box<dyn std::error::Error>> + '_ {
+        move || Ok(Share::new(device, relay(9))?)
+    }
+
     #[test]
-    fn created_device_and_share_are_private_and_round_trip() {
+    fn a_created_share_is_private_and_round_trips() {
         let dir = scratch("create");
         let path = dir.join("share.bin");
+        let device = DeviceIdentity::generate();
 
-        let device = load_device(&path).unwrap();
-        let share = load_or_make_share(&path, false, &device, None).unwrap();
+        let share =
+            load_or_make_share(&path, false, &device, None, &mut spora_default(&device)).unwrap();
+        assert_eq!(share.relays, relay(9), "no relay flags: the default share");
 
-        // The private key and the secret must never be group/world readable,
-        // even briefly.
-        for f in [&path, &dir.join("device.bin")] {
-            let mode = std::fs::metadata(f).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "{} must be 0600", f.display());
-        }
+        // The secret must never be group/world readable, even briefly.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the share file must be 0600");
 
-        // Loading again returns the SAME device and share, not new ones.
-        let device2 = load_device(&path).unwrap();
-        assert_eq!(device2.cert_hash(), device.cert_hash());
-        let again = load_or_make_share(&path, false, &device2, None).unwrap();
+        // Loading again returns the SAME share, not a new one, and never
+        // asks for a default.
+        let mut never = || -> Result<Share, Box<dyn std::error::Error>> {
+            panic!("a stored share needs no default")
+        };
+        let again = load_or_make_share(&path, false, &device, None, &mut never).unwrap();
         assert_eq!(again, share, "the share must be stable across launches");
         assert_eq!(again.url(), share.url());
 
         // The same relay flags keep it too.
-        let given = load_or_make_share(&path, false, &device, Some(share.relays.clone())).unwrap();
+        let given = load_or_make_share(
+            &path,
+            false,
+            &device,
+            Some(share.relays.clone()),
+            &mut never,
+        )
+        .unwrap();
         assert_eq!(given, share);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3369,10 +3404,13 @@ mod identity_persistence_tests {
     fn other_relays_fresh_or_another_device_make_a_new_share() {
         let dir = scratch("renew");
         let path = dir.join("share.bin");
-        let device = load_device(&path).unwrap();
-        let first = load_or_make_share(&path, false, &device, Some(relay(1))).unwrap();
+        let device = DeviceIdentity::generate();
+        let mut default = spora_default(&device);
+        let first =
+            load_or_make_share(&path, false, &device, Some(relay(1)), &mut default).unwrap();
 
-        let moved = load_or_make_share(&path, false, &device, Some(relay(2))).unwrap();
+        let moved =
+            load_or_make_share(&path, false, &device, Some(relay(2)), &mut default).unwrap();
         assert_ne!(
             moved.share_id, first.share_id,
             "other relays: another share"
@@ -3380,23 +3418,21 @@ mod identity_persistence_tests {
         assert_eq!(moved.relays, relay(2));
         // ...and it is now the stored one.
         assert_eq!(
-            load_or_make_share(&path, false, &device, None).unwrap(),
+            load_or_make_share(&path, false, &device, None, &mut default).unwrap(),
             moved
         );
 
-        let fresh = load_or_make_share(&path, true, &device, None).unwrap();
+        let fresh = load_or_make_share(&path, true, &device, None, &mut default).unwrap();
         assert_ne!(fresh.share_id, moved.share_id, "--fresh: another share");
         assert_eq!(
-            fresh.endpoints(),
-            vec![spora_core::identity::RelayEndpoint::new(
-                spora_core::DEFAULT_RELAY.0,
-                spora_core::DEFAULT_RELAY.1
-            )],
-            "a new share without relay flags gets the default relay"
+            fresh.relays,
+            relay(9),
+            "without relay flags: the default share"
         );
 
         let other = DeviceIdentity::generate();
-        let rebuilt = load_or_make_share(&path, false, &other, None).unwrap();
+        let rebuilt =
+            load_or_make_share(&path, false, &other, None, &mut spora_default(&other)).unwrap();
         assert_eq!(
             rebuilt.cert_hash,
             other.cert_hash(),
@@ -3404,8 +3440,15 @@ mod identity_persistence_tests {
         );
 
         std::fs::write(&path, b"garbage").unwrap();
-        let recovered = load_or_make_share(&path, false, &device, None).unwrap();
+        let recovered = load_or_make_share(&path, false, &device, None, &mut default).unwrap();
         assert_eq!(recovered.cert_hash, device.cert_hash());
+
+        // A default that cannot be made (no API) is the error, and the
+        // stored share is left as it was.
+        let mut failing = || -> Result<Share, Box<dyn std::error::Error>> { Err("no API".into()) };
+        let before = std::fs::read(&path).unwrap();
+        assert!(load_or_make_share(&path, true, &device, None, &mut failing).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
 
         std::fs::remove_dir_all(&dir).ok();
     }

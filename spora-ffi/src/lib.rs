@@ -142,6 +142,9 @@ struct TunnelSession {
 struct ShareSessionEntry {
     cancel: CancellationToken,
     task: JoinHandle<()>,
+    /// The share it serves: one instance per share, and the service's
+    /// registry entry to drop on stop.
+    share_id: spora_core::identity::ShareId,
     /// The session's DNS forwarder (see spora-core's `dns`), so the app can
     /// hand it the device's resolvers (`set_share_dns_servers`).
     dns: Arc<spora_core::dns::DnsForwarder>,
@@ -256,12 +259,31 @@ fn record_config(record_dir: Option<String>) -> Option<RecordConfig> {
 
 #[derive(Debug, uniffi::Error)]
 pub enum ShareError {
+    /// `init_service` has not run (shares need the device identity it keeps).
+    NotInitialized,
+    /// The share was made under another device identity (the service state
+    /// was lost and the device minted a new one): offer to make a new share.
+    IdentityMismatch,
+    /// A share on Spora's relays was asked for before any relays were
+    /// fetched: call `refresh_relays` first.
+    NoRelayAdvice,
+    /// This share is already running (one instance per share).
+    AlreadyRunning,
+    /// Not a share blob this build reads.
+    InvalidShare(String),
     Generic(String),
 }
 
 impl std::fmt::Display for ShareError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            ShareError::NotInitialized => "the service is not initialized".fmt(f),
+            ShareError::IdentityMismatch => {
+                "the share was made under another device identity".fmt(f)
+            }
+            ShareError::NoRelayAdvice => "no relays from the API yet".fmt(f),
+            ShareError::AlreadyRunning => "this share is already running".fmt(f),
+            ShareError::InvalidShare(s) => write!(f, "not a share: {s}"),
             ShareError::Generic(s) => s.fmt(f),
         }
     }
@@ -275,62 +297,162 @@ fn wrap_protector(cb: Box<dyn SocketProtectorCallback>) -> spora_core::SocketPro
     }))
 }
 
-/// Generate a fresh device identity and return its serialized bytes. The
-/// platform persists them and passes them back to `make_share()` and
-/// `share()`.
-#[uniffi::export]
-pub fn make_identity() -> Vec<u8> {
-    spora_core::identity::DeviceIdentity::generate().to_bytes()
+/// What one relay endpoint of a share is sent.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum RelayCredential {
+    /// Nothing: an open relay.
+    None,
+    /// These bytes (a self-hosted relay's token, as the user pasted it).
+    Static { token: Vec<u8> },
+    /// The device's relay token: Spora's relays.
+    Spora,
 }
 
-/// Make a new share of the device `identity_bytes` over the built-in relay
-/// and return its blob. The platform persists the blob and passes it back
-/// to `share()`, so the share URL stays stable across launches.
+/// One relay endpoint of a share. `endpoint` is in the share URL's `?r=`
+/// form: `host:port` (QUIC), `nz/host:port`, `tcptls/host:port` or
+/// `direct/host:port`, an IPv6 literal bracketed.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RelayEntry {
+    pub endpoint: String,
+    pub credential: RelayCredential,
+}
+
+impl TryFrom<RelayEntry> for spora_core::identity::RelayEntry {
+    type Error = ShareError;
+    fn try_from(e: RelayEntry) -> Result<Self, ShareError> {
+        use spora_core::identity::Credential;
+        Ok(spora_core::identity::RelayEntry {
+            endpoint: spora_core::identity::RelayEndpoint::from_url_param(&e.endpoint)
+                .map_err(ShareError::Generic)?,
+            credential: match e.credential {
+                RelayCredential::None => Credential::None,
+                RelayCredential::Static { token } => Credential::Static(token),
+                RelayCredential::Spora => Credential::Spora,
+            },
+        })
+    }
+}
+
+impl From<&spora_core::identity::RelayEntry> for RelayEntry {
+    fn from(e: &spora_core::identity::RelayEntry) -> Self {
+        use spora_core::identity::Credential;
+        RelayEntry {
+            endpoint: e.endpoint.to_url_param(),
+            credential: match &e.credential {
+                Credential::None => RelayCredential::None,
+                Credential::Static(token) => RelayCredential::Static {
+                    token: token.clone(),
+                },
+                Credential::Spora => RelayCredential::Spora,
+            },
+        }
+    }
+}
+
+fn service() -> Result<&'static spora_service::Telemetry, ShareError> {
+    spora_service::Telemetry::global().ok_or(ShareError::NotInitialized)
+}
+
+fn parse_share(blob: &[u8]) -> Result<spora_core::identity::Share, ShareError> {
+    spora_core::identity::Share::from_blob(blob).map_err(ShareError::InvalidShare)
+}
+
+/// Make a new share of this device and return its blob, offline. With
+/// `use_spora`, the relays `refresh_relays` last fetched come first (each
+/// presenting the device's relay token), then `own`; without fetched
+/// relays that is [`ShareError::NoRelayAdvice`]. The platform stores the
+/// blob (it holds the share's secret: keep it in an encrypted store) and
+/// passes it to `start_share`; its URL never changes ([`share_url`]), so
+/// other relays mean a new share.
 #[uniffi::export]
-pub fn make_share(identity_bytes: Vec<u8>) -> Result<Vec<u8>, ShareError> {
-    let device = spora_core::identity::DeviceIdentity::from_bytes(&identity_bytes)
-        .map_err(ShareError::Generic)?;
-    let share = spora_core::identity::Share::open(
-        &device,
-        vec![spora_core::identity::RelayEndpoint::new(
-            spora_core::DEFAULT_RELAY.0,
-            spora_core::DEFAULT_RELAY.1,
-        )],
-    )
-    .map_err(ShareError::Generic)?;
+pub fn make_share(own: Vec<RelayEntry>, use_spora: bool) -> Result<Vec<u8>, ShareError> {
+    let own = own
+        .into_iter()
+        .map(spora_core::identity::RelayEntry::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let share = service()?.make_share(own, use_spora).map_err(|e| match e {
+        spora_service::Error::NoRelayAdvice => ShareError::NoRelayAdvice,
+        e => ShareError::Generic(e.to_string()),
+    })?;
     Ok(share.to_blob())
 }
 
-/// Starts sharing this device's connection.
+/// A share's URL: the same for as long as the share exists.
+#[uniffi::export]
+pub fn share_url(share_blob: Vec<u8>) -> Result<String, ShareError> {
+    Ok(parse_share(&share_blob)?.url().to_string())
+}
+
+/// A share's id (hex): public, unique per share.
+#[uniffi::export]
+pub fn share_id(share_blob: Vec<u8>) -> Result<String, ShareError> {
+    Ok(spora_core::identity::hex(
+        &parse_share(&share_blob)?.share_id,
+    ))
+}
+
+/// A share's relays, in the order its URL lists them.
+#[uniffi::export]
+pub fn share_relays(share_blob: Vec<u8>) -> Result<Vec<RelayEntry>, ShareError> {
+    Ok(parse_share(&share_blob)?
+        .relays
+        .iter()
+        .map(Into::into)
+        .collect())
+}
+
+/// Starts sharing this device's connection as the share `share_blob` (made
+/// by [`make_share`] under this device's identity; another device's is
+/// [`ShareError::IdentityMismatch`]). Never touches the network beyond the
+/// share's own registrations: the relay token is the one the service has
+/// cached (none: the share starts degraded and gets one when the service
+/// renews), and every renewal reaches it until [`stop_share`]. One instance
+/// per share ([`ShareError::AlreadyRunning`]).
 ///
 /// Connection logging (the sharer-side per-flow record, see spora-core's
 /// `connlog`): pass `conn_log_dir` to enable it. The app should pass a
-/// directory under its files dir (e.g. `filesDir/connlog`) and exclude it
-/// from Android auto-backup. `conn_log_dir = None` disables logging.
-/// `conn_log_retention_days = None` uses the core default (90 days).
-/// `conn_log_sessions_only = true` records who was connected and when, but
-/// no per-flow destination records.
-///
-/// Fails if `conn_log_dir` is set but not writable — a default-on liability
-/// log must not silently degrade at startup.
+/// directory under its files dir (e.g. `filesDir/connlog/<share id>`) and
+/// exclude it from Android auto-backup. `conn_log_dir = None` disables
+/// logging. `conn_log_retention_days = None` uses the core default (90
+/// days). `conn_log_sessions_only = true` records who was connected and
+/// when, but no per-flow destination records. Fails if `conn_log_dir` is
+/// set but not writable — a default-on liability log must not silently
+/// degrade at startup.
 ///
 /// `record_dir` turns on the connection record (spora-core's `record`, the
 /// diagnostic account of this run) in that directory — one directory for
 /// every share and connect, not backed up (Android:
-/// `noBackupFilesDir/records`). `None` keeps no record.
-#[uniffi::export(default(record_dir = None))]
-pub fn share(
-    identity_bytes: Vec<u8>,
+/// `noBackupFilesDir/records`). `None` keeps no record. `stun_servers`
+/// empty uses the built-in list.
+#[uniffi::export(default(record_dir = None, stun_servers = []))]
+pub fn start_share(
     share_blob: Vec<u8>,
     protector: Option<Box<dyn SocketProtectorCallback>>,
     conn_log_dir: Option<String>,
     conn_log_retention_days: Option<u32>,
     conn_log_sessions_only: bool,
     record_dir: Option<String>,
+    stun_servers: Vec<String>,
 ) -> Result<ShareResult, ShareError> {
-    let device = spora_core::identity::DeviceIdentity::from_bytes(&identity_bytes)
-        .map_err(ShareError::Generic)?;
-    let share = spora_core::identity::Share::from_blob(&share_blob).map_err(ShareError::Generic)?;
+    let svc = service()?;
+    let share = parse_share(&share_blob)?;
+    let device = svc.device_identity();
+    if share.cert_hash != device.cert_hash() {
+        return Err(ShareError::IdentityMismatch);
+    }
+    if lock(&SHARE_SESSIONS)
+        .values()
+        .any(|e| e.share_id == share.share_id && !e.task.is_finished())
+    {
+        return Err(ShareError::AlreadyRunning);
+    }
+    let uses_spora = share
+        .relays
+        .iter()
+        .any(|r| r.credential == spora_core::identity::Credential::Spora);
+    if uses_spora {
+        svc.set_relay_access(true);
+    }
     let conn_log = conn_log_dir.map(|dir| {
         let mut cfg = spora_core::connlog::ConnLogConfig::in_dir(dir);
         if let Some(days) = conn_log_retention_days {
@@ -343,23 +465,43 @@ pub fn share(
     // fallback answers until the app supplies the network's resolvers via
     // `set_share_dns_servers`.
     let dns = spora_core::dns::DnsForwarder::system();
-    let config = spora_core::Config {
+    let mut config = spora_core::Config {
         protector: protector.and_then(wrap_protector),
         conn_log,
         dns_forwarder: Some(dns.clone()),
         record: record_config(record_dir),
+        relay_token: svc.relay_token(),
         ..spora_core::Config::default()
     };
+    if !stun_servers.is_empty() {
+        config.stun_servers = stun_servers;
+    }
+    let share_id = share.share_id;
     let session = RUNTIME
         .block_on(spora_core::share(device, share, config))
-        .map_err(|e| ShareError::Generic(e.to_string()))?;
+        .map_err(|e| {
+            if e.starts_with(spora_core::identity::IDENTITY_MISMATCH) {
+                ShareError::IdentityMismatch
+            } else {
+                ShareError::Generic(e)
+            }
+        })?;
+    svc.register_share(share_id, session.credentials.clone());
 
     let url = session.url.to_string();
     let cancel = session.cancel.clone();
     let task = session.task;
 
     let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    lock(&SHARE_SESSIONS).insert(id, ShareSessionEntry { cancel, task, dns });
+    lock(&SHARE_SESSIONS).insert(
+        id,
+        ShareSessionEntry {
+            cancel,
+            task,
+            share_id,
+            dns,
+        },
+    );
 
     Ok(ShareResult { handle: id, url })
 }
@@ -413,6 +555,9 @@ pub fn stop_share(handle: i32) -> Result<(), TunnelError> {
         .ok_or(TunnelError::InvalidHandle)?;
     entry.cancel.cancel();
     entry.task.abort();
+    if let Some(svc) = spora_service::Telemetry::global() {
+        svc.unregister_share(&entry.share_id);
+    }
     Ok(())
 }
 
@@ -872,6 +1017,7 @@ mod tests {
             ShareSessionEntry {
                 cancel: CancellationToken::new(),
                 task: RUNTIME.spawn(async {}),
+                share_id: [9; 8],
                 dns: spora_core::dns::DnsForwarder::system(),
             },
         );

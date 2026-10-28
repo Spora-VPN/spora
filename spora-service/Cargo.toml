@@ -22,6 +22,10 @@ flate2 = "1.1"
 # webpki-roots trust anchors; default features off also drops ureq's response
 # decompression, which nothing here needs (responses are a few bytes of JSON).
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+# Sealing the secrets in service.json (AES-256-GCM) and the encodings of the
+# device identity and relay token kept there.
+ring = "0.17"
+base64 = "0.22"
 
 # Unix: opening a listed file without following a symlink swapped in since
 # (O_NOFOLLOW, whose value differs per architecture; fsutil::open_listed).

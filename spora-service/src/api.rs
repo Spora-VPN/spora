@@ -124,6 +124,59 @@ pub struct UploadAck {
     pub telemetry_required: Option<bool>,
 }
 
+/// `GET /v1/relays`: the relays to write into new shares, and the device's
+/// relay token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayAnswer {
+    pub relays: Vec<crate::state::AdvisedRelay>,
+    /// `None`: the device is not entitled to a token.
+    pub token: Option<RelayTokenAnswer>,
+}
+
+/// The relay token as the API hands it out. `Debug` leaves the value out.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelayTokenAnswer {
+    /// base64url, unpadded: opaque bytes for the relays.
+    pub value: String,
+    /// The device it names (hex cert hash).
+    pub subject: String,
+    pub expires_unix_ms: u64,
+    pub renew_after_unix_ms: u64,
+}
+
+impl fmt::Debug for RelayTokenAnswer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RelayTokenAnswer")
+            .field("value", &"<redacted>")
+            .field("subject", &self.subject)
+            .field("expires_unix_ms", &self.expires_unix_ms)
+            .field("renew_after_unix_ms", &self.renew_after_unix_ms)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+struct RelaysBody {
+    relays: Vec<RelayBody>,
+    #[serde(default)]
+    token: Option<TokenBody>,
+}
+
+#[derive(Deserialize)]
+struct RelayBody {
+    protocol: String,
+    host: String,
+    port: u16,
+}
+
+#[derive(Deserialize)]
+struct TokenBody {
+    value: String,
+    subject: String,
+    expires_at: String,
+    renew_after: String,
+}
+
 #[derive(Deserialize)]
 struct RegisteredBody {
     device: String,
@@ -281,14 +334,16 @@ impl Api {
         }
     }
 
-    /// `POST /v1/devices`. The device belongs to this API: the built-in
-    /// one, or this override's bases.
-    pub fn register(&self, platform: &str) -> Result<Device, ApiError> {
+    /// `POST /v1/devices`, naming the device's cert hash (hex), which the
+    /// server keeps for good: the relay tokens it mints name it. The device
+    /// belongs to this API: the built-in one, or this override's bases.
+    pub fn register(&self, platform: &str, cert_hash: &str) -> Result<Device, ApiError> {
         let mut version = self.app_version.clone();
         crate::diag::cut_at(&mut version, MAX_APP_VERSION);
         let body = serde_json::to_vec(&serde_json::json!({
             "platform": platform,
             "app_version": version,
+            "cert_hash": cert_hash,
         }))
         .map_err(|e| ApiError::BadResponse(e.to_string()))?;
         let a = self.request("POST", "/v1/devices", None, Payload::Json(body))?;
@@ -319,6 +374,47 @@ impl Api {
             device: me.device,
             telemetry_required: me.telemetry_required,
         })
+    }
+
+    /// `GET /v1/relays`: the relays this device is to write into new shares,
+    /// and a freshly minted relay token (`null` when the device is not
+    /// entitled to one). Endpoints of a protocol this build does not know
+    /// are left out; timestamps are ISO 8601.
+    pub fn relays(&self, dev: &Device) -> Result<RelayAnswer, ApiError> {
+        let a = self.request("GET", "/v1/relays", Some(dev), Payload::None)?;
+        if a.status != 200 {
+            return Err(status_error(&a));
+        }
+        let b: RelaysBody = parse(&a)?;
+        let relays = b
+            .relays
+            .into_iter()
+            .filter(|r| matches!(r.protocol.as_str(), "quic" | "nz" | "tcptls"))
+            .map(|r| crate::state::AdvisedRelay {
+                protocol: r.protocol,
+                host: r.host,
+                port: r.port,
+            })
+            .collect();
+        let token = match b.token {
+            None => None,
+            Some(t) => {
+                let when = |s: &str, what: &str| {
+                    crate::time::parse_iso_ms(s)
+                        .ok_or_else(|| ApiError::BadResponse(format!("token {what}: {s:?}")))
+                };
+                if t.value.is_empty() {
+                    return Err(ApiError::BadResponse("empty relay token".into()));
+                }
+                Some(RelayTokenAnswer {
+                    expires_unix_ms: when(&t.expires_at, "expires_at")?,
+                    renew_after_unix_ms: when(&t.renew_after, "renew_after")?,
+                    value: t.value,
+                    subject: t.subject,
+                })
+            }
+        };
+        Ok(RelayAnswer { relays, token })
     }
 
     /// `POST /v1/telemetry/upload`: `data` is the file's bytes from `offset`.

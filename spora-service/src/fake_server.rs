@@ -42,6 +42,8 @@ pub(crate) struct FakeDevice {
     pub(crate) id: String,
     pub(crate) platform: String,
     pub(crate) revoked: bool,
+    /// The cert hash it registered with (hex).
+    pub(crate) cert_hash: String,
 }
 
 /// An answer given as is, whatever the request.
@@ -72,6 +74,12 @@ pub(crate) struct FakeState {
     pub(crate) path_status: BTreeMap<String, (u16, String)>,
     pub(crate) on_request: Option<Hook>,
     pub(crate) required: bool,
+    /// What `GET /v1/relays` hands out: endpoints as `(protocol, host, port)`.
+    pub(crate) relays: Vec<(String, String, u16)>,
+    /// Whether devices are entitled to a relay token.
+    pub(crate) no_token: bool,
+    /// The relay tokens minted so far (`value` of each answer).
+    pub(crate) minted: Vec<String>,
     next: u32,
 }
 
@@ -172,6 +180,7 @@ impl FakeServer {
                 id: id.into(),
                 platform: "linux".into(),
                 revoked: false,
+                cert_hash: "00".repeat(20),
             },
         );
         token
@@ -332,9 +341,12 @@ fn route(
             };
             let platform = v["platform"].as_str().unwrap_or("");
             let version = v["app_version"].as_str().unwrap_or("");
+            let cert_hash = v["cert_hash"].as_str().unwrap_or("");
             if !["android", "ios", "macos", "windows", "linux"].contains(&platform)
                 || version.is_empty()
                 || version.len() > 32
+                || cert_hash.len() != 40
+                || !cert_hash.bytes().all(|b| b.is_ascii_hexdigit())
             {
                 return err(400, "invalid");
             }
@@ -351,10 +363,40 @@ fn route(
                     id: id.clone(),
                     platform: platform.into(),
                     revoked: false,
+                    cert_hash: cert_hash.to_ascii_lowercase(),
                 },
             );
             (201, serde_json::json!({ "device": id, "token": token }))
         }
+        ("GET", "/v1/relays") => match device(st, headers) {
+            Some(d) => {
+                let relays: Vec<_> = st
+                    .relays
+                    .iter()
+                    .map(|(p, h, port)| serde_json::json!({"protocol": p, "host": h, "port": port}))
+                    .collect();
+                let token = if st.no_token {
+                    serde_json::Value::Null
+                } else {
+                    // Opaque bytes to the client: unique per answer, naming
+                    // the device.
+                    let value = format!("relay-token-{}-{}", d.cert_hash, st.minted.len());
+                    let b64 = {
+                        use base64::Engine;
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value)
+                    };
+                    st.minted.push(b64.clone());
+                    serde_json::json!({
+                        "value": b64,
+                        "subject": d.cert_hash,
+                        "expires_at": "2999-01-01T00:00:00Z",
+                        "renew_after": "2998-01-01T00:00:00Z",
+                    })
+                };
+                (200, serde_json::json!({ "relays": relays, "token": token }))
+            }
+            None => err(401, "not_authenticated"),
+        },
         ("GET", "/v1/devices/me") => match device(st, headers) {
             Some(d) => (
                 200,

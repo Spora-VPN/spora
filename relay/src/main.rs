@@ -147,6 +147,7 @@ async fn main() {
         tcp_port: args.tcp_port,
         session_log,
         json: args.json,
+        on_ready: None,
     };
     if let Err(e) = relay::server::run(opts, authorizer).await {
         eprintln!("relay: {e}");

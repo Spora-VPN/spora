@@ -14,6 +14,11 @@
 //!   open record's run id;
 //! - **crash files** ([`diag::install_panic_hook`], [`diag::write_crash`]).
 //!
+//! It also keeps the device's identity and its access to Spora's relays
+//! ([`access`]): the key pair every share of the device is served under,
+//! and the relays and relay token the API hands out, renewed in the
+//! background.
+//!
 //! A user can always hand all three over by hand ([`diag::bundle`], a zip for
 //! the share sheet or a mail client — no server involved). With uploads
 //! switched on ([`Telemetry`]) they are replicated to the API in the
@@ -22,8 +27,10 @@
 //! The connection log (spora-core's `connlog`) is deliberately no part of
 //! this: it is the sharer's local egress record and never uploads.
 
+pub mod access;
 pub mod api;
 pub mod diag;
+pub mod seal;
 pub mod state;
 pub mod telemetry;
 pub mod upload;
@@ -35,8 +42,10 @@ mod zip;
 use std::fmt;
 use std::io;
 
+pub use access::RelayAccessStatus;
 pub use api::{ApiError, DEFAULT_API_BASES};
 pub use diag::bundle::{BundleOptions, BundleSummary};
+pub use seal::StateKey;
 pub use telemetry::{
     REQUIRED_NOTICE, ServiceConfig, Telemetry, TelemetryStatus, UploadTimings, finish, nudge,
     record_subscriber, set_dormant,
@@ -51,6 +60,9 @@ pub enum Error {
     Required,
     /// Uploads are switched off (and an upload was asked for explicitly).
     Off,
+    /// A share on Spora's relays was asked for with no relay advice cached:
+    /// fetch it first ([`Telemetry::refresh_relays`]).
+    NoRelayAdvice,
     /// The configuration cannot work (e.g. an API base that is not a URL).
     Config(String),
     /// The state directory or the files to upload.
@@ -64,6 +76,7 @@ impl fmt::Display for Error {
         match self {
             Error::Required => f.write_str("the account requires telemetry"),
             Error::Off => f.write_str("uploads are switched off"),
+            Error::NoRelayAdvice => f.write_str("no relays from the API yet"),
             Error::Config(e) => write!(f, "configuration: {e}"),
             Error::Io(e) => write!(f, "{e}"),
             Error::Api(e) => write!(f, "{e}"),

@@ -234,6 +234,8 @@ pub(crate) struct Pass<'a> {
     pub(crate) api: &'a Api,
     pub(crate) store: &'a StateStore,
     pub(crate) platform: &'a str,
+    /// The device's cert hash (hex), named at registration.
+    pub(crate) cert_hash: &'a str,
     pub(crate) record_dirs: &'a [PathBuf],
     pub(crate) log_dir: Option<&'a Path>,
     pub(crate) status_interval: Duration,
@@ -327,6 +329,16 @@ impl Pass<'_> {
         outcome.map(|()| p.sum)
     }
 
+    /// This API's registration — made active — or a new one. Whatever the
+    /// upload switch says: the relay access needs a registration too.
+    pub(crate) fn ensure_device(&self, sum: &mut PassSummary) -> Result<Device, Error> {
+        let device = self.store.modify(|s| s.activate(|d| self.api.serves(d)))?;
+        match device {
+            Some(d) => Ok(d),
+            None => self.register(sum),
+        }
+    }
+
     /// Register this device with the configured API, unless another process
     /// sharing the state did so meanwhile (its device is then this one's).
     /// A registration with another API is parked, not replaced.
@@ -343,7 +355,7 @@ impl Pass<'_> {
         self.store.rewrite()?;
         let minted = self
             .api
-            .register(self.platform)
+            .register(self.platform, self.cert_hash)
             .map_err(|e| self.api_error("register", None, e))?;
         let (dev, adopted, parked) = self.store.modify(|s| {
             if let Some(d) = s.activate(|d| self.api.serves(d)) {
@@ -626,7 +638,7 @@ impl Pass<'_> {
     /// another process has registered since — along with what belonged to
     /// it there, so the next pass registers afresh (and sends what is on
     /// disk again, under the new id).
-    fn api_error(&self, what: &str, dev: Option<&Device>, e: ApiError) -> Error {
+    pub(crate) fn api_error(&self, what: &str, dev: Option<&Device>, e: ApiError) -> Error {
         if e == ApiError::Unauthorized
             && let Some(dev) = dev
         {

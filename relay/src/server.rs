@@ -14,6 +14,10 @@ use crate::authz::Authorizer;
 use crate::sessionlog::{SessionLog, SessionLogConfig};
 use crate::{State, serve};
 
+/// Called once both listeners are bound, with the UDP and (if any) TCP
+/// address: the moment the relay serves.
+pub type OnReady = Box<dyn FnOnce(SocketAddr, Option<SocketAddr>) + Send>;
+
 /// Where and how to serve.
 pub struct ServeOptions {
     /// The UDP socket's address (QUIC and nz). A `::` wildcard is made
@@ -25,6 +29,8 @@ pub struct ServeOptions {
     pub session_log: Option<SessionLogConfig>,
     /// Print a `relay_ready` JSON line on stdout once both listeners are up.
     pub json: bool,
+    /// Told when both listeners are up (e.g. to write a health mark).
+    pub on_ready: Option<OnReady>,
 }
 
 /// Open the session log, bind the listeners and serve forever. Fails (before
@@ -81,6 +87,9 @@ pub async fn run(opts: ServeOptions, authorizer: Arc<dyn Authorizer>) -> Result<
             serde_json::json!({"event":"relay_ready","udp":bound,"tcp":tcp_bound})
         );
         let _ = std::io::stdout().flush();
+    }
+    if let Some(ready) = opts.on_ready {
+        ready(bound, tcp_bound);
     }
     serve(socket, state).await;
     Ok(())

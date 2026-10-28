@@ -10,7 +10,7 @@ same text.
 
 ## `spora share`
 
-Share over a tunnel. Serves the share kept at $XDG_CONFIG_HOME/spora/share.bin (made on the first run), so the share URL stays the same across invocations. The relays are part of the share (and of its URL): relay flags that differ from the stored share's make a new share, with a new URL
+Share over a tunnel. Serves the share kept at $XDG_CONFIG_HOME/spora/share.bin (made on the first run), so the share URL stays the same across invocations. The relays are part of the share (and of its URL): relay flags that differ from the stored share's make a new share, with a new URL. Without relay flags a new share uses Spora's relays, which this machine gets from Spora's API (registering it there) along with the token they want
 
 ```text
 spora share [OPTIONS]
@@ -599,7 +599,7 @@ spora help [COMMAND]
 
 ## `spora help share`
 
-Share over a tunnel. Serves the share kept at $XDG_CONFIG_HOME/spora/share.bin (made on the first run), so the share URL stays the same across invocations. The relays are part of the share (and of its URL): relay flags that differ from the stored share's make a new share, with a new URL
+Share over a tunnel. Serves the share kept at $XDG_CONFIG_HOME/spora/share.bin (made on the first run), so the share URL stays the same across invocations. The relays are part of the share (and of its URL): relay flags that differ from the stored share's make a new share, with a new URL. Without relay flags a new share uses Spora's relays, which this machine gets from Spora's API (registering it there) along with the token they want
 
 ```text
 spora help share

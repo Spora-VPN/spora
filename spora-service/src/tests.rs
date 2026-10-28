@@ -985,6 +985,7 @@ fn a_flag_from_another_api_binds_nothing_here() {
 
     let elsewhere = "http://127.0.0.1:9".to_string();
     let mut st = ServiceState {
+        device_identity: Some(crate::state::StoredIdentity::generate()),
         upload_enabled: true,
         required: true,
         required_notice_pending: true,
@@ -1428,6 +1429,7 @@ fn halting_ends_a_pass_between_chunks() {
         api: &api,
         store: &store,
         platform: "linux",
+        cert_hash: &"ab".repeat(20),
         record_dirs: &[],
         log_dir: Some(&e.log),
         status_interval: Duration::from_secs(3600),
@@ -1472,6 +1474,7 @@ fn a_pass_stops_when_another_process_switches_uploads_off() {
         api: &api,
         store: &store,
         platform: "linux",
+        cert_hash: &"ab".repeat(20),
         record_dirs: std::slice::from_ref(&e.rec),
         log_dir: Some(&e.log),
         status_interval: Duration::from_secs(3600),
@@ -1617,4 +1620,273 @@ fn wait_for(mut f: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "timed out");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+// --- Relay access ---
+
+fn relay_cfg(e: &Env) -> ServiceConfig {
+    e.cfg().with_relay_access(true)
+}
+
+fn advise(e: &Env) {
+    e.server.state().relays = vec![
+        ("quic".into(), "203.0.113.7".into(), 443),
+        ("nz".into(), "2001:db8::7".into(), 443),
+        ("warp".into(), "203.0.113.8".into(), 1),
+    ];
+}
+
+fn relays_asked(e: &Env) -> usize {
+    e.server
+        .requests()
+        .iter()
+        .filter(|r| r.method == "GET" && r.path == "/v1/relays")
+        .count()
+}
+
+#[test]
+fn the_device_identity_is_minted_once_and_named_at_registration() {
+    let e = env();
+    let t = Telemetry::open(relay_cfg(&e)).unwrap();
+    let first = t.device_identity().cert_hash();
+    drop(t);
+    let t = Telemetry::open(relay_cfg(&e)).unwrap();
+    assert_eq!(t.device_identity().cert_hash(), first, "kept across opens");
+    assert!(e.state().device_identity.is_some());
+
+    advise(&e);
+    t.refresh_relays().unwrap();
+    let hex = spora_core::identity::hex(&first);
+    let reg = e.server.state().devices.values().next().cloned().unwrap();
+    assert_eq!(
+        reg.cert_hash, hex,
+        "the registration names the device's cert hash"
+    );
+    assert_eq!(t.relay_access_status().cert_hash, hex);
+}
+
+#[test]
+fn refreshing_relays_registers_even_with_uploads_off_and_caches_both() {
+    let e = env();
+    advise(&e);
+    let t = Telemetry::open(relay_cfg(&e)).unwrap();
+    assert!(!t.status().upload_enabled);
+    assert!(t.relay_token().is_none());
+    let st = t.refresh_relays().unwrap();
+    assert_eq!(registrations(&e.server.requests()), 1);
+    // The protocol this build does not know is left out.
+    assert_eq!(st.advised.len(), 2);
+    assert_eq!(st.advised[0].host, "203.0.113.7");
+    assert!(st.token_expires_unix_ms.is_some() && st.renew_after_unix_ms.is_some());
+    assert!(st.last_success_unix_ms.is_some() && st.last_error.is_none());
+    let token = t.relay_token().expect("a cached token");
+    let minted = e.server.state().minted[0].clone();
+    use base64::Engine;
+    assert_eq!(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&token),
+        minted
+    );
+    // Nothing was uploaded: the switch is off.
+    assert!(e.server.uploads().is_empty());
+
+    // Cached: a new handle sees it with no request.
+    drop(t);
+    let n = e.server.requests().len();
+    let t = Telemetry::open(relay_cfg(&e)).unwrap();
+    assert_eq!(t.relay_token(), Some(token));
+    assert_eq!(t.relay_access_status().advised.len(), 2);
+    assert_eq!(e.server.requests().len(), n);
+}
+
+#[test]
+fn a_share_on_spora_relays_puts_the_advice_first_then_its_own() {
+    use spora_core::identity::{Credential, RelayEndpoint, RelayEntry, RelayProtocol};
+    let e = env();
+    let t = Telemetry::open(relay_cfg(&e)).unwrap();
+    let own = RelayEntry {
+        endpoint: RelayEndpoint::new("198.51.100.1", 4000),
+        credential: Credential::Static(b"mine".to_vec()),
+    };
+    assert!(matches!(
+        t.make_share(vec![own.clone()], true),
+        Err(Error::NoRelayAdvice)
+    ));
+    // Own relays alone need no advice.
+    let solo = t.make_share(vec![own.clone()], false).unwrap();
+    assert_eq!(solo.relays, vec![own.clone()]);
+    assert!(t.make_share(vec![], false).is_err(), "no relays at all");
+
+    advise(&e);
+    t.refresh_relays().unwrap();
+    let share = t.make_share(vec![own.clone()], true).unwrap();
+    assert_eq!(share.cert_hash, t.device_identity().cert_hash());
+    assert_eq!(
+        share.relays,
+        vec![
+            RelayEntry {
+                endpoint: RelayEndpoint::new("203.0.113.7", 443),
+                credential: Credential::Spora,
+            },
+            RelayEntry {
+                endpoint: RelayEndpoint::with_protocol("2001:db8::7", 443, RelayProtocol::NoiseUdp),
+                credential: Credential::Spora,
+            },
+            own,
+        ]
+    );
+    assert!(spora_core::identity::ShareIdentity::new(&t.device_identity(), &share).is_ok());
+}
+
+#[test]
+fn a_renewed_token_reaches_every_running_share() {
+    use spora_core::identity::{Credential, Credentials};
+    let e = env();
+    advise(&e);
+    let t = Telemetry::open(relay_cfg(&e)).unwrap();
+    // A share that started degraded, before any token.
+    let started_bare = Credentials::new(None);
+    t.register_share([1; 8], started_bare.clone());
+    t.refresh_relays().unwrap();
+    let first = t.relay_token().unwrap();
+    assert_eq!(started_bare.token(&Credential::Spora), first);
+
+    // A share started with the cached token keeps it; the next renewal
+    // reaches both.
+    let started_with = Credentials::new(Some(first.clone()));
+    t.register_share([2; 8], started_with.clone());
+    t.refresh_relays().unwrap();
+    let second = t.relay_token().unwrap();
+    assert_ne!(second, first, "a fresh token per answer");
+    for c in [&started_bare, &started_with] {
+        assert_eq!(c.token(&Credential::Spora), second);
+    }
+    // A stopped share is left alone.
+    t.unregister_share(&[1; 8]);
+    t.refresh_relays().unwrap();
+    assert_eq!(started_bare.token(&Credential::Spora), second);
+    assert_ne!(started_with.token(&Credential::Spora), second);
+
+    // Not entitled any more: the cache is cleared and the shares lose the
+    // token too.
+    e.server.state().no_token = true;
+    let st = t.refresh_relays().unwrap();
+    assert!(st.token_expires_unix_ms.is_none());
+    assert!(t.relay_token().is_none());
+    assert!(!started_with.has_spora_token());
+}
+
+#[test]
+fn a_failed_refresh_keeps_what_was_cached() {
+    let e = env();
+    advise(&e);
+    let t = Telemetry::open(relay_cfg(&e)).unwrap();
+    t.refresh_relays().unwrap();
+    let token = t.relay_token().unwrap();
+    e.server
+        .state()
+        .path_status
+        .insert("/v1/relays".into(), (503, "unavailable".into()));
+    assert!(t.refresh_relays().is_err());
+    assert_eq!(t.relay_token(), Some(token));
+    let st = t.relay_access_status();
+    assert_eq!(st.advised.len(), 2);
+    assert!(st.last_error.is_some(), "the failure is reported");
+
+    // A revoked device: forgotten, and the next refresh registers anew.
+    e.server.state().path_status.clear();
+    e.server.revoke_all();
+    assert!(matches!(
+        t.refresh_relays(),
+        Err(Error::Api(ApiError::Unauthorized))
+    ));
+    assert!(e.state().device.is_none());
+    t.refresh_relays().unwrap();
+    assert_eq!(registrations(&e.server.requests()), 2);
+}
+
+#[test]
+fn the_thread_fetches_relay_access_at_start_without_uploads() {
+    let e = env();
+    advise(&e);
+    let t = Telemetry::open(relay_cfg(&e)).unwrap();
+    t.start();
+    wait_for(|| t.relay_token().is_some());
+    // The token's renew_after is far off: no more asking.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(relays_asked(&e), 1);
+    t.stop();
+    assert!(e.server.uploads().is_empty());
+
+    // A configuration that only connects never asks (nor registers).
+    let e2 = env();
+    advise(&e2);
+    let t2 = e2.open();
+    t2.start();
+    std::thread::sleep(Duration::from_millis(200));
+    t2.stop();
+    assert!(e2.server.requests().is_empty());
+}
+
+#[test]
+fn sealed_state_keeps_its_secrets_out_of_the_file() {
+    use crate::StateKey;
+    let e = env();
+    advise(&e);
+    let t = Telemetry::open(relay_cfg(&e).with_state_key(StateKey::Mint)).unwrap();
+    let key = t.minted_state_key().expect("a minted key");
+    t.refresh_relays().unwrap();
+    let cert_hash = t.device_identity().cert_hash();
+    let device_key = t.device_identity().key_der_bytes().to_vec();
+    let token = t.relay_token().unwrap();
+    let dev_token = e.server.state().devices.keys().next().cloned().unwrap();
+    drop(t);
+
+    let text = std::fs::read_to_string(e.state.join("service.json")).unwrap();
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    assert!(
+        !text.contains(&b64.encode(&device_key)),
+        "the private key is sealed"
+    );
+    assert!(!text.contains(&dev_token), "the device token is sealed");
+    assert!(
+        !text.contains(&b64.encode(&token)),
+        "the relay token is sealed"
+    );
+    assert!(text.contains("sealed:v1:"));
+    assert!(text.contains("203.0.113.7"), "the advice stays readable");
+
+    // The key brings it all back.
+    let t = Telemetry::open(relay_cfg(&e).with_state_key(StateKey::Provided(key))).unwrap();
+    assert!(t.minted_state_key().is_none());
+    assert_eq!(t.device_identity().cert_hash(), cert_hash);
+    assert_eq!(t.relay_token(), Some(token));
+    assert_eq!(registrations(&e.server.requests()), 1);
+    drop(t);
+
+    // Another key is state loss: a fresh device, never a rotation.
+    let t = Telemetry::open(relay_cfg(&e).with_state_key(StateKey::Mint)).unwrap();
+    assert_ne!(t.device_identity().cert_hash(), cert_hash);
+    assert!(t.relay_token().is_none());
+    assert!(e.state.join("service.json.corrupt").exists());
+}
+
+#[test]
+fn a_registration_made_before_device_identities_is_forgotten() {
+    let e = env();
+    let mut st = ServiceState {
+        upload_enabled: true,
+        ..ServiceState::default()
+    };
+    st.device = Some(device("old", "tok-old", &e.server.base()));
+    st.save(&e.state).unwrap();
+    let t = e.open();
+    let st = e.state();
+    assert!(
+        st.device.is_none(),
+        "no cert hash at the server: registered anew"
+    );
+    assert!(st.device_identity.is_some());
+    assert!(st.upload_enabled, "the user's switch stays");
+    drop(t);
 }

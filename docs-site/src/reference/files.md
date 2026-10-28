@@ -8,20 +8,21 @@ root's own for a run made with sudo (see the notes).
 | what | Linux and macOS | Windows |
 |---|---|---|
 | Share (the secret behind the share URL, and its relays) | `~/.config/spora/share.bin` | `%APPDATA%\spora\share.bin` |
-| Device identity (the key pair every share is served under) | `~/.config/spora/device.bin` | `%APPDATA%\spora\device.bin` |
 | Connection log (per share) | `~/.local/state/spora/connlog/<routing-hash>/` | `%LOCALAPPDATA%\spora\connlog\<routing-hash>\` |
 | Diagnostic records | `~/.local/state/spora/records/` | `%LOCALAPPDATA%\spora\records\` |
 | Diagnostic log and crash reports | `~/.local/state/spora/log/` | `%LOCALAPPDATA%\spora\log\` |
-| Telemetry state | `~/.local/state/spora/service/` | `%LOCALAPPDATA%\spora\service\` |
+| Device identity, relay access and telemetry state | `~/.local/state/spora/service/` | `%LOCALAPPDATA%\spora\service\` |
 
 Notes:
 
-- The share file is the secret behind a stable share URL, and the device
-  identity is the key it is served under: both mode `0600`, written
-  atomically. Copy both to move a share; use `--fresh` (or delete the
-  share file) to revoke the URL. `--share-file` selects another path, with
-  the device identity beside it. A share works only with the device
-  identity it was made under: with another, the CLI makes a new share.
+- The share file is the secret behind a stable share URL: mode `0600`,
+  written atomically. It works only with the device identity it was made
+  under, kept in `service/service.json` (this machine's key pair): with
+  another, the CLI makes a new share. Copy both to move a share; use
+  `--fresh` (or delete the share file) to revoke the URL. `--share-file`
+  selects another path. A run with sudo uses root's state directory, and so
+  root's device identity: a share made by one is remade (a new URL) by the
+  other.
 - The connection log is SQLite; read it with `spora log`, not by hand, and
   note that deleting the share does not delete the log. It is your
   record of what your connection was used for, and it outlives the URL on

@@ -30,10 +30,16 @@ struct Seen {
     method: String,
     path: String,
     auth: Option<String>,
+    body: Vec<u8>,
 }
 
-/// Just enough of the telemetry API for a device: registration (always as
-/// `dev-2`, token [`MINTED`]), `/me` and uploads, every request recorded.
+/// The relay the fake API advises: the closed port, so a share on it starts
+/// and reaches nobody.
+const ADVISED: (&str, u16) = ("127.0.0.1", 9);
+
+/// Just enough of the device API for a device: registration (always as
+/// `dev-2`, token [`MINTED`]), `/me`, uploads and `/v1/relays` (the relay
+/// [`ADVISED`] and a relay token), every request recorded.
 struct FakeApi {
     base: String,
     seen: Arc<Mutex<Vec<Seen>>>,
@@ -125,6 +131,14 @@ fn serve(conn: TcpStream, log: &Mutex<Vec<Seen>>, revoked: bool) {
                 "201 Created",
                 format!(r#"{{"device":"dev-2","token":"{MINTED}"}}"#),
             )
+        } else if method == "GET" && path == "/v1/relays" {
+            (
+                "200 OK",
+                format!(
+                    r#"{{"relays":[{{"protocol":"quic","host":"{}","port":{}}}],"token":{{"value":"cmVsYXktdG9rZW4","subject":"00","expires_at":"2999-01-01T00:00:00Z","renew_after":"2998-01-01T00:00:00Z"}}}}"#,
+                    ADVISED.0, ADVISED.1
+                ),
+            )
         } else if path.starts_with("/v1/telemetry/upload") {
             // More than any file here holds: the client then takes its own
             // size as what the server has.
@@ -140,6 +154,7 @@ fn serve(conn: TcpStream, log: &Mutex<Vec<Seen>>, revoked: bool) {
             method,
             path,
             auth,
+            body,
         });
         let reply = format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{answer}",
@@ -190,6 +205,7 @@ fn seed_device(home: &Path, api: &str, required: bool) {
 fn seed_state(home: &Path, api: &str, builtin: bool, required: bool) {
     use spora_service::state::{Device, ServiceState};
     let state = ServiceState {
+        device_identity: Some(spora_service::state::StoredIdentity::generate()),
         device: Some(Device {
             id: "dev-1".into(),
             token: TOKEN.into(),
@@ -982,4 +998,78 @@ fn trace_output_never_carries_the_upload_token() {
         );
     }
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// Without relay flags, a new share goes on Spora's relays: the run
+/// registers the device with the API (naming its cert hash), fetches the
+/// relays and a relay token, and writes the relays into the share's URL. A
+/// later run serves the same share from what it stored, asking nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_share_without_relay_flags_goes_on_spora_relays() {
+    let api = FakeApi::start();
+    let home = scratch("spora-relays");
+    let run = || {
+        let mut child = spora(&home, &api.base)
+            .args(["share", "--json", "--no-conn-log", "--no-record"])
+            .spawn()
+            .expect("spawn spora share");
+        let out = lines(child.stdout.take().unwrap());
+        let err = lines(child.stderr.take().unwrap());
+        let ready = Instant::now() + Duration::from_secs(30);
+        let url = loop {
+            let left = ready.saturating_duration_since(Instant::now());
+            let line = out.recv_timeout(left).unwrap_or_else(|_| {
+                panic!(
+                    "share never got ready; stderr: {:?}",
+                    err.try_iter().collect::<Vec<_>>()
+                )
+            });
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                && v["event"] == "share_ready"
+            {
+                break v["url"].as_str().unwrap().to_string();
+            }
+        };
+        send(&child, libc::SIGINT);
+        let status = wait(&mut child, Duration::from_secs(30));
+        assert!(
+            status.success(),
+            "{status}; stderr: {:?}",
+            err.try_iter().collect::<Vec<_>>()
+        );
+        url
+    };
+    let url = run();
+    assert!(
+        url.ends_with(&format!("?r={}:{}", ADVISED.0, ADVISED.1)),
+        "the URL names the advised relay: {url}"
+    );
+    let seen = api.seen.lock().unwrap();
+    let register = seen
+        .iter()
+        .find(|s| s.method == "POST" && s.path == "/v1/devices")
+        .expect("the device registered");
+    let body: serde_json::Value = serde_json::from_slice(&register.body).unwrap();
+    let cert_hash = body["cert_hash"].as_str().unwrap_or_default();
+    assert_eq!(cert_hash.len(), 40, "{body}");
+    let bearer = format!("Bearer {MINTED}");
+    assert!(
+        seen.iter()
+            .any(|s| s.path == "/v1/relays" && s.auth.as_deref() == Some(bearer.as_str())),
+        "relays fetched with the minted device token"
+    );
+    // Uploads are off: nothing but the device API.
+    assert!(!seen.iter().any(|s| s.path.starts_with("/v1/telemetry")));
+    let asked = seen.len();
+    drop(seen);
+
+    assert_eq!(run(), url, "the stored share serves the same URL");
+    let seen = api.seen.lock().unwrap();
+    assert!(
+        !seen[asked..]
+            .iter()
+            .any(|s| s.path == "/v1/devices" || s.path == "/v1/relays"),
+        "nothing to ask: the advice and token are cached and far from renewal"
+    );
 }

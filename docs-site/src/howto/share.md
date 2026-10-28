@@ -17,11 +17,17 @@ trust, and to people you trust. If it leaks, run `spora share --fresh` to
 make a new share (and a new URL); the old link stops working.
 
 The URL stays stable across restarts because the share behind it is kept
-at `~/.config/spora/share.bin`, with this machine's device identity beside
-it in `device.bin`. Copy both to move a share to another machine, or keep
-several shares with `--share-file`. The relays are part of the share and
-of its URL: running with other relay flags than the share was made with
-makes a new share, with a new URL.
+at `~/.config/spora/share.bin`, made under this machine's device identity
+(in `~/.local/state/spora/service/`). Keep several shares with
+`--share-file`. The relays are part of the share and of its URL: running
+with other relay flags than the share was made with makes a new share,
+with a new URL.
+
+Without relay flags, a new share goes through Spora's relays: the first
+run registers this machine with Spora's API and gets the relays from it,
+with the token those relays want, which the CLI then renews while it
+runs. Pass `--relay` (and `--relay-token` for a relay that wants one) to
+use relays of your own instead; see [Run your own relay](relay.md).
 
 One share serves one client at a time. If a second client connects with the
 same URL, it replaces the first.

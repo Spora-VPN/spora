@@ -1,6 +1,7 @@
 //! The service layer for platform clients (see the `spora-service` crate):
-//! the diagnostic log and its bridge for platform log lines, crash capture,
-//! the telemetry upload switch, and bug-report bundles.
+//! the device identity and relay access (the relays and relay token the API
+//! hands out), the diagnostic log and its bridge for platform log lines,
+//! crash capture, the telemetry upload switch, and bug-report bundles.
 //!
 //! Collection is unconditional and local; the switch only governs whether
 //! what is already on the device is uploaded. Nothing here blocks on the
@@ -139,12 +140,35 @@ pub fn write_crash(source: String, text: String) {
     }
 }
 
+/// How the service keeps the secrets in its state file (the device's private
+/// key, the device token, the relay token).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum StateKey {
+    /// In the clear, protected by the file's permissions only.
+    Plaintext,
+    /// Sealed with this 32-byte key, from the platform's secure store.
+    Provided { key: Vec<u8> },
+    /// Mint a key and seal with it: the first run, or the platform's store
+    /// lost the key. [`init_service`] returns it for the platform to keep.
+    Mint,
+}
+
+impl std::fmt::Debug for StateKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StateKey::Plaintext => f.write_str("Plaintext"),
+            StateKey::Provided { .. } => f.write_str("Provided(<key>)"),
+            StateKey::Mint => f.write_str("Mint"),
+        }
+    }
+}
+
 /// Where the service keeps its state and finds what it uploads.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ServiceConfig {
-    /// `service.json` (the switch, the device token, upload cursors). Must
-    /// not be backed up: a restored token would clone a device (Android:
-    /// `noBackupFilesDir/service`).
+    /// `service.json` (the device identity, the switch, the device token,
+    /// upload cursors, the relay access). Must not be backed up: a restored
+    /// token would clone a device (Android: `noBackupFilesDir/service`).
     pub state_dir: String,
     /// The connection-record directory the app passes to `connect`/`share`.
     #[uniffi(default = None)]
@@ -163,12 +187,47 @@ pub struct ServiceConfig {
     /// to the listed addresses that issued it.
     #[uniffi(default = [])]
     pub api_bases: Vec<String>,
+    /// How the state's secrets are kept (`None`: [`StateKey::Plaintext`]). A
+    /// key that does not open an existing state is state loss: a fresh
+    /// device (every share made under the old one is refused with
+    /// `IdentityMismatch`).
+    #[uniffi(default = None)]
+    pub state_key: Option<StateKey>,
+    /// Keep the device's relay access fresh in the background (the relays
+    /// for new shares and the relay token running shares present), whatever
+    /// the upload switch says. A share on Spora's relays turns it on anyway.
+    #[uniffi(default = true)]
+    pub manage_relays: bool,
+}
+
+/// What [`init_service`] hands back.
+#[derive(Clone, uniffi::Record)]
+pub struct InitResult {
+    /// With [`StateKey::Mint`]: the key the state is now sealed with. The
+    /// platform keeps it in its secure store and passes it back as
+    /// [`StateKey::Provided`] from then on.
+    pub minted_state_key: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for InitResult {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitResult")
+            .field(
+                "minted_state_key",
+                &self.minted_state_key.as_ref().map(|_| "<key>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, uniffi::Error)]
 pub enum ServiceError {
     /// A configuration that cannot work (e.g. an API base that is not a URL).
     Config(String),
+    /// [`init_service`] has not run.
+    NotInitialized,
+    /// The API, or the way to it.
+    Api(String),
     /// The directories involved.
     Io(String),
 }
@@ -177,6 +236,8 @@ impl std::fmt::Display for ServiceError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ServiceError::Config(s) => write!(f, "configuration: {s}"),
+            ServiceError::NotInitialized => "the service is not initialized".fmt(f),
+            ServiceError::Api(s) => s.fmt(f),
             ServiceError::Io(s) => s.fmt(f),
         }
     }
@@ -186,6 +247,7 @@ impl From<spora_service::Error> for ServiceError {
     fn from(e: spora_service::Error) -> Self {
         match e {
             spora_service::Error::Config(s) => ServiceError::Config(s),
+            e @ spora_service::Error::Api(_) => ServiceError::Api(e.to_string()),
             e => ServiceError::Io(e.to_string()),
         }
     }
@@ -196,15 +258,23 @@ impl From<spora_service::Error> for ServiceError {
 /// app's directories, platform and version in it.
 static OFFERED: Mutex<Option<spora_service::ServiceConfig>> = Mutex::new(None);
 
-/// Open the service state and start the uploader thread. Idempotent: the
-/// first successful call's config holds for the life of the process. Reads
-/// local files only; the uploader does its network work on its own thread,
-/// and nothing at all while uploads are off.
+/// Open the service state (minting the device identity on first use) and
+/// start the service thread. Idempotent: the first successful call's config
+/// holds for the life of the process. Reads local files only; the thread
+/// does its network work on its own: uploads while they are on, and the
+/// relay access while `manage_relays` (registering the device for it).
 #[uniffi::export]
-pub fn init_service(config: ServiceConfig) -> Result<(), ServiceError> {
+pub fn init_service(config: ServiceConfig) -> Result<InitResult, ServiceError> {
+    let state_key = match config.state_key.unwrap_or(StateKey::Plaintext) {
+        StateKey::Plaintext => spora_service::StateKey::Plaintext,
+        StateKey::Provided { key } => spora_service::StateKey::Provided(key),
+        StateKey::Mint => spora_service::StateKey::Mint,
+    };
     let mut cfg =
         spora_service::ServiceConfig::new(config.state_dir, config.platform, config.app_version)
-            .with_api_bases(config.api_bases);
+            .with_api_bases(config.api_bases)
+            .with_state_key(state_key)
+            .with_relay_access(config.manage_relays);
     if let Some(dir) = config.record_dir {
         cfg = cfg.with_record_dir(dir);
     }
@@ -212,8 +282,63 @@ pub fn init_service(config: ServiceConfig) -> Result<(), ServiceError> {
         cfg = cfg.with_log_dir(dir);
     }
     *crate::lock(&OFFERED) = Some(cfg.clone());
-    Telemetry::init_global(cfg)?;
-    Ok(())
+    let t = Telemetry::init_global(cfg)?;
+    Ok(InitResult {
+        minted_state_key: t.minted_state_key(),
+    })
+}
+
+/// The device's relay access as the UI shows it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RelayAccessStatus {
+    /// The device's cert hash (hex): what relay tokens and relays name it by.
+    pub cert_hash: String,
+    /// When the cached relay token expires; `None` without one (never
+    /// fetched, or the device is not entitled).
+    pub token_expires_unix_ms: Option<u64>,
+    /// When it is renewed.
+    pub renew_after_unix_ms: Option<u64>,
+    /// The last time the API answered.
+    pub last_success_unix_ms: Option<u64>,
+    /// The last failure, if it came after the last success.
+    pub last_error: Option<String>,
+    /// The relays a new share on Spora's relays gets, in `?r=` form.
+    pub advised_relays: Vec<String>,
+}
+
+impl From<spora_service::RelayAccessStatus> for RelayAccessStatus {
+    fn from(s: spora_service::RelayAccessStatus) -> Self {
+        Self {
+            cert_hash: s.cert_hash,
+            token_expires_unix_ms: s.token_expires_unix_ms,
+            renew_after_unix_ms: s.renew_after_unix_ms,
+            last_success_unix_ms: s.last_success_unix_ms,
+            last_error: s.last_error,
+            advised_relays: s
+                .advised
+                .iter()
+                .filter_map(spora_service::access::advised_endpoint)
+                .map(|e| e.to_url_param())
+                .collect(),
+        }
+    }
+}
+
+/// Fetch the relays for new shares and a relay token now: network, on the
+/// caller's thread (call it off the UI thread). Registers the device if it
+/// is not yet. Every running share gets the new token. A failure keeps what
+/// was cached and is the error.
+#[uniffi::export]
+pub fn refresh_relays() -> Result<RelayAccessStatus, ServiceError> {
+    let t = Telemetry::global().ok_or(ServiceError::NotInitialized)?;
+    Ok(t.refresh_relays()?.into())
+}
+
+/// The relay access from this process's copy of the state (no I/O).
+#[uniffi::export]
+pub fn relay_access_status() -> Result<RelayAccessStatus, ServiceError> {
+    let t = Telemetry::global().ok_or(ServiceError::NotInitialized)?;
+    Ok(t.relay_access_status().into())
 }
 
 /// The upload switch as the UI shows it.
@@ -531,6 +656,8 @@ mod tests {
             platform: "android".into(),
             app_version: "0.0.0-test".into(),
             api_bases: vec![api.into()],
+            state_key: Some(StateKey::Mint),
+            manage_relays: true,
         };
         // a configuration that cannot work leaves the service uninitialized
         let offered_records = tmp.path().join("offered-records");
@@ -555,6 +682,17 @@ mod tests {
         assert_eq!(opts.platform["platform"], "android-tv");
         assert_eq!(opts.platform["app_version"], "0.0.0-test");
 
+        // before the service, nothing needs the device identity... and the
+        // calls that do say so
+        assert!(matches!(
+            crate::make_share(vec![], false),
+            Err(crate::ShareError::NotInitialized)
+        ));
+        assert!(matches!(
+            relay_access_status(),
+            Err(ServiceError::NotInitialized)
+        ));
+
         // a device whose account requires telemetry (as last known); nothing
         // listens at the API base, so the uploader's passes fail fast
         std::fs::create_dir_all(&state_dir).unwrap();
@@ -563,10 +701,69 @@ mod tests {
             r#"{"v":1,"upload_enabled":true,"required":true,"required_notice_pending":true}"#,
         )
         .unwrap();
-        init_service(config(&state_dir, "http://127.0.0.1:9")).unwrap();
+        let init = init_service(config(&state_dir, "http://127.0.0.1:9")).unwrap();
+        assert!(
+            format!("{init:?}").contains("<key>"),
+            "the key stays out of logs"
+        );
+        let key = init.minted_state_key.expect("a minted state key");
+        assert_eq!(key.len(), 32);
         let other = tmp.path().join("other");
         init_service(config(&other, "http://127.0.0.1:9")).unwrap();
         assert!(!other.exists(), "a second init is a no-op");
+        // the state's secrets are sealed: no private key in the clear
+        let text = std::fs::read_to_string(state_dir.join("service.json")).unwrap();
+        assert!(text.contains("sealed:v1:"), "{text}");
+
+        // shares: the device identity is the service's
+        let access = relay_access_status().unwrap();
+        assert_eq!(access.cert_hash.len(), 40);
+        assert!(access.token_expires_unix_ms.is_none() && access.advised_relays.is_empty());
+        assert!(matches!(
+            crate::make_share(vec![], true),
+            Err(crate::ShareError::NoRelayAdvice)
+        ));
+        assert!(refresh_relays().is_err(), "nothing answers at the API");
+        let relay = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let own = crate::RelayEntry {
+            endpoint: format!("127.0.0.1:{}", relay.local_addr().unwrap().port()),
+            credential: crate::RelayCredential::Static {
+                token: b"bearer".to_vec(),
+            },
+        };
+        let blob = crate::make_share(vec![own.clone()], false).unwrap();
+        let url = crate::share_url(blob.clone()).unwrap();
+        assert!(url.starts_with("https://spora.to/s/"));
+        assert!(
+            !url.contains("bearer"),
+            "a static token is never in the URL"
+        );
+        assert_eq!(crate::share_id(blob.clone()).unwrap().len(), 16);
+        assert_eq!(crate::share_relays(blob.clone()).unwrap(), vec![own]);
+        assert!(matches!(
+            crate::share_url(b"nonsense".to_vec()),
+            Err(crate::ShareError::InvalidShare(_))
+        ));
+        let started =
+            crate::start_share(blob.clone(), None, None, None, false, None, vec![]).unwrap();
+        assert_eq!(started.url, url, "the URL is the share's");
+        assert!(matches!(
+            crate::start_share(blob.clone(), None, None, None, false, None, vec![]),
+            Err(crate::ShareError::AlreadyRunning)
+        ));
+        crate::stop_share(started.handle).unwrap();
+        // a share made under another device identity is refused
+        let elsewhere = spora_core::identity::DeviceIdentity::generate();
+        let foreign = spora_core::identity::Share::open(
+            &elsewhere,
+            vec![spora_core::identity::RelayEndpoint::new("127.0.0.1", 9)],
+        )
+        .unwrap()
+        .to_blob();
+        assert!(matches!(
+            crate::start_share(foreign, None, None, None, false, None, vec![]),
+            Err(crate::ShareError::IdentityMismatch)
+        ));
         let status = telemetry_status();
         assert!(status.upload_enabled && status.required && status.required_notice_pending);
         assert_eq!(status.device_id, None);

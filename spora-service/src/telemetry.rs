@@ -16,7 +16,14 @@
 //! and a condvar, so it behaves the same under the FFI and the CLI and needs
 //! no caller's async runtime.
 //!
-//! Registration is lazy: a device registers only once uploads are on.
+//! The same thread keeps the device's relay access fresh when the
+//! configuration manages it ([`ServiceConfig::relays`], see
+//! [`crate::access`]): it fetches the relay advice and a relay token when
+//! there is none, and again once the token's `renew_after` has passed,
+//! whatever the upload switch says, with the same backoff.
+//!
+//! Registration is lazy: a device registers once uploads are on, or once
+//! it needs relay access.
 //! The server can require telemetry for a device's account (a promotion paid
 //! for in data): the flag is fetched right after registering, then at most
 //! daily, and with every upload answer. While it is set the switch cannot be
@@ -35,10 +42,13 @@ use std::time::{Duration, Instant};
 
 use spora_core::record::{Entry, RecordSubscriber};
 
+use spora_core::identity::{Credentials, DeviceIdentity, ShareId};
+
 use crate::Error;
 use crate::api::{Api, ApiError, PLATFORMS};
 use crate::diag;
 use crate::diag::bundle::{BundleOptions, BundleSummary};
+use crate::seal::{Sealer, StateKey};
 use crate::state::{ServiceState, StateStore};
 use crate::upload::{Pass, PassSummary};
 
@@ -108,6 +118,12 @@ pub struct ServiceConfig {
     /// again.
     pub api_bases: Vec<String>,
     pub timings: UploadTimings,
+    /// How the secrets in `service.json` are kept ([`crate::seal`]).
+    pub state_key: StateKey,
+    /// Keep the device's relay access fresh (the relay advice and token,
+    /// [`crate::access`]): a process that shares wants it, one that only
+    /// connects does not (and then never registers for it).
+    pub relays: bool,
 }
 
 impl ServiceConfig {
@@ -124,7 +140,19 @@ impl ServiceConfig {
             app_version: app_version.into(),
             api_bases: Vec::new(),
             timings: UploadTimings::default(),
+            state_key: StateKey::Plaintext,
+            relays: false,
         }
+    }
+
+    pub fn with_state_key(mut self, key: StateKey) -> Self {
+        self.state_key = key;
+        self
+    }
+
+    pub fn with_relay_access(mut self, relays: bool) -> Self {
+        self.relays = relays;
+        self
     }
 
     pub fn with_record_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -205,12 +233,25 @@ pub struct Telemetry {
     inner: Arc<Inner>,
 }
 
-struct Inner {
-    cfg: ServiceConfig,
-    api: Api,
-    store: StateStore,
-    /// One pass at a time: the thread's and an explicit [`Telemetry::upload_now`].
-    pass_lock: Mutex<()>,
+pub(crate) struct Inner {
+    pub(crate) cfg: ServiceConfig,
+    pub(crate) api: Api,
+    pub(crate) store: StateStore,
+    /// The device identity (minted at open if the state had none).
+    pub(crate) device: DeviceIdentity,
+    /// Its cert hash, hex.
+    pub(crate) cert_hash: String,
+    /// The state key minted at open ([`StateKey::Mint`]), for the platform.
+    pub(crate) minted_key: Option<Vec<u8>>,
+    /// The running shares' credentials, by share id: a new relay token goes
+    /// to each ([`crate::access`]).
+    pub(crate) shares: Mutex<std::collections::HashMap<ShareId, Credentials>>,
+    /// Keep the relay access fresh ([`ServiceConfig::relays`], then
+    /// [`Telemetry::set_relay_access`]).
+    pub(crate) manage_relays: AtomicBool,
+    /// One pass at a time: the thread's, an explicit [`Telemetry::upload_now`]
+    /// and a relay refresh ([`Telemetry::refresh_relays`]).
+    pub(crate) pass_lock: Mutex<()>,
     signal: Mutex<Signal>,
     wake: Condvar,
     worker: Mutex<Option<Worker>>,
@@ -252,7 +293,7 @@ static GLOBAL_INIT: Mutex<()> = Mutex::new(());
 /// [`set_dormant`]'s last word, for the global instance made after it.
 static DORMANT: AtomicBool = AtomicBool::new(false);
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -267,12 +308,21 @@ impl Telemetry {
     /// [`Telemetry::open`] with `api` in place of the one `cfg.api_bases`
     /// names (a test's built-in API over fake servers).
     pub(crate) fn open_with(cfg: ServiceConfig, api: Api) -> Result<Telemetry, Error> {
-        let store = StateStore::open(&cfg.state_dir)?;
+        let (sealer, minted_key) = Sealer::new(&cfg.state_key).map_err(Error::Config)?;
+        let store = StateStore::open_sealed(&cfg.state_dir, sealer)?;
+        let device = crate::access::ensure_identity(&store)?;
+        let cert_hash = spora_core::identity::hex(&device.cert_hash());
+        let cfg_relays = cfg.relays;
         Ok(Telemetry {
             inner: Arc::new(Inner {
                 cfg,
                 api,
                 store,
+                device,
+                cert_hash,
+                minted_key,
+                shares: Mutex::new(std::collections::HashMap::new()),
+                manage_relays: AtomicBool::new(cfg_relays),
                 pass_lock: Mutex::new(()),
                 signal: Mutex::new(Signal::default()),
                 wake: Condvar::new(),
@@ -298,6 +348,26 @@ impl Telemetry {
         let t = GLOBAL.get_or_init(|| t);
         t.start();
         Ok(t)
+    }
+
+    /// The state key minted at open ([`StateKey::Mint`]): the platform keeps
+    /// it in its secure store and passes it back as [`StateKey::Provided`].
+    pub fn minted_state_key(&self) -> Option<Vec<u8>> {
+        self.inner.minted_key.clone()
+    }
+
+    pub(crate) fn inner(&self) -> &Arc<Inner> {
+        &self.inner
+    }
+
+    /// Start (or stop) keeping the relay access fresh, as
+    /// [`ServiceConfig::relays`] would have from the start: for a process
+    /// that learns only later that it serves a share on Spora's relays.
+    pub fn set_relay_access(&self, manage: bool) {
+        let was = self.inner.manage_relays.swap(manage, Ordering::SeqCst);
+        if manage && !was {
+            self.inner.nudge(Nudge::Soft);
+        }
     }
 
     /// The process-wide instance, once [`Telemetry::init_global`] made it.
@@ -636,11 +706,12 @@ impl Inner {
         self.signal(|s| s.nudge = s.nudge.max(Some(kind)));
     }
 
-    fn new_pass<'a>(&'a self, halt: &'a dyn Fn() -> bool) -> Pass<'a> {
+    pub(crate) fn new_pass<'a>(&'a self, halt: &'a dyn Fn() -> bool) -> Pass<'a> {
         Pass {
             api: &self.api,
             store: &self.store,
             platform: &self.cfg.platform,
+            cert_hash: &self.cert_hash,
             record_dirs: &self.cfg.record_dirs,
             log_dir: self.cfg.log_dir.as_deref(),
             status_interval: self.cfg.timings.status_interval,
@@ -651,6 +722,14 @@ impl Inner {
 
     fn pass(&self, explicit: bool, halt: &dyn Fn() -> bool) -> Result<PassSummary, Error> {
         let _g = lock(&self.pass_lock);
+        // Relay access first: a share starting or renewing waits on it, an
+        // upload does not. Its failure does not stop the uploads, but fails
+        // the pass (for its backoff) if they went well.
+        let renewed = if !halt() && self.renewal_due(crate::time::unix_ms()) {
+            Some(self.renew_relay_access_locked(halt))
+        } else {
+            None
+        };
         let mut pass = self.new_pass(halt);
         pass.refresh_status = self.status_wanted.swap(false, Ordering::SeqCst);
         let result = pass.run(explicit);
@@ -683,7 +762,13 @@ impl Inner {
                 let _ = self.store.modify(|s| s.last_error = Some(msg));
             }
         }
-        result
+        // A failed renewal (logged and noted where it failed) fails a pass
+        // whose uploads went well, so the thread backs off before asking
+        // again.
+        match (result, renewed) {
+            (Ok(_), Some(Err(e))) => Err(e),
+            (r, _) => r,
+        }
     }
 
     /// [`Inner::pass`] for the thread: a panic in a pass is a failed pass
@@ -746,6 +831,12 @@ impl Schedule {
         }
     }
 
+    /// The relay access wants renewing at `at`: as a nudge, it may bring the
+    /// next pass forward, but never past a backoff.
+    fn renewal(&mut self, at: Instant) {
+        self.next = self.next.min(at.max(self.floor));
+    }
+
     fn nudge(&mut self, kind: Nudge, now: Instant, t: &UploadTimings) {
         let soon = now + t.nudge_delay;
         match kind {
@@ -801,6 +892,9 @@ fn run(inner: Arc<Inner>, stop: Arc<AtomicBool>) {
                 let dormant = inner.dormant.load(Ordering::SeqCst);
                 if !dormant && let Some(kind) = sig.nudge.take() {
                     plan.nudge(kind, Instant::now(), &t);
+                }
+                if !dormant && let Some(at) = inner.renewal_at() {
+                    plan.renewal(at);
                 }
                 let now = Instant::now();
                 if dormant {

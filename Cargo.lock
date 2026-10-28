@@ -2329,9 +2329,11 @@ dependencies = [
 name = "spora-service"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "flate2",
  "libc",
  "log",
+ "ring",
  "serde",
  "serde_json",
  "spora-core",

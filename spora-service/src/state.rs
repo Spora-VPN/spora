@@ -1,5 +1,8 @@
-//! `service.json`: the device's registration, the upload switch, the cached
-//! force-telemetry flag, and the per-file upload cursors.
+//! `service.json`: the device identity (its key pair and cert), the device's
+//! registration, the upload switch, the cached force-telemetry flag, the
+//! per-file upload cursors, and the relay access the API gave it (the relay
+//! advice and the relay token). The secrets in it are sealed when the
+//! platform gives a key ([`crate::seal`]).
 //!
 //! A registration belongs to the API that issued it — the built-in API,
 //! whatever fronts a release lists for it, or an override's own bases
@@ -42,6 +45,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::fsutil::{create_private_dir, create_private_file, open_lock_file, sync_dir, try_lock};
+use crate::seal::Sealer;
 
 pub const STATE_FILE: &str = "service.json";
 pub const STATE_VERSION: u32 = 1;
@@ -93,6 +97,108 @@ impl fmt::Debug for Device {
     }
 }
 
+/// The device identity: one key pair and self-signed cert per device, for
+/// every share it makes (spora-core's `DeviceIdentity`). Base64url DER; the
+/// key is sealed on disk when there is a state key. `Debug` leaves the key
+/// out.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredIdentity {
+    pub cert: String,
+    pub key: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl StoredIdentity {
+    /// A freshly minted identity, as stored (for seeding a state file).
+    pub fn generate() -> StoredIdentity {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let d = spora_core::identity::DeviceIdentity::generate();
+        StoredIdentity {
+            cert: b64.encode(d.cert_der_bytes()),
+            key: b64.encode(d.key_der_bytes()),
+            extra: serde_json::Map::new(),
+        }
+    }
+}
+
+impl fmt::Debug for StoredIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredIdentity")
+            .field("cert", &self.cert)
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One relay endpoint the API advised, as it described it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvisedRelay {
+    /// A spora-core URL tag (`quic`, `nz`, `tcptls`).
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// The relay token the API minted for this device: opaque bytes
+/// (base64url, sealed on disk when there is a state key) with what the API
+/// said about them. `Debug` leaves the value out.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedRelayToken {
+    pub value: String,
+    /// The device it names, as the API said (hex cert hash).
+    #[serde(default)]
+    pub subject: String,
+    pub expires_unix_ms: u64,
+    pub renew_after_unix_ms: u64,
+    pub fetched_unix_ms: u64,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl fmt::Debug for CachedRelayToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CachedRelayToken")
+            .field("value", &"<redacted>")
+            .field("subject", &self.subject)
+            .field("expires_unix_ms", &self.expires_unix_ms)
+            .field("renew_after_unix_ms", &self.renew_after_unix_ms)
+            .field("fetched_unix_ms", &self.fetched_unix_ms)
+            .finish()
+    }
+}
+
+/// What a registration got from `GET /v1/relays`, and how asking went. A
+/// failed request keeps the advice and the token it had.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayAccess {
+    /// The relays to write into new shares, in order. Empty: never fetched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advice: Vec<AdvisedRelay>,
+    /// `None`: never fetched, or the API said the device is not entitled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<CachedRelayToken>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub last_success_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub last_failure_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl RelayAccess {
+    pub fn is_empty(&self) -> bool {
+        *self == RelayAccess::default()
+    }
+}
+
 /// Bytes of each file the server has acknowledged, per stream
 /// (`record`, `log`, `crash`) and file name.
 pub type Cursors = BTreeMap<String, BTreeMap<String, u64>>;
@@ -131,6 +237,8 @@ pub struct Registration {
     pub cursors: Cursors,
     #[serde(default)]
     pub refused: Refusals,
+    #[serde(default, skip_serializing_if = "RelayAccess::is_empty")]
+    pub relay_access: RelayAccess,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -146,6 +254,7 @@ impl Registration {
             status_failed_unix_ms: 0,
             cursors: Cursors::new(),
             refused: Refusals::new(),
+            relay_access: RelayAccess::default(),
             extra: serde_json::Map::new(),
         }
     }
@@ -169,6 +278,7 @@ impl Registration {
         );
         std::mem::swap(&mut self.cursors, &mut s.cursors);
         std::mem::swap(&mut self.refused, &mut s.refused);
+        std::mem::swap(&mut self.relay_access, &mut s.relay_access);
     }
 }
 
@@ -182,6 +292,11 @@ fn same(a: &Device, b: &Device) -> bool {
 pub struct ServiceState {
     #[serde(default = "version")]
     pub v: u32,
+    /// The device's key pair and cert, minted on first use. Every
+    /// registration is made with its cert hash: one that was not (a state
+    /// from before device identities) is forgotten when one is minted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_identity: Option<StoredIdentity>,
     #[serde(default)]
     pub device: Option<Device>,
     #[serde(default)]
@@ -207,8 +322,12 @@ pub struct ServiceState {
     pub cursors: Cursors,
     #[serde(default)]
     pub refused: Refusals,
+    /// The active registration's relay access.
+    #[serde(default, skip_serializing_if = "RelayAccess::is_empty")]
+    pub relay_access: RelayAccess,
     /// Registrations with other APIs, oldest first, each with its own
-    /// cursors, refusals and flag (the fields above are the active one's).
+    /// cursors, refusals, flag and relay access (the fields above are the
+    /// active one's).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parked: Vec<Registration>,
     #[serde(flatten)]
@@ -223,6 +342,7 @@ impl Default for ServiceState {
     fn default() -> Self {
         Self {
             v: STATE_VERSION,
+            device_identity: None,
             device: None,
             upload_enabled: false,
             required: false,
@@ -233,6 +353,7 @@ impl Default for ServiceState {
             last_error: None,
             cursors: Cursors::new(),
             refused: Refusals::new(),
+            relay_access: RelayAccess::default(),
             parked: Vec::new(),
             extra: serde_json::Map::new(),
         }
@@ -259,8 +380,15 @@ impl ServiceState {
 
     /// The state in `dir`: a missing file is a fresh state, and so (with a
     /// warning) is one that cannot be parsed; a file that cannot be read is
-    /// an error. Changes nothing on disk.
+    /// an error. Changes nothing on disk. Sealed fields are left sealed: this
+    /// is the state to show, never to act on a secret of.
     pub fn read(dir: &Path) -> io::Result<(ServiceState, Loaded)> {
+        Self::read_with(dir, &Sealer::lenient())
+    }
+
+    /// [`ServiceState::read`] with the sealed fields opened by `sealer`. A
+    /// file whose sealed fields do not open is state loss: [`Loaded::Corrupt`].
+    pub(crate) fn read_with(dir: &Path, sealer: &Sealer) -> io::Result<(ServiceState, Loaded)> {
         let path = Self::path(dir);
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
@@ -274,7 +402,13 @@ impl ServiceState {
                 ));
             }
         };
-        match serde_json::from_slice::<ServiceState>(&bytes) {
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|mut v| {
+                sealer.open_state(&mut v).map_err(|e| e.0)?;
+                serde_json::from_value::<ServiceState>(v).map_err(|e| e.to_string())
+            });
+        match parsed {
             Ok(s) => Ok((s, Loaded::Read)),
             Err(e) => {
                 log::warn!("service: {} is unusable ({e})", path.display());
@@ -301,17 +435,25 @@ impl ServiceState {
         Self::load_checked(dir).0
     }
 
-    /// Write atomically into `dir` (created, 0700 on Unix, if missing). The
-    /// bare write: changes other processes may race go through the store,
-    /// which holds [`LOCK_FILE`] around the read and this.
+    /// Write atomically into `dir` (created, 0700 on Unix, if missing), the
+    /// secrets in the clear. The bare write: changes other processes may
+    /// race go through the store, which holds [`LOCK_FILE`] around the read
+    /// and this.
     pub fn save(&self, dir: &Path) -> io::Result<()> {
+        self.save_with(dir, &Sealer::lenient())
+    }
+
+    /// [`ServiceState::save`] with the secrets sealed by `sealer`.
+    pub(crate) fn save_with(&self, dir: &Path, sealer: &Sealer) -> io::Result<()> {
         // Unique per save, so two writers in one process never share one.
         static SAVES: AtomicU64 = AtomicU64::new(0);
         create_private_dir(dir)?;
         let path = Self::path(dir);
         let n = SAVES.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!(".{STATE_FILE}.{}.{n}.tmp", std::process::id()));
-        let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        let mut value = serde_json::to_value(self).map_err(io::Error::other)?;
+        sealer.seal_state(&mut value);
+        let json = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
         let written = (|| {
             let _ = std::fs::remove_file(&tmp);
             let mut f = create_private_file(&tmp)?;
@@ -350,6 +492,7 @@ impl ServiceState {
         r.status_failed_unix_ms = self.status_failed_unix_ms;
         r.cursors = self.cursors.clone();
         r.refused = self.refused.clone();
+        r.relay_access = self.relay_access.clone();
         Some(r)
     }
 
@@ -401,6 +544,7 @@ impl ServiceState {
             self.status_failed_unix_ms = 0;
             self.cursors.clear();
             self.refused.clear();
+            self.relay_access = RelayAccess::default();
             return;
         };
         let mut r = Registration::new(device);
@@ -459,16 +603,25 @@ impl ServiceState {
 pub(crate) struct StateStore {
     dir: PathBuf,
     cache: Mutex<ServiceState>,
+    sealer: Sealer,
 }
 
 impl StateStore {
-    /// Open the state in `dir` (created if missing). A file that cannot be
-    /// read is an error.
+    /// Open the state in `dir` (created if missing), secrets in the clear. A
+    /// file that cannot be read is an error.
+    #[cfg(test)]
     pub(crate) fn open(dir: &Path) -> io::Result<StateStore> {
+        Self::open_sealed(dir, Sealer::lenient())
+    }
+
+    /// Open the state in `dir`, its secrets sealed by `sealer`: a file whose
+    /// sealed fields do not open is moved aside and the state starts fresh.
+    pub(crate) fn open_sealed(dir: &Path, sealer: Sealer) -> io::Result<StateStore> {
         create_private_dir(dir)?;
         let store = StateStore {
             dir: dir.to_path_buf(),
             cache: Mutex::new(ServiceState::default()),
+            sealer,
         };
         {
             let mut cache = store.cache();
@@ -517,7 +670,7 @@ impl StateStore {
     /// The file's state, with the lock held: an unparseable file is moved
     /// aside here, where no other process can be writing a good one.
     fn load_locked(&self) -> io::Result<ServiceState> {
-        let (s, how) = ServiceState::read(&self.dir)?;
+        let (s, how) = ServiceState::read_with(&self.dir, &self.sealer)?;
         if how == Loaded::Corrupt {
             let path = ServiceState::path(&self.dir);
             let aside = path.with_extension("json.corrupt");
@@ -556,7 +709,7 @@ impl StateStore {
         let before = s.clone();
         let r = f(&mut s);
         if s != before {
-            s.save(&self.dir)?;
+            s.save_with(&self.dir, &self.sealer)?;
         }
         *cache = s;
         Ok(r)
@@ -568,7 +721,7 @@ impl StateStore {
         let mut cache = self.cache();
         let _lock = self.lock_file()?;
         let s = self.load_locked()?;
-        s.save(&self.dir)?;
+        s.save_with(&self.dir, &self.sealer)?;
         *cache = s;
         Ok(())
     }

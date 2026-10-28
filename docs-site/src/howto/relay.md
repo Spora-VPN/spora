@@ -1,7 +1,7 @@
 # Run your own relay
 
-By default a share registers with the built-in public relay, so links work
-with zero setup. Running your own removes that dependency, and it is a
+By default a share goes through Spora's relays, so links work with zero
+setup. Running your own removes that dependency, and it is a
 small job: the relay is a deliberately dumb UDP forwarder. It carries
 encrypted packets between the two ends without being able to read them,
 holds no keys, and speaks no protocol of its own beyond a registration

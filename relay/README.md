@@ -2,7 +2,7 @@
 
 The Spora **relay** is a rendezvous and fallback forwarder. It lets a sharer behind NAT be reachable, and provides a fallback path when a direct connection can't be punched. Its defining property: it **never terminates the peers' end-to-end encryption** — it holds no keys, runs no handshake, and reads no plaintext. It only matches the two sides and shuttles bytes between them.
 
-Shares use Spora's relays by default, so most users never run one. Run your own to avoid depending on the default, to hold the accountability record yourself, or to serve a particular network. (If your exit is on an Internet-routable machine you can skip the relay altogether — see `--direct` in the top-level README.)
+A CLI share is relay-less by default: clients dial the sharer, which then needs a public address. A relay is for a sharer behind NAT. Spora's relays are one flag away (`spora share --spora-relays`); run your own to avoid depending on them, to hold the accountability record yourself, or to serve a particular network.
 
 ## What it forwards
 

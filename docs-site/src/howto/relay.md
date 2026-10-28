@@ -1,8 +1,10 @@
 # Run your own relay
 
-By default a share goes through Spora's relays, so links work with zero
-setup. Running your own removes that dependency, and it is a
-small job: the relay is a deliberately dumb UDP forwarder. It carries
+A new share is relay-less by default: clients connect straight to the
+sharing machine, so it needs a public address. A relay lets clients reach
+a sharer behind a NAT. `spora share --spora-relays` uses Spora's; running
+your own instead is a small job: the relay is a deliberately dumb UDP
+forwarder. It carries
 encrypted packets between the two ends without being able to read them,
 holds no keys, and speaks no protocol of its own beyond a registration
 message.
@@ -30,7 +32,9 @@ you IPv6 connectivity for free.
 ## Skipping the relay entirely
 
 If the sharing machine itself has a public, reachable address, no relay is
-needed at all:
+needed at all. That is the default for a new share without relay flags: the
+sharer finds its public address with STUN and picks a port. To name the
+address and port yourself:
 
 ```bash
 spora share --direct your.public.host:51820

@@ -33,6 +33,19 @@ macro_rules! say {
     }};
 }
 
+/// A line for whoever runs the command: stdout, or stderr when `json`
+/// (`--json`'s stdout carries events only).
+macro_rules! notice {
+    ($json:expr, $($arg:tt)*) => {{
+        use std::io::Write as _;
+        if $json {
+            let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+        } else {
+            let _ = writeln!(std::io::stdout().lock(), $($arg)*);
+        }
+    }};
+}
+
 /// Use jemalloc on non-Windows glibc targets. The default glibc allocator
 /// holds onto pages under heavy alloc/free churn (every IP packet on the
 /// share side allocates a `Vec<u8>`); jemalloc returns memory to the OS far
@@ -58,8 +71,8 @@ enum Mode {
     /// URL stays the same across invocations. The relays are part of the
     /// share (and of its URL): relay flags that differ from the stored
     /// share's make a new share, with a new URL. Without relay flags a new
-    /// share uses Spora's relays, which this machine gets from Spora's API
-    /// (registering it there) along with the token they want.
+    /// share is relay-less: clients connect straight to this machine, on a
+    /// random UDP port, at the public address STUN services see it use.
     Share {
         /// Override the share file path.
         #[arg(long, alias = "identity-file")]
@@ -101,8 +114,15 @@ enum Mode {
         /// binds this port, so it must be publicly reachable. Repeat for
         /// several advertised addresses (they must share one port). Combine
         /// with --relay for a mix, or use alone for pure relay-less sharing.
+        /// A new share without relay flags is relay-less already, at the
+        /// address STUN finds; this names the address and port instead.
         #[arg(long)]
         direct: Vec<String>,
+        /// Put the share on Spora's relays, ahead of any given with the
+        /// other relay flags. This machine gets them from Spora's API
+        /// (registering it there) along with the token they want.
+        #[arg(long)]
+        spora_relays: bool,
         /// Advertise a TCP/TLS relay endpoint (host:port): a TCP relay carrying
         /// end-to-end TLS, for networks that block UDP/QUIC. The sharer connects
         /// out and parks connections at it. Repeat for several; combine with
@@ -698,6 +718,7 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
             no_nat,
             relay,
             direct,
+            spora_relays,
             tcp_relay,
             nz_relay,
             stun,
@@ -719,10 +740,17 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
             let shutdown = shutdown.expect("share watches for stop signals");
             let path = share_file.unwrap_or_else(default_share_path);
             let mut config = Config::default();
+            if !stun.is_empty() {
+                for server in &stun {
+                    parse_host_port(server).map_err(|e| format!("--stun: {}", e))?;
+                }
+                config.stun_servers = stun;
+            }
             // --relay (UDP-QUIC), --direct (relay-less), --tcp-relay and
             // --nz-relay endpoints compose into one preference-ordered list,
-            // which is the share's own; without any, the share keeps the
-            // relays it was made with (a new one gets the default relay).
+            // after Spora's relays with --spora-relays. Without any of them
+            // the share keeps the relays it was made with, and a new one is
+            // relay-less.
             let static_token = relay_token.as_deref().map(load_relay_token).transpose()?;
             let credential = match &static_token {
                 Some(t) => spora_core::identity::Credential::Static(t.clone()),
@@ -782,13 +810,32 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
             let service = spora_service::Telemetry::init_global(service_config(&[]))
                 .map_err(|e| format!("service state in {}: {e}", service_dir().display()))?;
             let device = service.device_identity();
-            let share = load_or_make_share(
-                &path,
-                fresh,
-                &device,
-                (!relays.is_empty()).then_some(relays),
-                &mut || spora_relays_share(service),
-            )?;
+            let wanted = if spora_relays {
+                WantedRelays::Spora(relays)
+            } else if relays.is_empty() {
+                WantedRelays::Any
+            } else {
+                WantedRelays::Exactly(relays)
+            };
+            let share = match stored_share(&path, fresh, &device, &wanted) {
+                StoredShare::Serve(share) => share,
+                stored => {
+                    if let StoredShare::Replace(why) = stored {
+                        notice!(
+                            json,
+                            "Making a new share (a new URL) in place of the one at {}: {why}.",
+                            path.display()
+                        );
+                    }
+                    let share = match wanted {
+                        WantedRelays::Exactly(relays) => Share::new(&device, relays)?,
+                        WantedRelays::Spora(own) => spora_relays_share(service, own)?,
+                        WantedRelays::Any => relayless_share(&device, &config, json).await?,
+                    };
+                    save_share(&path, &share)?;
+                    share
+                }
+            };
             if share
                 .relays
                 .iter()
@@ -797,17 +844,17 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
                 service.set_relay_access(true);
                 config.relay_token = service.relay_token();
                 if config.relay_token.is_none() {
-                    say!(
+                    notice!(
+                        json,
                         "No valid relay token yet: Spora's relays will refuse this share until one comes from the API."
                     );
                 }
             }
-            if !stun.is_empty() {
-                for server in &stun {
-                    parse_host_port(server).map_err(|e| format!("--stun: {}", e))?;
-                }
-                config.stun_servers = stun;
-            }
+            let direct_port = share
+                .relays
+                .iter()
+                .find(|r| r.endpoint.protocol == spora_core::identity::RelayProtocol::Direct)
+                .map(|r| r.endpoint.port);
             config.enable_direct_upgrade = !no_direct_upgrade;
             // Reassigned only under --os-routing (Linux).
             #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
@@ -895,6 +942,11 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
                 say!("Share this URL with the peer that wants to connect:");
                 say!("{}", session.url);
                 say!("(Share kept at {})", path.display());
+                if let Some(port) = direct_port {
+                    say!(
+                        "Clients connect straight to this machine at UDP port {port}: a firewall in the way must let it in."
+                    );
+                }
                 if let Some(g) = &routing {
                     say!(
                         "OS routing enabled: client traffic is forwarded by the kernel via {}.",
@@ -3202,62 +3254,164 @@ fn default_share_path() -> PathBuf {
     config_dir().join("share.bin")
 }
 
-/// A new share on Spora's relays (fetching them, with a relay token, when
-/// none are cached yet).
+/// A new share on Spora's relays, then `own` (fetching Spora's relays, with
+/// a relay token, when none are cached yet).
 fn spora_relays_share(
     service: &spora_service::Telemetry,
+    own: Vec<RelayEntry>,
 ) -> Result<Share, Box<dyn std::error::Error>> {
     if service.relay_access_status().advised.is_empty() {
         tokio::task::block_in_place(|| service.refresh_relays()).map_err(|e| {
             format!(
-                "cannot get Spora's relays from its API ({e}); pass --relay to share through a relay of your own"
+                "cannot get Spora's relays from its API ({e}); share without --spora-relays instead (relay-less, or through a relay of your own with --relay)"
             )
         })?;
     }
-    Ok(service.make_share(Vec::new(), true)?)
+    Ok(service.make_share(own, true)?)
 }
 
-/// The share at `path`, or a new one (written there) when there is none,
-/// `fresh` asks for one, it was made under another device, or `relays` (the
-/// relay flags, if any were given) are not the ones it was made with: the
-/// relays are in the URL, so other relays are another share. A new share
-/// without relay flags is `default_share`'s.
-fn load_or_make_share(
+/// A new relay-less share: clients dial this machine on a random UDP port,
+/// at each public address STUN sees that port send from.
+async fn relayless_share(
+    device: &DeviceIdentity,
+    config: &Config,
+    json: bool,
+) -> Result<Share, Box<dyn std::error::Error>> {
+    let found =
+        spora_core::direct_port::find(&config.stun_servers, config.timings.stun_query_timeout)
+            .await
+            .map_err(|e| {
+                format!(
+                    "cannot find this machine's public address with STUN ({e}). Name one clients can reach with --direct <host:port>, or share through a relay with --relay <host:port> or --spora-relays"
+                )
+            })?;
+    let (relays, notices) = relayless_endpoints(&found);
+    for line in notices {
+        notice!(json, "{line}");
+    }
+    Ok(Share::new(device, relays)?)
+}
+
+/// The `Direct` endpoints a relay-less share advertises for what
+/// [`spora_core::direct_port::find`] found, and what to tell the user about
+/// them. A family whose NAT moved the port is left out while another family
+/// remains: nothing forwards a port picked a moment ago, and clients try
+/// IPv6 first, so an endpoint that cannot answer costs every dial its
+/// timeout. A NAT that kept the port may be a 1:1 NAT (most cloud servers),
+/// which forwards every port: kept, with a warning.
+fn relayless_endpoints(
+    found: &spora_core::direct_port::DirectPort,
+) -> (Vec<RelayEntry>, Vec<String>) {
+    use spora_core::identity::{RelayEndpoint, RelayProtocol};
+    let port = found.port;
+    let kept_port = found.found.iter().any(|a| a.mapped.port() == port);
+    let mut relays = Vec::new();
+    let mut notices = Vec::new();
+    for a in &found.found {
+        let family = if a.mapped.is_ipv4() { "IPv4" } else { "IPv6" };
+        let ip = a.mapped.ip();
+        let moved = a.mapped.port();
+        if moved != port && kept_port {
+            notices.push(format!(
+                "This machine's {family} goes out through a NAT that moved port {port} to {moved}, so the URL leaves {family} out."
+            ));
+            continue;
+        }
+        if a.behind_nat(port) {
+            let why = match (a.on_host, moved == port) {
+                (false, true) => format!("its public {family} address {ip} is not one of its own"),
+                (false, false) => format!(
+                    "its public {family} address {ip} is not one of its own, and port {port} goes out as {moved}"
+                ),
+                (true, _) => format!("its {family} port {port} goes out as {moved}"),
+            };
+            notices.push(format!(
+                "This machine is behind a NAT: {why}. Clients get in only if UDP port {port} is forwarded to it (a cloud server's NAT usually does that); otherwise share through a relay with --relay or --spora-relays."
+            ));
+        }
+        relays.push(RelayEntry::open(RelayEndpoint::with_protocol(
+            ip.to_string(),
+            port,
+            RelayProtocol::Direct,
+        )));
+    }
+    (relays, notices)
+}
+
+/// The relays a run asks for with its relay flags.
+#[derive(Debug, Clone, PartialEq)]
+enum WantedRelays {
+    /// No relay flags: whatever the stored share has (a new share is
+    /// relay-less).
+    Any,
+    /// Exactly these.
+    Exactly(Vec<RelayEntry>),
+    /// Spora's relays, whichever the API advised, then these.
+    Spora(Vec<RelayEntry>),
+}
+
+impl WantedRelays {
+    /// A share made with `relays` is one this run wants. Spora's relays
+    /// match whatever the API advises now: a new advice must not change a
+    /// working share's URL.
+    fn fit(&self, relays: &[RelayEntry]) -> bool {
+        match self {
+            WantedRelays::Any => true,
+            WantedRelays::Exactly(wanted) => wanted == relays,
+            WantedRelays::Spora(own) => {
+                let spora = relays
+                    .iter()
+                    .take_while(|r| r.credential == spora_core::identity::Credential::Spora)
+                    .count();
+                spora > 0 && relays[spora..] == own[..]
+            }
+        }
+    }
+}
+
+/// What the share file holds for a run.
+#[derive(Debug)]
+enum StoredShare {
+    /// The share to serve.
+    Serve(Share),
+    /// Nothing (or `--fresh` asked for a new share).
+    None,
+    /// A share to replace, and why: it cannot be read, was made under
+    /// another device, or has other relays than the run asks for (the
+    /// relays are in the URL, so other relays are another share).
+    Replace(String),
+}
+
+fn stored_share(
     path: &std::path::Path,
     fresh: bool,
     device: &DeviceIdentity,
-    relays: Option<Vec<RelayEntry>>,
-    default_share: &mut dyn FnMut() -> Result<Share, Box<dyn std::error::Error>>,
-) -> Result<Share, Box<dyn std::error::Error>> {
-    if !fresh && let Ok(bytes) = std::fs::read(path) {
-        let why_new = match Share::from_blob(&bytes) {
-            Err(e) => Some(format!("it cannot be read ({e})")),
-            Ok(share) if share.cert_hash != device.cert_hash() => {
-                Some("it was made under another device identity".to_string())
-            }
-            Ok(share) => match &relays {
-                Some(wanted) if *wanted != share.relays => {
-                    Some("the relays given are not the ones it was made with".to_string())
-                }
-                _ => return Ok(share),
-            },
-        };
-        if let Some(why) = why_new {
-            say!(
-                "Making a new share (a new URL) in place of the one at {}: {why}.",
-                path.display()
-            );
-        }
+    wanted: &WantedRelays,
+) -> StoredShare {
+    if fresh {
+        return StoredShare::None;
     }
-    let share = match relays {
-        Some(relays) => Share::new(device, relays)?,
-        None => default_share()?,
+    let Ok(bytes) = std::fs::read(path) else {
+        return StoredShare::None;
     };
+    StoredShare::Replace(match Share::from_blob(&bytes) {
+        Err(e) => format!("it cannot be read ({e})"),
+        Ok(share) if share.cert_hash != device.cert_hash() => {
+            "it was made under another device identity".to_string()
+        }
+        Ok(share) if !wanted.fit(&share.relays) => {
+            "the relays given are not the ones it was made with".to_string()
+        }
+        Ok(share) => return StoredShare::Serve(share),
+    })
+}
+
+/// Keep `share` at `path` (0600, atomically).
+fn save_share(path: &std::path::Path, share: &Share) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    write_private_atomically(path, &share.to_blob())?;
-    Ok(share)
+    write_private_atomically(path, &share.to_blob())
 }
 
 /// Persist a private file (the device key, a share's secret) durably and
@@ -3355,102 +3509,161 @@ mod identity_persistence_tests {
         ))]
     }
 
-    /// A share over `relay(9)` of `device`, standing in for one on
-    /// Spora's relays.
-    fn spora_default(
-        device: &DeviceIdentity,
-    ) -> impl FnMut() -> Result<Share, Box<dyn std::error::Error>> + '_ {
-        move || Ok(Share::new(device, relay(9))?)
+    /// A stand-in for a share on Spora's relays: `own` after one advised
+    /// relay.
+    fn on_spora(own: Vec<RelayEntry>) -> Vec<RelayEntry> {
+        let mut relays = vec![RelayEntry {
+            endpoint: spora_core::identity::RelayEndpoint::new("127.0.0.2", 443),
+            credential: spora_core::identity::Credential::Spora,
+        }];
+        relays.extend(own);
+        relays
+    }
+
+    fn served(stored: StoredShare) -> Share {
+        match stored {
+            StoredShare::Serve(share) => share,
+            other => panic!("expected the stored share to serve, got {other:?}"),
+        }
     }
 
     #[test]
-    fn a_created_share_is_private_and_round_trips() {
+    fn a_saved_share_is_private_and_served_again() {
         let dir = scratch("create");
         let path = dir.join("share.bin");
         let device = DeviceIdentity::generate();
+        assert!(matches!(
+            stored_share(&path, false, &device, &WantedRelays::Any),
+            StoredShare::None
+        ));
 
-        let share =
-            load_or_make_share(&path, false, &device, None, &mut spora_default(&device)).unwrap();
-        assert_eq!(share.relays, relay(9), "no relay flags: the default share");
-
+        let share = Share::new(&device, relay(9)).unwrap();
+        save_share(&path, &share).unwrap();
         // The secret must never be group/world readable, even briefly.
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "the share file must be 0600");
 
-        // Loading again returns the SAME share, not a new one, and never
-        // asks for a default.
-        let mut never = || -> Result<Share, Box<dyn std::error::Error>> {
-            panic!("a stored share needs no default")
-        };
-        let again = load_or_make_share(&path, false, &device, None, &mut never).unwrap();
-        assert_eq!(again, share, "the share must be stable across launches");
+        // Without relay flags, and with the same ones, the SAME share
+        // serves: the URL is stable across launches.
+        let again = served(stored_share(&path, false, &device, &WantedRelays::Any));
+        assert_eq!(again, share);
         assert_eq!(again.url(), share.url());
-
-        // The same relay flags keep it too.
-        let given = load_or_make_share(
-            &path,
-            false,
-            &device,
-            Some(share.relays.clone()),
-            &mut never,
-        )
-        .unwrap();
-        assert_eq!(given, share);
+        let given = stored_share(&path, false, &device, &WantedRelays::Exactly(relay(9)));
+        assert_eq!(served(given), share);
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn other_relays_fresh_or_another_device_make_a_new_share() {
+    fn other_relays_fresh_or_another_device_want_a_new_share() {
         let dir = scratch("renew");
         let path = dir.join("share.bin");
         let device = DeviceIdentity::generate();
-        let mut default = spora_default(&device);
-        let first =
-            load_or_make_share(&path, false, &device, Some(relay(1)), &mut default).unwrap();
+        save_share(&path, &Share::new(&device, relay(1)).unwrap()).unwrap();
 
-        let moved =
-            load_or_make_share(&path, false, &device, Some(relay(2)), &mut default).unwrap();
-        assert_ne!(
-            moved.share_id, first.share_id,
-            "other relays: another share"
+        let replaced = |wanted: &WantedRelays, device: &DeviceIdentity| match stored_share(
+            &path, false, device, wanted,
+        ) {
+            StoredShare::Replace(why) => why,
+            other => panic!("expected a replacement for {wanted:?}, got {other:?}"),
+        };
+        assert!(replaced(&WantedRelays::Exactly(relay(2)), &device).contains("relays"));
+        assert!(replaced(&WantedRelays::Spora(relay(1)), &device).contains("relays"));
+        assert!(
+            replaced(&WantedRelays::Any, &DeviceIdentity::generate()).contains("another device")
         );
-        assert_eq!(moved.relays, relay(2));
-        // ...and it is now the stored one.
-        assert_eq!(
-            load_or_make_share(&path, false, &device, None, &mut default).unwrap(),
-            moved
-        );
-
-        let fresh = load_or_make_share(&path, true, &device, None, &mut default).unwrap();
-        assert_ne!(fresh.share_id, moved.share_id, "--fresh: another share");
-        assert_eq!(
-            fresh.relays,
-            relay(9),
-            "without relay flags: the default share"
-        );
-
-        let other = DeviceIdentity::generate();
-        let rebuilt =
-            load_or_make_share(&path, false, &other, None, &mut spora_default(&other)).unwrap();
-        assert_eq!(
-            rebuilt.cert_hash,
-            other.cert_hash(),
-            "made under the device in use"
-        );
+        assert!(matches!(
+            stored_share(&path, true, &device, &WantedRelays::Any),
+            StoredShare::None
+        ));
 
         std::fs::write(&path, b"garbage").unwrap();
-        let recovered = load_or_make_share(&path, false, &device, None, &mut default).unwrap();
-        assert_eq!(recovered.cert_hash, device.cert_hash());
-
-        // A default that cannot be made (no API) is the error, and the
-        // stored share is left as it was.
-        let mut failing = || -> Result<Share, Box<dyn std::error::Error>> { Err("no API".into()) };
-        let before = std::fs::read(&path).unwrap();
-        assert!(load_or_make_share(&path, true, &device, None, &mut failing).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(replaced(&WantedRelays::Any, &device).contains("cannot be read"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spora_relays_fit_whatever_the_api_advised() {
+        let wanted = WantedRelays::Spora(relay(1));
+        assert!(wanted.fit(&on_spora(relay(1))));
+        let mut two = on_spora(relay(1));
+        two.insert(0, two[0].clone());
+        assert!(wanted.fit(&two), "advice of two relays");
+        assert!(!wanted.fit(&on_spora(relay(2))), "other own relays");
+        assert!(!wanted.fit(&on_spora(Vec::new())), "own relays missing");
+        assert!(!wanted.fit(&relay(1)), "not on Spora's relays");
+        assert!(WantedRelays::Spora(Vec::new()).fit(&on_spora(Vec::new())));
+        assert!(!WantedRelays::Exactly(relay(1)).fit(&on_spora(relay(1))));
+        assert!(WantedRelays::Any.fit(&on_spora(relay(1))));
+    }
+
+    fn direct(found: &[(&str, bool)], port: u16) -> spora_core::direct_port::DirectPort {
+        spora_core::direct_port::DirectPort {
+            port,
+            found: found
+                .iter()
+                .map(|(mapped, on_host)| spora_core::direct_port::PublicAddress {
+                    mapped: mapped.parse().unwrap(),
+                    on_host: *on_host,
+                })
+                .collect(),
+            misses: Vec::new(),
+        }
+    }
+
+    fn hosts(relays: &[RelayEntry]) -> Vec<String> {
+        relays
+            .iter()
+            .map(|r| {
+                assert_eq!(
+                    r.endpoint.protocol,
+                    spora_core::identity::RelayProtocol::Direct
+                );
+                assert_eq!(r.credential, spora_core::identity::Credential::None);
+                r.endpoint.to_url_param()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_relayless_share_advertises_each_family_that_can_answer() {
+        // A server with its own addresses: both, no word of a NAT.
+        let (relays, notices) = relayless_endpoints(&direct(
+            &[("198.51.100.4:20000", true), ("[2001:db8::4]:20000", true)],
+            20000,
+        ));
+        assert_eq!(
+            hosts(&relays),
+            ["direct/198.51.100.4:20000", "direct/[2001:db8::4]:20000"]
+        );
+        assert!(notices.is_empty(), "{notices:?}");
+
+        // A cloud server's 1:1 NAT keeps the port: kept, with a warning.
+        let (relays, notices) =
+            relayless_endpoints(&direct(&[("203.0.113.7:20000", false)], 20000));
+        assert_eq!(hosts(&relays), ["direct/203.0.113.7:20000"]);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("behind a NAT") && notices[0].contains("203.0.113.7"));
+
+        // A NAT that moved the port is left out while another family can
+        // answer...
+        let (relays, notices) = relayless_endpoints(&direct(
+            &[("203.0.113.7:20000", false), ("[2001:db8::4]:41000", false)],
+            20000,
+        ));
+        assert_eq!(hosts(&relays), ["direct/203.0.113.7:20000"]);
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(
+            notices.iter().any(|n| n.contains("leaves IPv6 out")),
+            "{notices:?}"
+        );
+
+        // ...and kept, with a warning, when it is all there is.
+        let (relays, notices) =
+            relayless_endpoints(&direct(&[("203.0.113.7:41000", false)], 20000));
+        assert_eq!(hosts(&relays), ["direct/203.0.113.7:20000"]);
+        assert!(notices[0].contains("goes out as 41000"), "{notices:?}");
     }
 
     #[test]

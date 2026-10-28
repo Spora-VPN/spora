@@ -10,7 +10,7 @@ same text.
 
 ## `spora share`
 
-Share over a tunnel. Serves the share kept at $XDG_CONFIG_HOME/spora/share.bin (made on the first run), so the share URL stays the same across invocations. The relays are part of the share (and of its URL): relay flags that differ from the stored share's make a new share, with a new URL. Without relay flags a new share uses Spora's relays, which this machine gets from Spora's API (registering it there) along with the token they want
+Share over a tunnel. Serves the share kept at $XDG_CONFIG_HOME/spora/share.bin (made on the first run), so the share URL stays the same across invocations. The relays are part of the share (and of its URL): relay flags that differ from the stored share's make a new share, with a new URL. Without relay flags a new share is relay-less: clients connect straight to this machine, on a random UDP port, at the public address STUN services see it use
 
 ```text
 spora share [OPTIONS]
@@ -41,7 +41,10 @@ With --os-routing: don't touch ip_forward or iptables. You are responsible for f
 Override the relay address(es) (host:port) used for registration and baked into the share URL. Repeat the flag for multiple relays (the sharer registers with all; the client tries them IPv6-first then in order). A hostname with both A and AAAA records counts as two relays
 
 **`--direct <DIRECT>`** *(repeatable)*  
-Advertise a relay-less DIRECT endpoint (host:port) clients can dial straight to this sharer: no relay, no relay bandwidth. The sharer binds this port, so it must be publicly reachable. Repeat for several advertised addresses (they must share one port). Combine with --relay for a mix, or use alone for pure relay-less sharing
+Advertise a relay-less DIRECT endpoint (host:port) clients can dial straight to this sharer: no relay, no relay bandwidth. The sharer binds this port, so it must be publicly reachable. Repeat for several advertised addresses (they must share one port). Combine with --relay for a mix, or use alone for pure relay-less sharing. A new share without relay flags is relay-less already, at the address STUN finds; this names the address and port instead
+
+**`--spora-relays`** *(default `false`)*  
+Put the share on Spora's relays, ahead of any given with the other relay flags. This machine gets them from Spora's API (registering it there) along with the token they want
 
 **`--tcp-relay <TCP_RELAY>`** *(repeatable)*  
 Advertise a TCP/TLS relay endpoint (host:port): a TCP relay carrying end-to-end TLS, for networks that block UDP/QUIC. The sharer connects out and parks connections at it. Repeat for several; combine with --relay to offer both (the client tries them in preference order)
@@ -599,7 +602,7 @@ spora help [COMMAND]
 
 ## `spora help share`
 
-Share over a tunnel. Serves the share kept at $XDG_CONFIG_HOME/spora/share.bin (made on the first run), so the share URL stays the same across invocations. The relays are part of the share (and of its URL): relay flags that differ from the stored share's make a new share, with a new URL. Without relay flags a new share uses Spora's relays, which this machine gets from Spora's API (registering it there) along with the token they want
+Share over a tunnel. Serves the share kept at $XDG_CONFIG_HOME/spora/share.bin (made on the first run), so the share URL stays the same across invocations. The relays are part of the share (and of its URL): relay flags that differ from the stored share's make a new share, with a new URL. Without relay flags a new share is relay-less: clients connect straight to this machine, on a random UDP port, at the public address STUN services see it use
 
 ```text
 spora help share

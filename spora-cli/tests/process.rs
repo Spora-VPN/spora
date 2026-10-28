@@ -285,6 +285,33 @@ fn record_close(home: &Path) -> serde_json::Value {
     last
 }
 
+/// A STUN service on loopback that answers every binding request with
+/// `answer`, or with the requester's own address. Returns its address.
+#[cfg(target_os = "linux")]
+fn fake_stun(answer: Option<std::net::SocketAddrV4>) -> String {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let mut request = [0u8; 256];
+        while let Ok((len, peer)) = socket.recv_from(&mut request) {
+            let std::net::SocketAddr::V4(requester) = peer else {
+                continue;
+            };
+            if len < 20 {
+                continue;
+            }
+            let seen = answer.unwrap_or(requester);
+            let mut response = vec![0x01, 0x01, 0x00, 0x0c, 0x21, 0x12, 0xa4, 0x42];
+            response.extend_from_slice(&request[8..20]);
+            response.extend_from_slice(&[0x00, 0x20, 0x00, 0x08, 0x00, 0x01]);
+            response.extend_from_slice(&(seen.port() ^ 0x2112).to_be_bytes());
+            response.extend_from_slice(&(u32::from(*seen.ip()) ^ 0x2112_a442).to_be_bytes());
+            let _ = socket.send_to(&response, peer);
+        }
+    });
+    addr
+}
+
 /// A UDP port on loopback that nothing uses right now.
 #[cfg(target_os = "linux")]
 fn free_udp_port() -> u16 {
@@ -1000,18 +1027,24 @@ fn trace_output_never_carries_the_upload_token() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// Without relay flags, a new share goes on Spora's relays: the run
+/// With --spora-relays, a new share goes on Spora's relays: the run
 /// registers the device with the API (naming its cert hash), fetches the
 /// relays and a relay token, and writes the relays into the share's URL. A
 /// later run serves the same share from what it stored, asking nothing.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_share_without_relay_flags_goes_on_spora_relays() {
+fn spora_relays_put_a_share_on_the_advised_relays() {
     let api = FakeApi::start();
     let home = scratch("spora-relays");
     let run = || {
         let mut child = spora(&home, &api.base)
-            .args(["share", "--json", "--no-conn-log", "--no-record"])
+            .args([
+                "share",
+                "--spora-relays",
+                "--json",
+                "--no-conn-log",
+                "--no-record",
+            ])
             .spawn()
             .expect("spawn spora share");
         let out = lines(child.stdout.take().unwrap());
@@ -1072,4 +1105,154 @@ fn a_share_without_relay_flags_goes_on_spora_relays() {
             .any(|s| s.path == "/v1/devices" || s.path == "/v1/relays"),
         "nothing to ask: the advice and token are cached and far from renewal"
     );
+}
+
+/// Without relay flags a new share is relay-less: it learns its public
+/// address from STUN (a fake one here, which sees loopback), advertises it
+/// with a port of its own, says which port to let in, and a client gets its
+/// tunnel straight from it, with no relay anywhere (the client then fails
+/// to attach a TUN that does not exist, which it tries only once the tunnel
+/// is up). A later run serves the same URL. Skipped as root, which could
+/// attach. Linux only, like `--tun-name`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_share_without_relay_flags_is_relayless() {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: running as root");
+        return;
+    }
+    let stun = fake_stun(None);
+    let sharer = scratch("relayless-share");
+    let client = scratch("relayless-use");
+    let start = || {
+        let mut share = spora(&sharer, &format!("http://{NOWHERE}"))
+            .args([
+                "share",
+                "--stun",
+                &stun,
+                "--no-direct-upgrade",
+                "--no-conn-log",
+                "--no-record",
+            ])
+            .spawn()
+            .expect("spawn spora share");
+        let out = lines(share.stdout.take().unwrap());
+        let err = lines(share.stderr.take().unwrap());
+        let ready = Instant::now() + Duration::from_secs(30);
+        let mut said = Vec::new();
+        loop {
+            let left = ready.saturating_duration_since(Instant::now());
+            match out.recv_timeout(left) {
+                Ok(line) if line.starts_with("Press Ctrl+C") => break,
+                Ok(line) => said.push(line),
+                Err(_) => panic!(
+                    "share never got ready: {said:?}; stderr: {:?}",
+                    err.try_iter().collect::<Vec<_>>()
+                ),
+            }
+        }
+        (share, said)
+    };
+
+    let (mut share, said) = start();
+    let url = said
+        .iter()
+        .find(|l| l.starts_with("https://"))
+        .unwrap_or_else(|| panic!("no URL: {said:?}"))
+        .clone();
+    let (_, port) = url
+        .split_once("?r=direct/127.0.0.1:")
+        .unwrap_or_else(|| panic!("not a relay-less URL on loopback: {url}"));
+    let port: u16 = port.parse().unwrap();
+    assert!(
+        said.iter()
+            .any(|l| l.contains(&format!("at UDP port {port}:"))),
+        "the port to let in goes unsaid: {said:?}"
+    );
+    let used = spora(&client, &format!("http://{NOWHERE}"))
+        .args([
+            "use",
+            "--tun-name",
+            "nosuchtun",
+            "--stun",
+            NOWHERE,
+            "--no-direct-upgrade",
+            &url,
+        ])
+        .output()
+        .expect("run spora use");
+    let stderr = String::from_utf8_lossy(&used.stderr);
+    assert!(
+        stderr.contains("could not attach TUN nosuchtun"),
+        "the tunnel never came up: {stderr}"
+    );
+    interrupt(&share);
+    assert!(wait(&mut share, Duration::from_secs(30)).success());
+
+    let (mut again, said) = start();
+    assert!(
+        said.contains(&url),
+        "the stored share serves the same URL: {said:?}"
+    );
+    interrupt(&again);
+    assert!(wait(&mut again, Duration::from_secs(30)).success());
+    std::fs::remove_dir_all(&sharer).ok();
+    std::fs::remove_dir_all(&client).ok();
+}
+
+/// A relay-less share whose public address is not one of its own (a fake
+/// STUN service says 203.0.113.7) still starts, on that address, and says it
+/// is behind a NAT. Under --json that goes to stderr: stdout carries events
+/// only.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_relayless_share_behind_a_nat_says_so_off_the_event_stream() {
+    let stun = fake_stun(Some("203.0.113.7:40000".parse().unwrap()));
+    let home = scratch("relayless-nat");
+    let mut share = spora(&home, &format!("http://{NOWHERE}"))
+        .args([
+            "share",
+            "--json",
+            "--stun",
+            &stun,
+            "--no-conn-log",
+            "--no-record",
+        ])
+        .spawn()
+        .expect("spawn spora share");
+    let out = lines(share.stdout.take().unwrap());
+    let err = lines(share.stderr.take().unwrap());
+    let ready = Instant::now() + Duration::from_secs(30);
+    let event = |line: &str| -> serde_json::Value {
+        serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("not an event on stdout: {line:?} ({e})"))
+    };
+    let url = loop {
+        let left = ready.saturating_duration_since(Instant::now());
+        let line = out.recv_timeout(left).unwrap_or_else(|_| {
+            panic!(
+                "share never got ready; stderr: {:?}",
+                err.try_iter().collect::<Vec<_>>()
+            )
+        });
+        let v = event(&line);
+        if v["event"] == "share_ready" {
+            break v["url"].as_str().unwrap().to_string();
+        }
+    };
+    assert!(url.contains("?r=direct/203.0.113.7:"), "{url}");
+    interrupt(&share);
+    assert!(wait(&mut share, Duration::from_secs(30)).success());
+    for line in out.iter() {
+        event(&line);
+    }
+    let stderr: Vec<String> = err.iter().collect();
+    assert!(
+        stderr
+            .iter()
+            .any(|l| l.contains("behind a NAT") && l.contains("203.0.113.7")),
+        "{stderr:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
 }

@@ -30,7 +30,7 @@ It is a Rust [workspace](Cargo.toml) (edition 2024). The crates:
 cargo build --release
 ```
 
-The client is then at `target/release/spora-cli` (symlink or alias it to `spora` if you like — it names itself `spora` in `--help`). The build also produces the `relay` daemon, which you only need if you want to run your own relay; a public one is built in.
+The client is then at `target/release/spora-cli` (symlink or alias it to `spora` if you like — it names itself `spora` in `--help`). The build also produces the `relay` daemon, which you only need if you want to run your own relay.
 
 Contributing? Point git at the repository's hooks once (`git config core.hooksPath .githooks`): the pre-commit hook runs rustfmt over what you stage, so CI's formatting check never trips on a commit.
 
@@ -42,25 +42,25 @@ spora-cli share
 
 Prints an `https://spora.to/s/…` URL; hand it to the peer that should tunnel through you, and leave the process running (Ctrl+C stops it). No privileges needed — the default exit is a userland netstack that terminates each flow and re-originates it from ordinary OS sockets.
 
-First run writes a persistent identity to `$XDG_CONFIG_HOME/spora/identity.bin` so the URL stays the same across restarts (`--fresh` regenerates it). It also opens a local connection log at `$XDG_STATE_HOME/spora/connlog/<routing-key>/` — your record of which client reached which destination, and when (`--no-conn-log` disables it; read it back with `spora-cli log query …`).
+First run keeps the share at `$XDG_CONFIG_HOME/spora/share.bin` (under the machine's device identity in `$XDG_STATE_HOME/spora/service/`) so the URL stays the same across restarts (`--fresh` makes a new share and URL). It also opens a local connection log at `$XDG_STATE_HOME/spora/connlog/<routing-key>/` — your record of which client reached which destination, and when (`--no-conn-log` disables it; read it back with `spora-cli log query …`).
 
 For a kernel-level exit — packets routed and NATed by the kernel through a TUN device instead of the userland netstack — use `spora-cli share --os-routing` (needs root / `CAP_NET_ADMIN`, Linux only).
 
 ### Relays
 
-By default `spora-cli share` registers with a built-in public relay, so the URL works from anywhere with no extra setup. Two ways to change that:
+By default a new share is relay-less: `spora-cli share` finds the machine's public address with STUN, picks a random UDP port (10000 to 32767, kept in the share and printed on every run; let it through the firewall) and puts both in the URL, so clients dial the sharer straight, with no relay and no relay bandwidth. That needs an Internet-routable machine; behind a NAT it warns, and clients get in only if the NAT forwards the port. To name the address yourself, advertise a direct endpoint:
+
+```bash
+spora-cli share --direct your.public.host:51820
+```
+
+Behind a NAT, share through a relay instead: `--spora-relays` for Spora's (the machine registers with Spora's API, which hands out the relays and a token for them), or:
 
 **Run your own relay.** The build also produces the `relay` daemon; run it on any Internet-routable machine and point `share` at it (repeat `--relay` for several):
 
 ```bash
 relay --port 51820                        # on a public host — 443 is the default, but binding <1024 needs privilege
 spora-cli share --relay your.host:51820   # register there instead of the built-in default
-```
-
-**Skip the relay entirely.** If the exit machine is *itself* Internet-routable, you don't need a relay at all: advertise a direct endpoint and clients dial the sharer straight — no relay, no relay bandwidth.
-
-```bash
-spora-cli share --direct your.public.host:51820
 ```
 
 See [`relay/README.md`](relay/README.md) for running a relay in production — its TCP/TLS and Noise-UDP carriers, capability-token authorization, and session log.

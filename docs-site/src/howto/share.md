@@ -1,9 +1,10 @@
 # Share your connection
 
-`spora share` turns your machine into the exit for someone you trust. No
-port forwarding, no public IP, no configuration: the sharer registers with
-a relay, and the client reaches it through that relay until a direct path
-is punched.
+`spora share` turns your machine into the exit for someone you trust. By
+default the client connects straight to it, which suits a machine with a
+public address, such as a server. Behind a NAT, share through a relay
+instead: the sharer registers with it, and the client reaches it through
+the relay until a direct path is punched.
 
 ```bash
 spora share
@@ -23,11 +24,23 @@ at `~/.config/spora/share.bin`, made under this machine's device identity
 with other relay flags than the share was made with makes a new share,
 with a new URL.
 
-Without relay flags, a new share goes through Spora's relays: the first
-run registers this machine with Spora's API and gets the relays from it,
-with the token those relays want, which the CLI then renews while it
-runs. Pass `--relay` (and `--relay-token` for a relay that wants one) to
-use relays of your own instead; see [Run your own relay](relay.md).
+Without relay flags, a new share is relay-less. The first run asks STUN
+services which public address this machine reaches the internet from,
+picks a random UDP port between 10000 and 32767, and puts both in the URL
+(an IPv6 address as well, where the machine has one). Every run prints the
+port, and a firewall in the way must let it in. If the public address is
+not one of the machine's own, the run says it is behind a NAT: clients
+then get in only if the NAT forwards that port to it, as a cloud server's
+usually does. An address family whose NAT changes the port is left out of
+the URL, as long as another family remains. `--direct host:port` names the address and port instead (a
+hostname, or a port your firewall already lets in). If the machine's public
+address changes, `spora share --fresh` makes a share on the new one.
+
+To share through relays instead, pass `--spora-relays` for Spora's relays:
+the first run registers this machine with Spora's API and gets the relays
+from it, with the token those relays want, which the CLI then renews while
+it runs. Or pass `--relay` (and `--relay-token` for a relay that wants one)
+to use relays of your own; see [Run your own relay](relay.md).
 
 One share serves one client at a time. If a second client connects with the
 same URL, it replaces the first.

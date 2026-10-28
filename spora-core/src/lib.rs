@@ -1,5 +1,6 @@
 mod carrier;
 pub mod connlog;
+pub mod direct_port;
 pub mod dns;
 pub mod e2e;
 pub mod e2e_noise;

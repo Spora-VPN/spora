@@ -10,7 +10,6 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::UdpSocket as TokioUdp;
 use tokio::sync::mpsc;
 
-use spora_core::identity::Identity;
 use spora_core::{Config, ExitMode, SessionHandler, TunnelEvent, connect, share};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -40,10 +39,6 @@ async fn relay_session_events_and_disabled_direct_upgrade() {
 
     let (share_tx, mut share_rx) = mpsc::unbounded_channel();
     let share_config = Config {
-        relays: vec![spora_core::identity::RelayEndpoint::new(
-            "127.0.0.1",
-            relay_addr.port(),
-        )],
         exit_mode: ExitMode::Custom(handler),
         event_hook: Some(Arc::new(move |ev| {
             let _ = share_tx.send(ev);
@@ -51,9 +46,20 @@ async fn relay_session_events_and_disabled_direct_upgrade() {
         enable_direct_upgrade: false,
         ..Config::default()
     };
-    let session = share(Identity::generate(), share_config)
-        .await
-        .expect("share()");
+    let session = {
+        let device = spora_core::identity::DeviceIdentity::generate();
+        let sh = spora_core::identity::Share::open(
+            &device,
+            vec![spora_core::identity::RelayEndpoint::new(
+                "127.0.0.1",
+                relay_addr.port(),
+            )],
+        )
+        .unwrap();
+        share(device, sh, share_config)
+    }
+    .await
+    .expect("share()");
     tokio::time::sleep(Duration::from_millis(300)).await; // let registration land
 
     let (client_tx, mut client_rx) = mpsc::unbounded_channel();

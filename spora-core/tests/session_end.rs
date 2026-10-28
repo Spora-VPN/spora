@@ -15,7 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::UdpSocket as TokioUdp;
 use tokio::sync::mpsc;
 
-use spora_core::identity::{Identity, RelayEndpoint, Token};
+use spora_core::identity::{DeviceIdentity, RelayEndpoint, Share, Token};
 use spora_core::record::{Outcome, Reason, RecordConfig, Recorder, StepKind, StepOutcome};
 use spora_core::{Config, ExitMode, SessionHandler, Timings, TunnelEvent, connect, share};
 
@@ -136,19 +136,16 @@ fn first_session_end(rec: &Recorder) -> Option<(StepOutcome, Option<Reason>, Opt
         .next()
 }
 
-fn configs(
-    relay: std::net::SocketAddr,
-) -> (
+fn configs() -> (
     Config,
     Config,
     mpsc::UnboundedReceiver<TunnelEvent>,
     mpsc::UnboundedReceiver<TunnelEvent>,
 ) {
-    configs_with(relay, draining_exit(), Timings::default())
+    configs_with(draining_exit(), Timings::default())
 }
 
 fn configs_with(
-    relay: std::net::SocketAddr,
     exit: SessionHandler,
     timings: Timings,
 ) -> (
@@ -165,7 +162,6 @@ fn configs_with(
         ..timings
     };
     let share_config = Config {
-        relays: vec![RelayEndpoint::new("127.0.0.1", relay.port())],
         exit_mode: ExitMode::Custom(exit),
         event_hook: hooked(share_tx),
         enable_direct_upgrade: false,
@@ -182,6 +178,16 @@ fn configs_with(
         ..Config::default()
     };
     (share_config, client_config, share_rx, client_rx)
+}
+
+/// Share a fresh device's fresh share over the loopback relay.
+async fn share_at(
+    relay: std::net::SocketAddr,
+    config: Config,
+) -> Result<spora_core::ShareSession, String> {
+    let device = DeviceIdentity::generate();
+    let sh = Share::open(&device, vec![RelayEndpoint::new("127.0.0.1", relay.port())]).unwrap();
+    share(device, sh, config).await
 }
 
 fn is_session_up(ev: &TunnelEvent) -> bool {
@@ -208,10 +214,8 @@ fn set_knob(client: &spora_core::ConnectResult, secs: u64) {
 async fn a_client_that_leaves_is_no_failure_of_the_exit() {
     let _ = env_logger::builder().is_test(true).try_init();
     let relay = start_relay().await;
-    let (share_config, client_config, mut share_rx, mut client_rx) = configs(relay);
-    let session = share(Identity::generate(), share_config)
-        .await
-        .expect("share()");
+    let (share_config, client_config, mut share_rx, mut client_rx) = configs();
+    let session = share_at(relay, share_config).await.expect("share()");
     tokio::time::sleep(Duration::from_millis(300)).await; // let registration land
 
     let client = connect(session.url.clone(), &client_config)
@@ -252,10 +256,8 @@ async fn a_client_that_leaves_is_no_failure_of_the_exit() {
 async fn an_exit_that_stops_is_no_failure_of_the_client() {
     let _ = env_logger::builder().is_test(true).try_init();
     let relay = start_relay().await;
-    let (share_config, client_config, mut share_rx, mut client_rx) = configs(relay);
-    let session = share(Identity::generate(), share_config)
-        .await
-        .expect("share()");
+    let (share_config, client_config, mut share_rx, mut client_rx) = configs();
+    let session = share_at(relay, share_config).await.expect("share()");
     tokio::time::sleep(Duration::from_millis(300)).await; // let registration land
 
     let client = connect(session.url.clone(), &client_config)
@@ -322,11 +324,10 @@ async fn a_client_that_leaves_mid_download_is_no_failure_of_the_exit() {
     for _ in 0..BUSY_ROUNDS {
         let relay = start_relay().await;
         let (share_config, client_config, mut share_rx, mut client_rx) = configs_with(
-            relay,
             downloading_exit(Duration::from_micros(200)),
             Timings::default(),
         );
-        let session = share(Identity::generate(), share_config).await.unwrap();
+        let session = share_at(relay, share_config).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         let client = connect(session.url.clone(), &client_config).await.unwrap();
         wait_for(&mut client_rx, "the client's session", is_session_up).await;
@@ -362,8 +363,8 @@ async fn an_exit_that_stops_mid_upload_is_no_failure_of_the_client() {
     for _ in 0..BUSY_ROUNDS {
         let relay = start_relay().await;
         let (share_config, client_config, mut share_rx, mut client_rx) =
-            configs_with(relay, draining_exit(), Timings::default());
-        let session = share(Identity::generate(), share_config).await.unwrap();
+            configs_with(draining_exit(), Timings::default());
+        let session = share_at(relay, share_config).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         let client = connect(session.url.clone(), &client_config).await.unwrap();
         wait_for(&mut client_rx, "the client's session", is_session_up).await;
@@ -443,8 +444,8 @@ async fn a_client_whose_tunnel_died_is_a_failure_of_the_exit_too() {
         ..Timings::default()
     };
     let (share_config, client_config, mut share_rx, mut client_rx) =
-        configs_with(relay, downloading_exit(Duration::from_millis(100)), timings);
-    let session = share(Identity::generate(), share_config).await.unwrap();
+        configs_with(downloading_exit(Duration::from_millis(100)), timings);
+    let session = share_at(relay, share_config).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut token = Token::from_url(&session.url).unwrap();
     token.relays = vec![RelayEndpoint::new("127.0.0.1", proxy_port)];
@@ -484,12 +485,9 @@ async fn a_client_whose_tunnel_died_is_a_failure_of_the_exit_too() {
 async fn an_exit_that_fails_is_a_failure_of_the_client() {
     let _ = env_logger::builder().is_test(true).try_init();
     let relay = start_relay().await;
-    let (share_config, client_config, mut share_rx, mut client_rx) = configs_with(
-        relay,
-        failing_exit(Duration::from_millis(500)),
-        Timings::default(),
-    );
-    let session = share(Identity::generate(), share_config).await.unwrap();
+    let (share_config, client_config, mut share_rx, mut client_rx) =
+        configs_with(failing_exit(Duration::from_millis(500)), Timings::default());
+    let session = share_at(relay, share_config).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     let client = connect(session.url.clone(), &client_config).await.unwrap();
     wait_for(&mut client_rx, "the client's session", is_session_up).await;
@@ -530,8 +528,8 @@ async fn a_client_process_that_exits_right_after_stopping_still_says_goodbye() {
             ..Timings::default()
         };
         let (share_config, client_config, mut share_rx, _client_rx) =
-            configs_with(relay, draining_exit(), timings);
-        let session = share(Identity::generate(), share_config).await.unwrap();
+            configs_with(draining_exit(), timings);
+        let session = share_at(relay, share_config).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // The client, in a runtime of its own that goes away with it.

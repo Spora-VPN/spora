@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::UdpSocket as TokioUdp;
 
 use spora_core::e2e::{E2eSession, client_connect, client_endpoint};
-use spora_core::identity::{Identity, Token};
+use spora_core::identity::Token;
 use spora_core::{Config, ExitMode, SessionHandler, Timings, share};
 
 fn icmp_echo(seq: u16) -> Vec<u8> {
@@ -47,21 +47,35 @@ async fn custom_exit_mode_pumps_packets() {
     });
 
     let config = Config {
-        relays: vec![spora_core::identity::RelayEndpoint::new(
-            "127.0.0.1",
-            relay_addr.port(),
-        )],
         exit_mode: ExitMode::Custom(handler),
         ..Config::default()
     };
-    let session = share(Identity::generate(), config).await.expect("share()");
+    let session = {
+        let device = spora_core::identity::DeviceIdentity::generate();
+        let sh = spora_core::identity::Share::open(
+            &device,
+            vec![spora_core::identity::RelayEndpoint::new(
+                "127.0.0.1",
+                relay_addr.port(),
+            )],
+        )
+        .unwrap();
+        share(device, sh, config)
+    }
+    .await
+    .expect("share()");
     let token = Token::from_url(&session.url).expect("parse url");
     tokio::time::sleep(Duration::from_millis(300)).await; // let registration land
 
     let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     b_std.set_nonblocking(true).unwrap();
-    let b_endpoint =
-        client_endpoint(b_std, token.routing_key, &Timings::default()).expect("client_endpoint");
+    let b_endpoint = client_endpoint(
+        b_std,
+        token.cert_hash,
+        token.routing_hash(),
+        &Timings::default(),
+    )
+    .expect("client_endpoint");
     let endpoint = Box::leak(Box::new(b_endpoint));
     let E2eSession {
         conn: _conn,

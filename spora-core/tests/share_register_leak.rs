@@ -12,7 +12,6 @@ use std::time::Duration;
 use tokio::net::UdpSocket as TokioUdp;
 
 use relay_client::protocol::{Classified, classify, ctrl};
-use spora_core::identity::Identity;
 use spora_core::{Config, Timings, share};
 
 /// Bind a fake relay that just counts REGISTER control packets it receives.
@@ -27,7 +26,7 @@ async fn counting_relay() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
             match sock.recv_from(&mut buf).await {
                 Ok((n, _)) => {
                     if let Classified::Control { ty, .. } = classify(&buf[..n]) {
-                        if ty == ctrl::REGISTER {
+                        if ty == ctrl::REGISTER_V2 {
                             count_clone.fetch_add(1, Ordering::SeqCst);
                         }
                     }
@@ -47,10 +46,6 @@ async fn abort_stops_the_relay_registrar() {
 
     let interval = Duration::from_millis(50);
     let config = Config {
-        relays: vec![spora_core::identity::RelayEndpoint::new(
-            "127.0.0.1",
-            relay_addr.port(),
-        )],
         timings: Timings {
             register_interval: interval,
             ..Timings::default()
@@ -58,7 +53,20 @@ async fn abort_stops_the_relay_registrar() {
         ..Config::default()
     };
 
-    let session = share(Identity::generate(), config).await.expect("share()");
+    let session = {
+        let device = spora_core::identity::DeviceIdentity::generate();
+        let sh = spora_core::identity::Share::open(
+            &device,
+            vec![spora_core::identity::RelayEndpoint::new(
+                "127.0.0.1",
+                relay_addr.port(),
+            )],
+        )
+        .unwrap();
+        share(device, sh, config)
+    }
+    .await
+    .expect("share()");
 
     // Let several registration ticks land so we know the loop is running.
     tokio::time::sleep(interval * 6).await;

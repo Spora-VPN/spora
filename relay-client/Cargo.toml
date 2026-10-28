@@ -9,7 +9,6 @@ publish = false
 tokio = { version = "1", features = ["full"]}
 log = "0.4"
 ring = "0.17"
-base64 = "0.22"
 rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
 rustls-pki-types = "1"
 

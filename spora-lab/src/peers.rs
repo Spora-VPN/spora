@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use spora_core::identity::Identity;
+use spora_core::identity::{DeviceIdentity, Share};
 use spora_core::{Config, ConnectResult, TunnelEvent};
 use url::Url;
 
@@ -55,11 +55,12 @@ pub struct LabPeerOpts {
     /// (`Config::record`). The record suite points this at a per-scenario
     /// temp dir and asserts on what the peers wrote there.
     pub record: Option<spora_core::record::RecordConfig>,
-    /// Share side only: identity to share as. `None` (default) generates a
-    /// fresh one per `start_sharer` call; recovery scenarios that restart the
-    /// sharer pass the SAME identity so the share URL — and the routing key
-    /// the relay and the surviving client hold — stays stable.
-    pub identity: Option<Identity>,
+    /// Share side only: the device and share to serve. `None` (default)
+    /// makes a fresh device and an open share over `relays` per
+    /// `start_sharer` call; recovery scenarios that restart the sharer pin
+    /// one ([`LabPeerOpts::pin_share`]) so the share URL — and the routing
+    /// hash the relay and the surviving client hold — stays stable.
+    pub share: Option<(DeviceIdentity, Share)>,
     /// Share side only: what the sharer's DNS forwarder does
     /// (`Config::dns_forwarder`, see spora-core's `dns`).
     pub dns: DnsExit,
@@ -92,7 +93,7 @@ impl LabPeerOpts {
             stun_server: stun_server.into(),
             conn_log: None,
             record: None,
-            identity: None,
+            share: None,
             dns: DnsExit::Default,
         }
     }
@@ -104,6 +105,24 @@ impl LabPeerOpts {
         self
     }
 
+    /// Serve the same device and share on every `start_sharer` from now on:
+    /// a fresh device and an open share over the current `relays`.
+    pub fn pin_share(&mut self) {
+        let device = DeviceIdentity::generate();
+        let share = Share::open(&device, self.relays.clone()).expect("the lab names a relay");
+        self.share = Some((device, share));
+    }
+
+    /// The device and share `start_sharer` serves: the pinned one, or a
+    /// fresh one over `relays`.
+    pub fn sharer_identity(&self) -> (DeviceIdentity, Share) {
+        self.share.clone().unwrap_or_else(|| {
+            let device = DeviceIdentity::generate();
+            let share = Share::open(&device, self.relays.clone()).expect("the lab names a relay");
+            (device, share)
+        })
+    }
+
     /// Build a `spora_core::Config` from these options, with the event hook
     /// wired to a fresh [`EventStream`]. Everything not covered by the
     /// options is `Config::default()` (notably `exit_mode: Netstack`).
@@ -113,7 +132,6 @@ impl LabPeerOpts {
             // Lab scenarios name their isolated in-namespace STUN service
             // explicitly and must never fall back to the public internet.
             stun_servers: vec![self.stun_server.clone()],
-            relays: self.relays.clone(),
             timings: self.timings.clone(),
             enable_direct_upgrade: self.enable_direct_upgrade,
             event_hook: Some(hook),
@@ -265,15 +283,36 @@ impl SharerHandle {
     }
 }
 
+/// Share `relays` (open, no credentials) from a fresh device, outside any
+/// namespace (loopback scenarios).
+pub async fn share_over(
+    relays: Vec<spora_core::identity::RelayEndpoint>,
+    config: Config,
+) -> Result<spora_core::ShareSession, String> {
+    let device = DeviceIdentity::generate();
+    let share = Share::open(&device, relays)?;
+    spora_core::share(device, share, config).await
+}
+
+/// [`share_over`] with a credential per relay.
+pub async fn share_entries(
+    relays: Vec<spora_core::identity::RelayEntry>,
+    config: Config,
+) -> Result<spora_core::ShareSession, String> {
+    let device = DeviceIdentity::generate();
+    let share = Share::new(&device, relays)?;
+    spora_core::share(device, share, config).await
+}
+
 /// Run the production sharer inside `ns` with a fresh identity. Blocks until
 /// `share()` reports its URL (or its error).
 pub fn start_sharer(ns: &Netns, opts: &LabPeerOpts) -> Result<SharerHandle, String> {
     let (config, events) = opts.config();
-    let identity = opts.identity.clone().unwrap_or_else(Identity::generate);
+    let (device, share) = opts.sharer_identity();
     let (url_tx, url_rx) = mpsc::channel::<Result<Url, String>>();
 
     let host = ns.spawn_host("sharer", move |cancel| async move {
-        match spora_core::share(identity, config).await {
+        match spora_core::share(device, share, config).await {
             Ok(session) => {
                 let _ = url_tx.send(Ok(session.url.clone()));
                 // Keep the host alive until cancelled. NOTE: spawn_host

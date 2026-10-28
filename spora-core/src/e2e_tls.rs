@@ -3,7 +3,7 @@
 //!
 //! This mirrors `e2e.rs` (the QUIC path) but over a plain `AsyncRead + AsyncWrite`
 //! stream instead of QUIC datagrams: the SAME cert pinning
-//! (`RoutingKeyVerifier`), the SAME identity cert, and the SAME 16-byte secret
+//! (`CertHashVerifier`), the SAME identity cert, and the SAME 16-byte secret
 //! with an ACK handshake. On success both ends wrap the TLS stream in a framed
 //! `StreamPeerTransport` of IP packets.
 //!
@@ -18,7 +18,7 @@ use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use crate::identity::{Identity, ROUTING_KEY_LEN, RoutingKeyVerifier, SECRET_LEN};
+use crate::identity::{CertHash, CertHashVerifier, SECRET_LEN, ShareIdentity};
 use crate::record::{Fault, Reason};
 use crate::transport::IpTransport;
 use crate::transport::stream::StreamPeerTransport;
@@ -38,7 +38,7 @@ fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
 
 /// Server (A): TLS-accept `stream` with the identity cert, read and verify the
 /// client's secret, ack, and return the IP-packet transport.
-pub async fn accept<S>(stream: S, identity: &Identity) -> Result<IpTransport, Fault>
+pub async fn accept<S>(stream: S, identity: &ShareIdentity) -> Result<IpTransport, Fault>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -83,17 +83,17 @@ where
 }
 
 /// Client (B): TLS-connect over `stream` pinning the server cert to
-/// `routing_key`, send the secret, await the ack, and return the transport.
+/// `cert_hash`, send the secret, await the ack, and return the transport.
 pub async fn connect<S>(
     stream: S,
-    routing_key: [u8; ROUTING_KEY_LEN],
+    cert_hash: CertHash,
     secret: &[u8; SECRET_LEN],
 ) -> Result<IpTransport, Fault>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let provider = ring_provider();
-    let verifier = Arc::new(RoutingKeyVerifier::new(routing_key, provider.clone()));
+    let verifier = Arc::new(CertHashVerifier::new(cert_hash, provider.clone()));
     let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| Fault::new(Reason::CryptoError, format!("tls client version: {e}")))?
@@ -162,14 +162,14 @@ mod tests {
     #[tokio::test]
     async fn e2e_tls_handshake_auth_and_ip_round_trip() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let identity = Identity::generate();
-        let rk = identity.routing_key;
+        let identity = ShareIdentity::generate();
+        let pin = identity.cert_hash;
         let secret = identity.secret;
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
 
         let server_id = identity.clone();
         let server = tokio::spawn(async move { accept(server_io, &server_id).await });
-        let mut client = connect(client_io, rk, &secret)
+        let mut client = connect(client_io, pin, &secret)
             .await
             .expect("client connects");
         let mut server = server.await.unwrap().expect("server accepts");
@@ -186,14 +186,14 @@ mod tests {
     #[tokio::test]
     async fn e2e_tls_rejects_a_bad_secret() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let identity = Identity::generate();
+        let identity = ShareIdentity::generate();
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server_id = identity.clone();
         let server = tokio::spawn(async move { accept(server_io, &server_id).await });
 
         let mut bad = identity.secret;
         bad[0] ^= 0xFF;
-        let r = connect(client_io, identity.routing_key, &bad).await;
+        let r = connect(client_io, identity.cert_hash, &bad).await;
         assert!(r.is_err(), "client must not get an ack for a bad secret");
         assert!(
             server.await.unwrap().is_err(),
@@ -202,18 +202,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e2e_tls_client_rejects_a_mismatched_routing_key() {
+    async fn e2e_tls_client_rejects_a_mismatched_cert_hash() {
         let _ = env_logger::builder().is_test(true).try_init();
-        // Server presents A's cert; the client pins B's (different) routing key.
-        let a = Identity::generate();
-        let b = Identity::generate();
+        // Server presents A's cert; the client pins B's (different) cert hash.
+        let a = ShareIdentity::generate();
+        let b = ShareIdentity::generate();
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move { accept(server_io, &a).await });
 
-        let r = connect(client_io, b.routing_key, &b.secret).await;
+        let r = connect(client_io, b.cert_hash, &b.secret).await;
         assert!(
             r.is_err(),
-            "cert pinning must reject a mismatched routing key"
+            "cert pinning must reject a mismatched cert hash"
         );
         let _ = server.await;
     }

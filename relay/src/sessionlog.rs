@@ -3,11 +3,12 @@
 //! The dumb relay forwards by 5-tuple and holds no keys, but the relay
 //! *operator* fronts every byte that crosses it, so — like the sharer's
 //! connection log (see `docs/connection-logging.md`) — it keeps a local,
-//! auto-expiring record of which client address reached which sharer (by
-//! routing key) and when. This answers the operator's analog of the abuse/LE
-//! query: "which client used routing key Z through this relay during
-//! [T1,T2]". No payload, no QUIC inspection beyond the DCID the forwarder
-//! already reads.
+//! auto-expiring record of which client address reached which share (by
+//! routing hash, with the sharer's device as its cert hash) and when. This
+//! answers the operator's analog of the abuse/LE query: "which client used
+//! share Z, or any share of device D, through this relay during [T1,T2]".
+//! No payload, no QUIC inspection beyond the DCID the forwarder already
+//! reads.
 //!
 //! It stays off the forwarding hot path: `serve`/`handle_packet` only bump
 //! in-memory atomic counters and `try_send` open/close events into a bounded
@@ -26,7 +27,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use log::{error, info, warn};
 use rusqlite::Connection;
 
-pub const FORMAT_VERSION: i64 = 1;
+/// 2: `routing_hash` (was `routing_key`, when the two were the same thing)
+/// and `cert_hash`. A version-1 `sessions` table is kept as `sessions_v1`
+/// (and swept by retention like the rest), never converted.
+pub const FORMAT_VERSION: i64 = 2;
 
 const CHANNEL_CAPACITY: usize = 16 * 1024;
 const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -73,7 +77,8 @@ fn random_id() -> i64 {
 /// close is emitted exactly once (idempotent `closed` flag).
 pub struct SessionState {
     id: i64,
-    routing_key_hex: String,
+    routing_hash_hex: String,
+    cert_hash_hex: String,
     start_ms: i64,
     pkts_c2s: AtomicU64,
     bytes_c2s: AtomicU64,
@@ -83,11 +88,11 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    fn new(routing_key: &[u8]) -> SessionState {
-        let routing_key_hex = routing_key.iter().map(|b| format!("{:02x}", b)).collect();
+    fn new(routing_hash: &[u8], cert_hash: &[u8]) -> SessionState {
         SessionState {
             id: random_id(),
-            routing_key_hex,
+            routing_hash_hex: relay_client::protocol::hex(routing_hash),
+            cert_hash_hex: relay_client::protocol::hex(cert_hash),
             start_ms: now_ms(),
             pkts_c2s: AtomicU64::new(0),
             bytes_c2s: AtomicU64::new(0),
@@ -113,7 +118,8 @@ impl SessionState {
 enum Ev {
     Open {
         id: i64,
-        routing_key_hex: String,
+        routing_hash_hex: String,
+        cert_hash_hex: String,
         client: String,
         sharer: String,
         start_ms: i64,
@@ -185,14 +191,16 @@ impl SessionLog {
     /// on both forwarding-table entries.
     pub fn open_session(
         &self,
-        routing_key: &[u8],
+        routing_hash: &[u8],
+        cert_hash: &[u8],
         client: SocketAddr,
         sharer: SocketAddr,
     ) -> Arc<SessionState> {
-        let st = Arc::new(SessionState::new(routing_key));
+        let st = Arc::new(SessionState::new(routing_hash, cert_hash));
         self.send(Ev::Open {
             id: st.id,
-            routing_key_hex: st.routing_key_hex.clone(),
+            routing_hash_hex: st.routing_hash_hex.clone(),
+            cert_hash_hex: st.cert_hash_hex.clone(),
             client: client.to_string(),
             sharer: sharer.to_string(),
             start_ms: st.start_ms,
@@ -250,8 +258,14 @@ fn open_db(path: &Path) -> Result<Connection, String> {
         .map_err(|e| format!("session log: WAL: {}", e))?;
     db.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| format!("session log: synchronous: {}", e))?;
+    set_aside_v1(&db).map_err(|e| format!("session log: keeping the v1 sessions: {}", e))?;
     db.execute_batch(SCHEMA)
         .map_err(|e| format!("session log: schema: {}", e))?;
+    db.execute(
+        "UPDATE meta SET value=?1 WHERE key='format_version'",
+        rusqlite::params![FORMAT_VERSION.to_string()],
+    )
+    .map_err(|e| format!("session log: meta: {}", e))?;
     let version = env!("CARGO_PKG_VERSION");
     db.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('format_version', ?1), ('created_ms', ?2)",
@@ -271,14 +285,36 @@ fn open_db(path: &Path) -> Result<Connection, String> {
     Ok(db)
 }
 
+/// A database written by a version-1 relay has `sessions.routing_key`: rename
+/// that table out of the way (its indexes with it, under names of their own)
+/// so the current schema can be created beside it.
+fn set_aside_v1(db: &Connection) -> Result<(), rusqlite::Error> {
+    let has_v1: bool = db
+        .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='routing_key'")?
+        .exists([])?;
+    if !has_v1 {
+        return Ok(());
+    }
+    db.execute_batch(
+        "BEGIN;
+         ALTER TABLE sessions RENAME TO sessions_v1;
+         DROP INDEX IF EXISTS sessions_rk;
+         DROP INDEX IF EXISTS sessions_client;
+         DROP INDEX IF EXISTS sessions_time;
+         CREATE INDEX IF NOT EXISTS sessions_v1_time ON sessions_v1(start_ms);
+         COMMIT;",
+    )
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
-    id          INTEGER PRIMARY KEY,
-    routing_key TEXT NOT NULL,
+    id           INTEGER PRIMARY KEY,
+    routing_hash TEXT NOT NULL,
+    cert_hash    TEXT NOT NULL,
     client_addr TEXT NOT NULL,
     sharer_addr TEXT NOT NULL,
     start_ms    INTEGER NOT NULL,
@@ -289,7 +325,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     pkts_s2c    INTEGER NOT NULL DEFAULT 0,
     bytes_s2c   INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS sessions_rk     ON sessions(routing_key, start_ms);
+CREATE INDEX IF NOT EXISTS sessions_rh     ON sessions(routing_hash, start_ms);
+CREATE INDEX IF NOT EXISTS sessions_device ON sessions(cert_hash, start_ms);
 CREATE INDEX IF NOT EXISTS sessions_client ON sessions(client_addr, start_ms);
 CREATE INDEX IF NOT EXISTS sessions_time   ON sessions(start_ms);
 CREATE TABLE IF NOT EXISTS marks (
@@ -398,15 +435,16 @@ fn flush_batch(db: &mut Connection, batch: &[Ev]) -> Result<(), rusqlite::Error>
         match ev {
             Ev::Open {
                 id,
-                routing_key_hex,
+                routing_hash_hex,
+                cert_hash_hex,
                 client,
                 sharer,
                 start_ms,
             } => {
                 tx.execute(
-                    "INSERT OR IGNORE INTO sessions(id, routing_key, client_addr, sharer_addr, start_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![id, routing_key_hex, client, sharer, start_ms],
+                    "INSERT OR IGNORE INTO sessions(id, routing_hash, cert_hash, client_addr, sharer_addr, start_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![id, routing_hash_hex, cert_hash_hex, client, sharer, start_ms],
                 )?;
             }
             Ev::Close {
@@ -452,6 +490,15 @@ fn retention_sweep(db: &Connection, retention: Duration) -> Result<(), rusqlite:
         "DELETE FROM marks WHERE ts_ms < ?1",
         rusqlite::params![cutoff],
     )?;
+    let has_v1: bool = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions_v1'")?
+        .exists([])?;
+    if has_v1 {
+        db.execute(
+            "DELETE FROM sessions_v1 WHERE COALESCE(end_ms, start_ms) < ?1",
+            rusqlite::params![cutoff],
+        )?;
+    }
     Ok(())
 }
 
@@ -490,7 +537,12 @@ mod tests {
         let log = SessionLog::open(cfg(&path)).unwrap();
 
         let rk = [0xABu8; 20];
-        let st = log.open_session(&rk, addr("203.0.113.9:51000"), addr("198.51.100.4:443"));
+        let st = log.open_session(
+            &rk,
+            &[0xCD; 20],
+            addr("203.0.113.9:51000"),
+            addr("198.51.100.4:443"),
+        );
         st.add_c2s(1200);
         st.add_c2s(800);
         st.add_s2c(64_000);
@@ -510,7 +562,8 @@ mod tests {
         });
 
         let db = Connection::open(&path).unwrap();
-        let (rk_hex, client, sharer, c2s_b, c2s_p, s2c_b, reason): (
+        let (rk_hex, device, client, sharer, c2s_b, c2s_p, s2c_b, reason): (
+            String,
             String,
             String,
             String,
@@ -520,12 +573,24 @@ mod tests {
             String,
         ) = db
             .query_row(
-                "SELECT routing_key, client_addr, sharer_addr, bytes_c2s, pkts_c2s, bytes_s2c, end_reason FROM sessions",
+                "SELECT routing_hash, cert_hash, client_addr, sharer_addr, bytes_c2s, pkts_c2s, bytes_s2c, end_reason FROM sessions",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(rk_hex, "ab".repeat(20));
+        assert_eq!(device, "cd".repeat(20));
         assert_eq!(client, "203.0.113.9:51000");
         assert_eq!(sharer, "198.51.100.4:443");
         assert_eq!(c2s_b, 2000);
@@ -564,8 +629,8 @@ mod tests {
         let old = now_ms() - 200 * 24 * 3600 * 1000;
         let recent = now_ms() - 1000;
         db.execute(
-            "INSERT INTO sessions(id, routing_key, client_addr, sharer_addr, start_ms, end_ms)
-             VALUES (1,'a','c','s',?1,?1), (2,'a','c','s',?2,?2)",
+            "INSERT INTO sessions(id, routing_hash, cert_hash, client_addr, sharer_addr, start_ms, end_ms)
+             VALUES (1,'a','d','c','s',?1,?1), (2,'a','d','c','s',?2,?2)",
             rusqlite::params![old, recent],
         )
         .unwrap();
@@ -578,5 +643,60 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(ids, vec![2]);
+    }
+
+    #[test]
+    fn a_v1_database_keeps_its_sessions_beside_the_new_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.sqlite");
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(&format!(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta VALUES ('format_version', '1');
+                 CREATE TABLE sessions (
+                    id INTEGER PRIMARY KEY, routing_key TEXT NOT NULL,
+                    client_addr TEXT NOT NULL, sharer_addr TEXT NOT NULL,
+                    start_ms INTEGER NOT NULL, end_ms INTEGER, end_reason TEXT,
+                    pkts_c2s INTEGER NOT NULL DEFAULT 0, bytes_c2s INTEGER NOT NULL DEFAULT 0,
+                    pkts_s2c INTEGER NOT NULL DEFAULT 0, bytes_s2c INTEGER NOT NULL DEFAULT 0);
+                 CREATE INDEX sessions_rk ON sessions(routing_key, start_ms);
+                 CREATE INDEX sessions_client ON sessions(client_addr, start_ms);
+                 CREATE INDEX sessions_time ON sessions(start_ms);
+                 CREATE TABLE marks (seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_ms INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT);
+                 INSERT INTO sessions(id, routing_key, client_addr, sharer_addr, start_ms)
+                    VALUES (7, 'old', 'c', 's', {});",
+                now_ms()
+            ))
+            .unwrap();
+        }
+        let log = SessionLog::open(cfg(&path)).unwrap();
+        let st = log.open_session(&[1; 20], &[2; 20], addr("10.0.0.1:1"), addr("10.0.0.2:2"));
+        log.close_session(&st, "idle");
+        drop(log);
+        wait_for(&path, |db| {
+            db.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+                .unwrap_or(0)
+                == 1
+        });
+        let db = Connection::open(&path).unwrap();
+        let old: String = db
+            .query_row("SELECT routing_key FROM sessions_v1 WHERE id=7", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(old, "old");
+        let version: String = db
+            .query_row(
+                "SELECT value FROM meta WHERE key='format_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, FORMAT_VERSION.to_string());
+        // Opening again is a no-op for the set-aside table.
+        drop(db);
+        drop(SessionLog::open(cfg(&path)).unwrap());
     }
 }

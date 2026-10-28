@@ -32,10 +32,11 @@ use std::net::Ipv4Addr;
 
 use crate::netns::Netns;
 
-/// REGISTER control-packet signature: `CTRL_MAGIC || REGISTER` =
-/// `0x80 'spR' 0x01` (relay-client/src/protocol.rs:11,19) — the 5-byte literal
-/// a DPI box matches on the first bytes of any UDP payload to flag a sharer.
-pub const SIG_REGISTER_MAGIC: &str = "8073705201";
+/// REGISTER control-packet signature: `CTRL_MAGIC || REGISTER_V2` =
+/// `0x80 'spR' 0x02` (relay-client's `protocol::CTRL_MAGIC` and
+/// `ctrl::REGISTER_V2`, the QUIC listener's REGISTER) — the 5-byte literal a
+/// DPI box matches on the first bytes of any UDP payload to flag a sharer.
+pub const SIG_REGISTER_MAGIC: &str = "8073705202";
 
 /// The OLD fixed hole-punch marker prefix once shared by `sporaHP1P`/`sporaHP1V`
 /// (now removed — the markers are per-session keyed nonces, spora-core
@@ -110,4 +111,18 @@ pub fn string_match_available(ns: &Netns) -> bool {
     let _ = ns.run(&format!("iptables -w -F {chain}"));
     let _ = ns.run(&format!("iptables -w -X {chain}"));
     ok
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_register_signature_is_the_wire_format() {
+        use relay_client::protocol::{CTRL_MAGIC, ctrl};
+        let mut wire = CTRL_MAGIC.to_vec();
+        wire.push(ctrl::REGISTER_V2);
+        assert_eq!(
+            super::SIG_REGISTER_MAGIC,
+            relay_client::protocol::hex(&wire)
+        );
+    }
 }

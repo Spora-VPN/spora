@@ -7,7 +7,7 @@
 //!
 //! Each scenario ties an audited fingerprint to the real-world censor technique
 //! that catches it:
-//!   register_magic_signature — CTRL_MAGIC `0x80 'spR' 0x01` | fixed magic-prefix DPI
+//!   register_magic_signature — CTRL_MAGIC `0x80 'spR' 0x02` | fixed magic-prefix DPI
 //!   quic_v1_wholesale        — QUIC v1 long-header version  | TSPU version+port block
 //!   punch_marker_signature   — `sporaHP1P`/`sporaHP1V`      | magic-prefix DPI (direct leg)
 //!
@@ -122,7 +122,7 @@ fn censor_available(wan: &Netns) -> Result<bool, String> {
 // 1. register_magic_signature
 //
 // Fingerprint: the REGISTER control packet's literal 5-byte prefix
-// `0x80 'spR' 0x01` (relay-client/src/protocol.rs:11,19). Threat: fixed
+// `0x80 'spR' 0x02` (relay-client's CTRL_MAGIC + REGISTER_V2). Threat: fixed
 // magic-prefix DPI (GFW/TSPU/Iran) — one observed sample → a permanent drop
 // rule. We drop ONLY that signature; QUIC to the relay is untouched. Yet
 // without a fresh registration the relay has no routing_key→sharer mapping, so

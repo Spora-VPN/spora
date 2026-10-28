@@ -32,7 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use log::{error, info, warn};
 use rusqlite::Connection;
 
-use crate::identity::Identity;
+use crate::identity::ShareIdentity;
 
 /// Bump when the schema changes; stored in `meta` so any database file is
 /// self-identifying.
@@ -243,7 +243,7 @@ impl ConnLog {
     /// when writing breaks at runtime.
     pub fn open(
         cfg: ConnLogConfig,
-        identity: &Identity,
+        identity: &ShareIdentity,
         hook: crate::EventHook,
     ) -> Result<ConnLog, String> {
         std::fs::create_dir_all(&cfg.dir)
@@ -565,7 +565,7 @@ impl Throttle {
 
 // ---------- Writer thread ----------
 
-fn open_db(path: &Path, identity: &Identity) -> Result<Connection, String> {
+fn open_db(path: &Path, identity: &ShareIdentity) -> Result<Connection, String> {
     let db =
         Connection::open(path).map_err(|e| format!("connlog: open {}: {}", path.display(), e))?;
     // auto_vacuum must be set before the first table is created to take
@@ -581,12 +581,12 @@ fn open_db(path: &Path, identity: &Identity) -> Result<Connection, String> {
         .map_err(|e| format!("connlog: schema: {}", e))?;
 
     let rk_hex: String = identity
-        .routing_key
+        .routing_hash
         .iter()
         .map(|b| format!("{:02x}", b))
         .collect();
     let stored_rk: Option<String> = db
-        .query_row("SELECT value FROM meta WHERE key='routing_key'", [], |r| {
+        .query_row("SELECT value FROM meta WHERE key='routing_hash'", [], |r| {
             r.get(0)
         })
         .ok();
@@ -603,7 +603,7 @@ fn open_db(path: &Path, identity: &Identity) -> Result<Connection, String> {
     let version = env!("CARGO_PKG_VERSION");
     db.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES
-            ('format_version', ?1), ('routing_key', ?2), ('created_ms', ?3)",
+            ('format_version', ?1), ('routing_hash', ?2), ('created_ms', ?3)",
         rusqlite::params![FORMAT_VERSION.to_string(), rk_hex, now_ms().to_string()],
     )
     .map_err(|e| format!("connlog: meta: {}", e))?;
@@ -1267,7 +1267,7 @@ mod tests {
     #[test]
     fn session_and_flow_lifecycle_lands_in_db() {
         let dir = tempfile::tempdir().unwrap();
-        let identity = Identity::generate();
+        let identity = ShareIdentity::generate();
         let log = ConnLog::open(test_cfg(dir.path()), &identity, None).unwrap();
 
         let session = log.session(addr([203, 0, 113, 1], 443));
@@ -1344,7 +1344,7 @@ mod tests {
     #[test]
     fn dropped_flow_guard_closes_with_session_end() {
         let dir = tempfile::tempdir().unwrap();
-        let identity = Identity::generate();
+        let identity = ShareIdentity::generate();
         let log = ConnLog::open(test_cfg(dir.path()), &identity, None).unwrap();
         let session = log.session(addr([203, 0, 113, 1], 443));
         let flow = session
@@ -1370,7 +1370,7 @@ mod tests {
     #[test]
     fn throttle_suppresses_and_summarizes() {
         let dir = tempfile::tempdir().unwrap();
-        let identity = Identity::generate();
+        let identity = ShareIdentity::generate();
         let mut cfg = test_cfg(dir.path());
         cfg.max_flow_records_per_sec = 1;
         cfg.flow_record_burst = 5;
@@ -1422,7 +1422,7 @@ mod tests {
     #[test]
     fn sessions_only_mode_logs_no_flows() {
         let dir = tempfile::tempdir().unwrap();
-        let identity = Identity::generate();
+        let identity = ShareIdentity::generate();
         let mut cfg = test_cfg(dir.path());
         cfg.log_destinations = false;
         let log = ConnLog::open(cfg, &identity, None).unwrap();
@@ -1454,7 +1454,7 @@ mod tests {
     #[test]
     fn retention_sweep_respects_holds() {
         let dir = tempfile::tempdir().unwrap();
-        let identity = Identity::generate();
+        let identity = ShareIdentity::generate();
         let log = ConnLog::open(test_cfg(dir.path()), &identity, None).unwrap();
         drop(log); // schema exists; writer exits
         wait_for(dir.path(), |db| {
@@ -1512,8 +1512,8 @@ mod tests {
     #[test]
     fn rejects_db_of_a_different_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let id_a = Identity::generate();
-        let id_b = Identity::generate();
+        let id_a = ShareIdentity::generate();
+        let id_b = ShareIdentity::generate();
         let log = ConnLog::open(test_cfg(dir.path()), &id_a, None).unwrap();
         drop(log);
         wait_for(dir.path(), |db| {
@@ -1535,7 +1535,7 @@ mod tests {
     #[test]
     fn flow_query_overlap_semantics() {
         let dir = tempfile::tempdir().unwrap();
-        let identity = Identity::generate();
+        let identity = ShareIdentity::generate();
         let log = ConnLog::open(test_cfg(dir.path()), &identity, None).unwrap();
         drop(log);
         wait_for(dir.path(), |db| {

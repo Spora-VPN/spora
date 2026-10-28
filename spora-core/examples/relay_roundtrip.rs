@@ -4,7 +4,8 @@
 // problem from a tunnel-plumbing bug in the appex.
 //
 //   cargo run -p spora-core --example relay_roundtrip
-use spora_core::{Config, connect, identity::Identity, share};
+use spora_core::identity::{DeviceIdentity, RelayEndpoint, Share};
+use spora_core::{Config, DEFAULT_RELAY, connect, share};
 
 #[tokio::main]
 async fn main() {
@@ -14,19 +15,19 @@ async fn main() {
         .filter_module("quinn_udp", log::LevelFilter::Warn)
         .init();
 
-    let identity = Identity::generate();
-    let mut config = Config::default();
+    let device = DeviceIdentity::generate();
+    let config = Config::default();
     // RELAY=host:port overrides the built-in relay (e.g. a local test relay).
-    if let Ok(r) = std::env::var("RELAY") {
-        let (host, port) = r.rsplit_once(':').expect("RELAY must be host:port");
-        config.relays = vec![spora_core::identity::RelayEndpoint::new(
-            host.to_string(),
-            port.parse().expect("bad port"),
-        )];
-    }
-
-    eprintln!("== sharing (registering with relay {:?}) ==", config.relays);
-    let session = share(identity, config.clone())
+    let relay = match std::env::var("RELAY") {
+        Ok(r) => {
+            let (host, port) = r.rsplit_once(':').expect("RELAY must be host:port");
+            RelayEndpoint::new(host.to_string(), port.parse().expect("bad port"))
+        }
+        Err(_) => RelayEndpoint::new(DEFAULT_RELAY.0, DEFAULT_RELAY.1),
+    };
+    eprintln!("== sharing (registering with relay {:?}) ==", relay);
+    let sh = Share::open(&device, vec![relay]).expect("one relay");
+    let session = share(device, sh, config.clone())
         .await
         .expect("share() failed");
     eprintln!("SHARE URL: {}", session.url);

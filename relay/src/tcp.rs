@@ -12,18 +12,18 @@
 //! connection to refill the pool after one is consumed.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use log::{debug, info, warn};
-use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 
-use relay_client::authz::{self, ISSUER_PUBKEY_LEN};
-use relay_client::protocol::ROUTING_KEY_LEN;
-use relay_client::tcp::{self, MAX_TOKEN_LEN, PREAMBLE_HEADER_LEN};
+use relay_client::protocol::{self, PARK_SIG_DOMAIN, hex};
+use relay_client::tcp::{self, Preamble};
 
-type RoutingKey = [u8; ROUTING_KEY_LEN];
+use crate::RoutingHash;
+use crate::authz::{self, Authorizer, Carrier, RegistrationCtx};
 
 /// How long a parked connection stays eligible. The sharer refreshes its pool
 /// well within this; older ones are discarded on pop so a vanished sharer never
@@ -32,52 +32,56 @@ pub const PARK_TTL: Duration = Duration::from_secs(90);
 /// How long a CONNECT waits for a parked sharer connection to appear (covers the
 /// brief window while the sharer refills its pool).
 pub const CONNECT_WAIT: Duration = Duration::from_secs(3);
-/// Cap on parked connections held per routing key.
+/// Cap on parked connections held per routing hash.
 pub const MAX_PARKED: usize = 32;
 /// Time-box the preamble read so a silent connection can't pin a task.
 const PREAMBLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a routing hash's last park timestamp is remembered: the UDP
+/// registration expiry, so the replay window is the same on both carriers
+/// and the map cannot grow without bound.
+pub const PARK_TS_TTL: Duration = crate::REGISTRATION_TIMEOUT;
+/// The map is pruned at most this often (on a park), not on every park.
+const PARK_TS_PRUNE_EVERY: Duration = Duration::from_secs(5);
 
 struct Parked {
     conn: TcpStream,
     at: Instant,
 }
 
-/// Shared state: parked sharer connections keyed by routing key, plus the
-/// trusted capability-token issuer keys (empty = open mode).
+/// The replay guard of parks: per routing hash, the last signed timestamp
+/// accepted and when.
+struct ParkStamps {
+    last: HashMap<RoutingHash, (u64, Instant)>,
+    pruned: Instant,
+}
+
+/// Shared state: parked sharer connections keyed by routing hash, the parks'
+/// replay guard, and who may park.
 pub struct TcpRelayState {
-    parked: Mutex<HashMap<RoutingKey, VecDeque<Parked>>>,
-    /// Trusted issuer public keys. **Empty means open mode** (any REGISTER is
-    /// parked). When non-empty, a REGISTER must carry a capability token signed
-    /// by one of these issuers and bound to its routing key — see [`authz`].
-    /// (Key *possession* is proven end-to-end by the pinned TLS cert, not here:
-    /// the relay blind-splices and never sees the E2E handshake.)
-    issuer_keys: Vec<[u8; ISSUER_PUBKEY_LEN]>,
+    parked: Mutex<HashMap<RoutingHash, VecDeque<Parked>>>,
+    stamps: Mutex<ParkStamps>,
+    authorizer: Arc<dyn Authorizer>,
 }
 
 impl TcpRelayState {
-    /// Open mode: any REGISTER is parked (no capability token required).
+    /// Parks every signed preamble (the [`authz::Open`] authorizer).
     pub fn new() -> Arc<Self> {
+        Self::with_authorizer(Arc::new(authz::Open))
+    }
+
+    /// Parks what `authorizer` allows.
+    pub fn with_authorizer(authorizer: Arc<dyn Authorizer>) -> Arc<Self> {
         Arc::new(Self {
             parked: Mutex::new(HashMap::new()),
-            issuer_keys: Vec::new(),
+            stamps: Mutex::new(ParkStamps {
+                last: HashMap::new(),
+                pruned: Instant::now(),
+            }),
+            authorizer,
         })
     }
 
-    /// Require a capability token signed by one of `issuer_keys` and bound to
-    /// the registering routing key. An empty set is open mode.
-    pub fn with_issuer_keys(issuer_keys: Vec<[u8; ISSUER_PUBKEY_LEN]>) -> Arc<Self> {
-        Arc::new(Self {
-            parked: Mutex::new(HashMap::new()),
-            issuer_keys,
-        })
-    }
-
-    /// Whether the relay requires capability-token authorization.
-    pub fn requires_authorization(&self) -> bool {
-        !self.issuer_keys.is_empty()
-    }
-
-    fn park(&self, rk: RoutingKey, conn: TcpStream) {
+    fn park(&self, rk: RoutingHash, conn: TcpStream) {
         let mut map = self.parked.lock().unwrap();
         let q = map.entry(rk).or_default();
         while q.len() >= MAX_PARKED {
@@ -90,7 +94,7 @@ impl TcpRelayState {
     }
 
     /// Pop a *fresh* parked connection for `rk`, discarding any that expired.
-    fn take_fresh(&self, rk: &RoutingKey) -> Option<TcpStream> {
+    fn take_fresh(&self, rk: &RoutingHash) -> Option<TcpStream> {
         let mut map = self.parked.lock().unwrap();
         let q = map.get_mut(rk)?;
         while let Some(p) = q.pop_front() {
@@ -102,7 +106,26 @@ impl TcpRelayState {
         None
     }
 
-    /// Number of routing keys with at least one parked connection (for tests).
+    /// Whether `ts` is fresh for `rk` (strictly above the last accepted).
+    fn is_fresh(&self, rk: &RoutingHash, ts: u64, now: Instant) -> bool {
+        let mut st = self.stamps.lock().unwrap();
+        if now.duration_since(st.pruned) >= PARK_TS_PRUNE_EVERY {
+            st.last
+                .retain(|_, (_, at)| now.duration_since(*at) < PARK_TS_TTL);
+            st.pruned = now;
+        }
+        match st.last.get(rk) {
+            Some((last, at)) => ts > *last || now.duration_since(*at) >= PARK_TS_TTL,
+            None => true,
+        }
+    }
+
+    /// Note `ts` as the last accepted park timestamp for `rk`.
+    fn accept_stamp(&self, rk: RoutingHash, ts: u64, now: Instant) {
+        self.stamps.lock().unwrap().last.insert(rk, (ts, now));
+    }
+
+    /// Number of routing hashes with at least one parked connection (for tests).
     pub fn parked_key_count(&self) -> usize {
         self.parked
             .lock()
@@ -110,6 +133,12 @@ impl TcpRelayState {
             .values()
             .filter(|q| !q.is_empty())
             .count()
+    }
+
+    /// Number of routing hashes whose last park timestamp is remembered (for
+    /// tests).
+    pub fn stamp_count(&self) -> usize {
+        self.stamps.lock().unwrap().last.len()
     }
 }
 
@@ -121,64 +150,69 @@ pub async fn serve_tcp(listener: TcpListener, state: Arc<TcpRelayState>) {
     }
     loop {
         match listener.accept().await {
-            Ok((conn, _addr)) => {
+            Ok((conn, addr)) => {
                 let _ = conn.set_nodelay(true);
-                tokio::spawn(handle_conn(conn, state.clone()));
+                tokio::spawn(handle_conn(conn, addr, state.clone()));
             }
             Err(e) => warn!("tcp accept error: {e}"),
         }
     }
 }
 
-async fn handle_conn(mut conn: TcpStream, state: Arc<TcpRelayState>) {
-    // Read the fixed header, then the (bounded) capability token.
-    let mut header = [0u8; PREAMBLE_HEADER_LEN];
-    match tokio::time::timeout(PREAMBLE_TIMEOUT, conn.read_exact(&mut header)).await {
-        Ok(Ok(_)) => {}
-        _ => {
-            debug!("tcp: header read failed/timed out");
+async fn handle_conn(mut conn: TcpStream, source: SocketAddr, state: Arc<TcpRelayState>) {
+    let preamble = match tcp::read_preamble(&mut conn, PREAMBLE_TIMEOUT).await {
+        Ok(p) => p,
+        Err(e) => {
+            debug!("tcp: bad preamble from {source}: {e:?}");
             return;
         }
-    }
-    let Some((role, rk, token_len)) = tcp::parse_header(&header) else {
-        debug!("tcp: bad preamble header");
-        return;
     };
-    if token_len > MAX_TOKEN_LEN {
-        debug!("tcp: token_len {token_len} over cap");
-        return;
-    }
-    let mut token = vec![0u8; token_len];
-    if token_len > 0
-        && !matches!(
-            tokio::time::timeout(PREAMBLE_TIMEOUT, conn.read_exact(&mut token)).await,
-            Ok(Ok(_))
-        )
-    {
-        debug!("tcp: token read failed/timed out");
-        return;
-    }
-
-    match role {
-        tcp::role::REGISTER => {
-            // Authorization: in gated mode the token must be valid and bound to
-            // this routing key. Open mode (no issuer keys) parks any REGISTER.
-            if !state.issuer_keys.is_empty()
-                && let Err(e) = authz::verify_token(&token, &rk, &state.issuer_keys)
-            {
+    match preamble {
+        Preamble::Park { signed, token } => {
+            let verified = protocol::parse_signed(&signed)
+                .filter(|(_, rest)| rest.is_empty())
+                .ok_or(protocol::RegisterVerifyError::Malformed)
+                .and_then(|(reg, _)| reg.verify(PARK_SIG_DOMAIN));
+            let reg = match verified {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("tcp: rejecting park from {source}: {e:?}");
+                    return;
+                }
+            };
+            let rk = reg.routing_hash;
+            let now = Instant::now();
+            // Replay guard: without it, anyone who saw one park preamble (it
+            // is cleartext) could park connections for that share at will.
+            if !state.is_fresh(&rk, reg.timestamp_millis, now) {
                 debug!(
-                    "tcp: rejecting unauthorized REGISTER rk {:x?}: {:?}",
-                    &rk[..4],
-                    e
+                    "tcp: rejecting stale/replayed park for rh {} from {source}",
+                    hex(&rk[..4])
                 );
                 return;
             }
-            debug!("tcp REGISTER rk {:x?}", &rk[..4]);
+            let ctx = RegistrationCtx {
+                cert_hash: reg.cert_hash,
+                share_id: reg.share_id,
+                routing_hash: rk,
+                source,
+                carrier: Carrier::Tcp,
+            };
+            if !state.authorizer.authorize(&ctx, &token, SystemTime::now()) {
+                debug!(
+                    "tcp: refusing unauthorized park for rh {} (device {}) from {source}",
+                    hex(&rk[..4]),
+                    hex(&reg.cert_hash[..4])
+                );
+                return;
+            }
+            state.accept_stamp(rk, reg.timestamp_millis, now);
+            debug!("tcp park rh {} from {source}", hex(&rk[..4]));
             // Park the connection; it lives in the queue until a client pops it.
             state.park(rk, conn);
         }
-        tcp::role::CONNECT => {
-            debug!("tcp CONNECT rk {:x?}", &rk[..4]);
+        Preamble::Connect(rk) => {
+            debug!("tcp CONNECT rh {}", hex(&rk[..4]));
             let deadline = Instant::now() + CONNECT_WAIT;
             let sharer = loop {
                 if let Some(s) = state.take_fresh(&rk) {
@@ -191,26 +225,28 @@ async fn handle_conn(mut conn: TcpStream, state: Arc<TcpRelayState>) {
             };
             let Some(mut sharer) = sharer else {
                 debug!(
-                    "tcp: no parked sharer for rk {:x?}; dropping client",
-                    &rk[..4]
+                    "tcp: no parked sharer for rh {}; dropping client",
+                    hex(&rk[..4])
                 );
                 return;
             };
             // Blind 1:1 splice — the E2E TLS runs A<->B through here; the relay
             // sees only ciphertext.
             match tokio::io::copy_bidirectional(&mut conn, &mut sharer).await {
-                Ok((c2s, s2c)) => debug!("tcp splice done rk {:x?}: c2s={c2s} s2c={s2c}", &rk[..4]),
-                Err(e) => debug!("tcp splice ended rk {:x?}: {e}", &rk[..4]),
+                Ok((c2s, s2c)) => {
+                    debug!("tcp splice done rh {}: c2s={c2s} s2c={s2c}", hex(&rk[..4]))
+                }
+                Err(e) => debug!("tcp splice ended rh {}: {e}", hex(&rk[..4])),
             }
         }
-        other => warn!("tcp: unknown role {other:#x}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use relay_client::protocol::RegisterSigner;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn start_with(state: Arc<TcpRelayState>) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -225,7 +261,12 @@ mod tests {
         (addr, state)
     }
 
-    /// Park briefly, then poll `parked_key_count` up to ~400 ms.
+    fn signer() -> RegisterSigner {
+        let ck = rcgen::generate_simple_self_signed(vec!["spora.peer".to_string()]).unwrap();
+        RegisterSigner::new(ck.cert.der(), &ck.key_pair.serialize_der(), rand::random()).unwrap()
+    }
+
+    /// Poll `parked_key_count` up to ~400 ms.
     async fn wait_parked(state: &Arc<TcpRelayState>, want: usize) -> usize {
         for _ in 0..40 {
             if state.parked_key_count() == want {
@@ -236,25 +277,25 @@ mod tests {
         state.parked_key_count()
     }
 
+    async fn park(addr: std::net::SocketAddr, preamble: &[u8]) -> TcpStream {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(preamble).await.unwrap();
+        s
+    }
+
     #[tokio::test]
     async fn splices_client_to_a_parked_sharer_both_directions() {
-        let (addr, _state) = start().await;
-        let rk = [0x42u8; ROUTING_KEY_LEN];
+        let (addr, state) = start().await;
+        let mut sig = signer();
+        let rk = sig.routing_hash();
 
         // Sharer parks a connection.
-        let mut sharer = TcpStream::connect(addr).await.unwrap();
-        sharer
-            .write_all(&tcp::build_preamble(tcp::role::REGISTER, &rk, &[]))
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(80)).await; // let the relay park it
+        let mut sharer = park(addr, &sig.park_preamble(&[])).await;
+        assert_eq!(wait_parked(&state, 1).await, 1);
 
         // Client connects and is spliced.
         let mut client = TcpStream::connect(addr).await.unwrap();
-        client
-            .write_all(&tcp::build_preamble(tcp::role::CONNECT, &rk, &[]))
-            .await
-            .unwrap();
+        client.write_all(&tcp::build_connect(&rk)).await.unwrap();
 
         // client -> sharer
         client.write_all(b"hello-sharer").await.unwrap();
@@ -272,12 +313,9 @@ mod tests {
     #[tokio::test]
     async fn client_with_no_parked_sharer_is_dropped() {
         let (addr, _state) = start().await;
-        let rk = [0x77u8; ROUTING_KEY_LEN];
+        let rk = [0x77u8; 20];
         let mut client = TcpStream::connect(addr).await.unwrap();
-        client
-            .write_all(&tcp::build_preamble(tcp::role::CONNECT, &rk, &[]))
-            .await
-            .unwrap();
+        client.write_all(&tcp::build_connect(&rk)).await.unwrap();
         // No sharer parked: the relay waits CONNECT_WAIT then closes → EOF.
         let mut buf = [0u8; 1];
         let n = tokio::time::timeout(CONNECT_WAIT + Duration::from_secs(2), client.read(&mut buf))
@@ -291,11 +329,8 @@ mod tests {
     async fn bad_preamble_is_dropped() {
         let (addr, _state) = start().await;
         let mut c = TcpStream::connect(addr).await.unwrap();
-        // A full-length header with wrong magic — parses-and-rejects fast (a
-        // short buffer would instead make read_exact wait for PREAMBLE_TIMEOUT).
-        let mut bad = vec![0u8; PREAMBLE_HEADER_LEN];
-        bad[..4].copy_from_slice(b"XXXX");
-        c.write_all(&bad).await.unwrap();
+        // Wrong magic — parses-and-rejects fast.
+        c.write_all(b"XXXXX").await.unwrap();
         let mut buf = [0u8; 1];
         let res = tokio::time::timeout(Duration::from_secs(2), c.read(&mut buf))
             .await
@@ -306,91 +341,85 @@ mod tests {
         }
     }
 
-    // --- Capability-token authorization ---
-
     #[tokio::test]
-    async fn open_mode_parks_a_tokenless_register() {
+    async fn a_replayed_park_preamble_is_refused() {
+        // A preamble is cleartext: a copy sent again (from anywhere) must not
+        // park a second connection for the share.
         let (addr, state) = start().await;
-        assert!(!state.requires_authorization());
-        let rk = [0x11u8; ROUTING_KEY_LEN];
-        let mut s = TcpStream::connect(addr).await.unwrap();
-        s.write_all(&tcp::build_preamble(tcp::role::REGISTER, &rk, &[]))
+        let mut sig = signer();
+        let pre = sig.park_preamble(&[]);
+        let _first = park(addr, &pre).await;
+        assert_eq!(wait_parked(&state, 1).await, 1);
+        let mut replay = park(addr, &pre).await;
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), replay.read(&mut buf))
             .await
-            .unwrap();
-        assert_eq!(
-            wait_parked(&state, 1).await,
-            1,
-            "open mode parks a tokenless register"
-        );
+            .expect("the relay closes a replayed park")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        let q = state
+            .parked
+            .lock()
+            .unwrap()
+            .get(&sig.routing_hash())
+            .map(|q| q.len());
+        assert_eq!(q, Some(1), "only the original is parked");
+        // The sharer's own next preamble (a higher timestamp) parks fine.
+        let _second = park(addr, &sig.park_preamble(&[])).await;
+        for _ in 0..40 {
+            if state.parked.lock().unwrap()[&sig.routing_hash()].len() == 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the fresh park was not parked");
     }
 
     #[tokio::test]
-    async fn gated_mode_requires_a_valid_token() {
-        let issuer = authz::IssuerKeyPair::generate().unwrap();
-        let state = TcpRelayState::with_issuer_keys(vec![issuer.public_key()]);
-        assert!(state.requires_authorization());
-        let addr = start_with(state.clone()).await;
-        let rk = [0x22u8; ROUTING_KEY_LEN];
-
-        // Tokenless => refused, never parks.
-        let mut s = TcpStream::connect(addr).await.unwrap();
-        s.write_all(&tcp::build_preamble(tcp::role::REGISTER, &rk, &[]))
-            .await
-            .unwrap();
+    async fn a_forged_or_cross_use_signature_is_refused() {
+        let (addr, state) = start().await;
+        // A UDP REGISTER's signed part, re-framed as a park: wrong domain.
+        let mut sig = signer();
+        let reg = sig.register_packet(protocol::RegisterKind::Quic, &[]);
+        let signed = &reg[protocol::CTRL_MAGIC.len() + 1..];
+        let mut p = tcp::TCP_MAGIC.to_vec();
+        p.push(tcp::role::PARK_V2);
+        p.extend_from_slice(signed);
+        p.extend_from_slice(&0u16.to_be_bytes());
+        let _c = park(addr, &p).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(
-            state.parked_key_count(),
-            0,
-            "gated relay must refuse a tokenless register"
-        );
-
-        // Valid token bound to rk => parks.
-        let token = issuer.issue(&rk);
-        let mut s2 = TcpStream::connect(addr).await.unwrap();
-        s2.write_all(&tcp::build_preamble(tcp::role::REGISTER, &rk, &token))
-            .await
-            .unwrap();
-        assert_eq!(
-            wait_parked(&state, 1).await,
-            1,
-            "a valid token must be accepted"
-        );
+        assert_eq!(state.parked_key_count(), 0);
     }
 
     #[tokio::test]
-    async fn gated_mode_rejects_wrong_issuer_and_wrong_subject() {
-        let issuer = authz::IssuerKeyPair::generate().unwrap();
-        let rogue = authz::IssuerKeyPair::generate().unwrap();
-        let state = TcpRelayState::with_issuer_keys(vec![issuer.public_key()]);
+    async fn the_authorizer_decides_parks() {
+        let state = TcpRelayState::with_authorizer(Arc::new(
+            authz::StaticToken::new(b"bearer".to_vec()).unwrap(),
+        ));
         let addr = start_with(state.clone()).await;
-        let rk = [0x33u8; ROUTING_KEY_LEN];
+        let mut sig = signer();
 
-        // Wrong issuer.
-        let bad = rogue.issue(&rk);
-        TcpStream::connect(addr)
-            .await
-            .unwrap()
-            .write_all(&tcp::build_preamble(tcp::role::REGISTER, &rk, &bad))
-            .await
-            .unwrap();
-        // Wrong subject: a valid token, but bound to a different routing key.
-        let wrong_subject = issuer.issue(&[0x44u8; ROUTING_KEY_LEN]);
-        TcpStream::connect(addr)
-            .await
-            .unwrap()
-            .write_all(&tcp::build_preamble(
-                tcp::role::REGISTER,
-                &rk,
-                &wrong_subject,
-            ))
-            .await
-            .unwrap();
-
+        let _refused = park(addr, &sig.park_preamble(&[])).await;
+        let _wrong = park(addr, &sig.park_preamble(b"guess")).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(
-            state.parked_key_count(),
-            0,
-            "wrong-issuer and wrong-subject tokens must both be refused"
-        );
+        assert_eq!(state.parked_key_count(), 0, "no or wrong token: refused");
+        assert_eq!(state.stamp_count(), 0, "a refusal burns no timestamp");
+
+        let _ok = park(addr, &sig.park_preamble(b"bearer")).await;
+        assert_eq!(wait_parked(&state, 1).await, 1, "the right token parks");
+    }
+
+    #[test]
+    fn park_stamps_are_pruned_after_the_registration_timeout() {
+        let state = TcpRelayState::new();
+        let t0 = Instant::now();
+        state.accept_stamp([1; 20], 100, t0);
+        assert!(!state.is_fresh(&[1; 20], 100, t0));
+        assert!(state.is_fresh(&[1; 20], 101, t0));
+        // Past the TTL the old stamp no longer counts, and a later park
+        // (of any routing hash) prunes it.
+        let late = t0 + PARK_TS_TTL + Duration::from_secs(1);
+        assert!(state.is_fresh(&[2; 20], 1, late));
+        assert_eq!(state.stamp_count(), 0);
     }
 }

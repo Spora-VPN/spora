@@ -527,7 +527,7 @@ impl Sink<Vec<u8>> for MeteredTransport {
 mod tests {
     use super::*;
     use crate::connlog::{ConnLog, ConnLogConfig, FlowQuery, open_readonly, query_flows};
-    use crate::identity::Identity;
+    use crate::identity::ShareIdentity;
     use crate::transport::mock::mock_transport;
     use futures_util::{SinkExt, StreamExt};
     use std::path::Path;
@@ -579,7 +579,7 @@ mod tests {
     fn rig(dir: &Path) -> Rig {
         let mut cfg = ConnLogConfig::in_dir(dir);
         cfg.flush_interval = Duration::from_millis(20);
-        let identity = Identity::generate();
+        let identity = ShareIdentity::generate();
         let log = ConnLog::open(cfg, &identity, None).unwrap();
         let session = log.session("203.0.113.1:443".parse().unwrap());
         let (mock, handle) = mock_transport();

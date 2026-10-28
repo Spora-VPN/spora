@@ -89,8 +89,8 @@ Workspace members (resolver v3):
 - **spora-ffi** — Uniffi-based FFI for Android/JNI. Wraps core functions for Kotlin. Builds as `cdylib`.
 - **spora-service** — The service layer the platform clients link (spora-cli, spora-ffi), kept out of core: the diagnostic log (`diag`: a JSON-Lines file sink behind `log`, crash files, bug-report zips) and the telemetry upload switch with its uploader thread, which replicates records, log and crash files to spora-web's API by byte cursor (blocking ureq, rustls/ring). See "Diagnostic log and telemetry".
 - **spora-wincore**, **spora-winui** — Windows service + UI.
-- **relay** — Dumb UDP relay (both `lib.rs` for use in tests and `main.rs` for the deployed binary). Forwards packets between peers by inspecting QUIC long-header DCIDs and tracking a small flow table. Speaks no QUIC, holds no TLS keys.
-- **relay-client** — Tiny client of the relay protocol: the wire-protocol constants (`protocol` module) and the sharer's `register_loop` helper.
+- **relay** — Dumb UDP relay (both `lib.rs` for use in tests and `main.rs` for the open binary). Forwards packets between peers by inspecting QUIC long-header DCIDs and tracking a small flow table. Speaks no QUIC, holds no TLS keys. Who may register is an `authz::Authorizer`: built in are `Open` and `StaticToken` (`--token-file`); `server::run` is the whole binary minus its flags, so a closed binary (the commercial relay, private repo `../spora-managed-relay`) links this crate and supplies its own authorizer. Tokens are opaque bytes here, end to end.
+- **relay-client** — Tiny client of the relay protocol: the wire-protocol constants (`protocol` module), the TCP preambles (`tcp`), a share's credentials (`credential`: `Credential` per relay endpoint, `Credentials` = the share's mutable relay token) and the sharer's `register_loop` helper.
 - **spora-lab** — Network-namespace e2e test lab (test-only; see `.local/docs/lab.md`): runs the real sharer/client/relay across netns topologies with iptables NAT flavors and netem conditions, in-process (one pinned thread + current-thread tokio runtime per simulated host).
 
 ## Architecture
@@ -109,31 +109,36 @@ A (sharer) <----- end-to-end QUIC (cert pinned, secret-auth) -----> B (client)
 
 There is exactly one QUIC connection — between A and B — even when traffic flows through the relay. The relay is a stateless-ish UDP forwarder: it looks at QUIC long-header packets and routes them by Destination Connection ID; everything after the first match is forwarded by source-address 5-tuple. PMTUD runs end-to-end on the single connection, not per-leg.
 
-### Identity persistence
+### Identity, shares, persistence
 
-`Identity` (cert + key + secret + routing_key) is what determines the share URL. **Platform-specific clients are responsible for persisting it** in a platform-appropriate way so the URL stays stable across launches:
+Four things with four lifetimes (`spora_core::identity`; the design is `../spora-kb/relay-management-decisions.md`):
 
-- CLI: `$XDG_CONFIG_HOME/spora/identity.bin` (mode 0600), `--fresh` flag forces regeneration.
-- FFI (Android): `make_identity()` returns bytes, app stores them (SharedPreferences/EncryptedSharedPreferences), passes them back to `share(identity_bytes, …)`.
-- Windows wincore (gRPC): the proto's `ShareRequest.key` field is interpreted as base64url(identity bytes), or empty to generate fresh. Proto change to `bytes identity` is a follow-up.
+- `DeviceIdentity` — the device's ONE P-256 key pair + self-signed cert (valid to 4096). Its **cert hash** = `SHA-256(cert DER)[..20]` identifies the device to relays, the API and clients (who pin the cert by it).
+- `Share` — one shared connection, immutable once made: cert hash, **share id** (8 random public bytes), **secret** (16 random bytes, what URL holders present) and its relays as `RelayEntry { endpoint, credential }` (`Credential::None | Static(bytes) | Spora`). The platform stores it as an opaque versioned blob (`Share::to_blob` / `from_blob`, magic `sSHR` v1; unknown versions are errors). The URL is a pure function of it (`Share::url`), so other relays = a new share = a new URL.
+- `ShareIdentity` — what a running share serves with (device key/cert + share id, secret, routing hash). `ShareIdentity::new` refuses a share made under another device (`IDENTITY_MISMATCH`).
+- **routing hash** = `SHA-256(cert hash || share id)[..20]`: the on-wire form of the routing key (cert hash, share id) — QUIC DCID, nz header prefix, TCP CONNECT key, relay registration key. Not the share id alone: that could be registered by anyone with any key.
 
-Use `Identity::generate()` once and `Identity::from_bytes(&persisted)` thereafter. Round-trip via `to_bytes()` / `from_bytes()` is versioned and magic-checked (`b"sIDv"`, version 1).
+`spora_core::share(device, share, config)` takes both by value. Where they live:
+
+- CLI (interim, until spora-service holds the device identity): `$XDG_CONFIG_HOME/spora/share.bin` + `device.bin` beside it (0600, atomic). `--share-file` (alias `--identity-file`, which the field lab still passes) selects another; `--fresh` makes a new share; relay flags differing from the stored share's make a new share (new URL) with a notice.
+- FFI (interim): `make_identity()` → device bytes, `make_share(identity)` → blob over the built-in relay, `share(identity, blob, …)`. To be replaced by service-aware `init_service`/`make_share`/`start_share` (spec S4).
 
 ### Sharer (A) flow — `spora_core::share(identity, config)` (rolling listener / per-port sessions)
 
-1. Receive `Identity` from the platform layer (already persisted on disk or in the OS keystore).
-2. Bind the generation-0 LISTENER socket (ephemeral port); `try_clone()` it so quinn owns one fd and the registrar uses the other. Spawn its registrar — every 30s a signed `[CTRL_MAGIC | REGISTER | routing_key]` packet to each UDP relay; the relay updates `routing_key -> A_addr`. One `RegisterSigner` (strictly-increasing timestamps) is shared across ALL generations.
+1. Receive the `DeviceIdentity` and the `Share` from the platform layer (already persisted).
+2. Bind the generation-0 LISTENER socket (ephemeral port); `try_clone()` it so quinn owns one fd and the registrar uses the other. Spawn its registrar — every 30s a signed `REGISTER_V2` to each UDP relay, each with its endpoint's credential; the relay updates `routing_hash -> A_addr`. One `RegisterSigner` per share (strictly-increasing timestamps) is shared across ALL generations, the nz carrier and the TCP park pool.
 3. Per accepted+authenticated session, `run_share_loop` ROLLS: the session keeps the socket/endpoint it arrived on (its own port, its own relay flow, its own quinn endpoint), and a fresh listener socket + registrar generation takes over the routing key (old listener: registrar aborted, `set_server_config(None)`). The relay's binding therefore always points at a flow-free port — no "actively-serving" lockout for dead predecessors, no same-DCID Initial swallow — and a REGISTER from the new port displaces the old binding (no relay changes needed). Demoted endpoints are tracked and closed once no session can use them.
-4. `Direct` endpoints get a separate PERMANENT endpoint on the advertised port (never rolls, never registers); direct-dialing clients use random initial DCIDs (the routing-key DCID exists only for relay routing). The nz carrier rolls its dedicated socket the same way (dispatcher demotes, keeps serving its session, exits when its tables empty).
+4. `Direct` endpoints get a separate PERMANENT endpoint on the advertised port (never rolls, never registers); direct-dialing clients use random initial DCIDs (the routing-hash DCID exists only for relay routing). The nz carrier rolls its dedicated socket the same way (dispatcher demotes, keeps serving its session, exits when its tables empty); it registers with `REGISTER_NZ_V2`, so a relay serving QUIC and nz on one port keeps the two sockets' registrations apart.
+4a. Relay token renewal: `Config.relay_token` is the device's token for `Credential::Spora` endpoints (`None` = degraded start, tokenless registrations). `ShareSession::update_relay_token` (or a clone of `ShareSession.credentials`) replaces it with one write; every registrar of the current generation sends a REGISTER at once and refused TCP park workers (which back off 0.5 s → 60 s) retry at once. Sessions, sockets and the connlog are untouched (`spora-core/tests/relay_token.rs`).
 5. Per session: wrap `transport` in `UpgradableTransport → KeepAliveTransport`; spawn `try_direct_upgrade` (responder role, with the identity); spawn the netstack tunnel. New peer kicks previous (two LIVE clients on one URL will alternate at `reconnect_delay` cadence — the fixed delay is the anti-storm pacing; real multi-client is future work, structurally easy now that each session owns an endpoint).
 
 NAT caveat: a listener's NAT mapping is kept alive only by outbound REGISTERs (relay never replies); on NATs with unreplied-UDP timeout <= register interval the mapping can lapse between REGISTERs. Planned fix: relay REGISTER-ACK (see `QuicListenerCtx` doc).
 
 ### Client (B) flow — `spora_core::connect(url)`
 
-1. Parse URL to `Token { routing_key, secret, relay_host, relay_port }`.
+1. Parse URL to `Token { cert_hash, share_id, secret, relays }`; `token.routing_hash()` derives the routing hash.
 2. Resolve the relay address; bind a UDP socket.
-3. Build quinn client config that pins the server cert to `routing_key` (`RoutingKeyVerifier`) and sets `initial_dst_cid_provider` so B's first Initial carries `DCID = routing_key`.
+3. Build quinn client config that pins the server cert to the URL's cert hash (`CertHashVerifier`; TLS and the nz cert-auth pin the same) and sets `initial_dst_cid_provider` so B's first Initial carries `DCID = routing_hash`.
 4. `client_connect` to the relay address — relay routes by DCID to A — QUIC handshake completes end-to-end. B opens a bidi stream and writes the secret; A verifies and accepts.
 5. Wrap the resulting `QuicPeerTransport` in `UpgradableTransport → KeepAliveTransport → ReconnectTransport`; spawn `try_direct_upgrade` (initiator role).
 6. Stopping: cancelling `ConnectResult.cancel` closes the live session's QUIC connection at once (code 0, "client stopped") and closes the record. `ConnectResult.stopper.stop().await` (`RunStopper`) does the same and waits until that close has been handed to the socket, at most `STOP_FLUSH_GRACE` (500 ms; normally about 1 ms). A process about to exit (the CLI) awaits it, best while it still holds the transport: dropped with its runtime first, the close never goes, and the exit records a session that died (its keepalive gives up ~30 s later) instead of a client that left.
@@ -144,7 +149,7 @@ After the relay-via session is up, both sides try to establish a direct path:
 
 - Signaling rides on the bidi QUIC stream that was opened during the auth step (the `SignalChannel` in `signal.rs`, length-framed messages).
 - STUN to discover external addresses; exchange endpoints via the signal channel; punch + bidirectional verify.
-- Build a fresh `e2e::client_endpoint` / `e2e::server_endpoint` over the new direct socket, using the same `Identity` / `routing_key`. New QUIC handshake completes end-to-end on the direct path.
+- Build a fresh `e2e::client_endpoint` / `e2e::server_endpoint` over the new direct socket, pinned to the same cert hash. New QUIC handshake completes end-to-end on the direct path.
 - `UpgradeSender` swaps the inner transport from the relay-via QUIC to the direct QUIC. The old relay-via connection drains and times out.
 - A failed attempt is retried by the initiator after `Timings.upgrade_retry_delay` (15 s), doubling after each consecutive failure up to `Timings.upgrade_retry_max` (5 min). The streak is per session (`try_direct_upgrade` runs per session, so the reconnect after a network change starts at 15 s again) and starts over on a wake from dormancy (keepalive knob 0 → >0), wherever the wake is seen: before an attempt, at the end of one that began dormant, or during the wait (`UpgradePacing`). Dormant attempts are still limited to 3 before the task parks until a wake. The wait (`wait_before_retry`) ends with its session or the run. Every attempt keeps its record steps.
 
@@ -258,25 +263,26 @@ exactly when sweeping is safe. Key invariants:
   and their pure logic (parsers, MTU policy, DNS files) is unit-tested on
   every host.
 
-### Wire protocol — relay control & QUIC routing (see `relay_client::protocol`)
+### Wire protocol — relay control & QUIC routing (see `relay_client::protocol`, `relay_client::tcp`)
 
-- Sharer registration: `[0x80, 's', 'p', 'R', 0x01, <20-byte routing_key>]`. The leading `0x80` has the QUIC "fixed bit" clear, so QUIC parsers will not mistake control traffic for QUIC.
-- QUIC long-header packets (Initial, Handshake): the relay parses out the DCID at byte offset 6, matches against registered routing keys, and installs a bidirectional `(B_addr, A_addr)` flow.
-- QUIC short-header (1-RTT) packets: routed by 5-tuple via the flow table that was installed when the first Initial arrived.
+- Sharer registration (UDP): `[0x80, 's', 'p', 'R', type | share_id(8) | ts(8, ms) | cert_len(2) | cert | sig_len(2) | sig | token…]`, type `REGISTER_V2` (0x02, the QUIC listener) or `REGISTER_NZ_V2` (0x03, the nz socket). The signature (ECDSA P-256, the device key) covers a per-use domain string plus everything from share id through cert; the token runs to the end of the packet, unsigned, opaque. The leading `0x80` has the QUIC "fixed bit" clear, so QUIC parsers will not mistake control traffic for QUIC. The relay derives the routing hash from cert + share id, verifies, requires `ts` strictly above the last it accepted for (routing hash, type), then asks its `Authorizer`; registrations are keyed by (routing hash, type).
+- TCP: sharer park `[spT2 | 0x03 | signed registration (park domain) | token_len(2) | token]`, with its own per-routing-hash timestamp guard (pruned after 120 s); client `[spT2 | 0x02 | routing_hash(20)]`.
+- QUIC long-header packets (Initial, Handshake): the relay parses out the DCID at byte offset 6, matches against registered routing hashes, and installs a bidirectional `(B_addr, A_addr)` flow. nz first packets: the leading 20 bytes.
+- QUIC short-header (1-RTT) packets: routed by 5-tuple via the flow table that was installed when the first Initial arrived. The authorizer is never on the forwarding path: a lapsed token stops new registrations, live flows run until idle.
 
 ### Token / URL format
 
 ```
-https://spora.to/s/<base64url(routing_key || secret)>?r=<host>:<port>[&r=<host>:<port>...]
+https://spora.to/s/<base64url(version(1)=1 || cert_hash(20) || share_id(8) || secret(16))>?r=<host>:<port>[&r=<host>:<port>...]
 ```
 
-`routing_key` is 20 bytes (the QUIC v1 DCID maximum); `secret` is 16 bytes. The blob is 36 bytes → 48 base64url chars. An IPv6 relay literal is bracketed (`?r=[2001:db8::1]:443`); `Token::from_url` strips the brackets, so each `RelayEndpoint::host` is a bare hostname/literal. One `?r=` per relay (`Token::relays: Vec<RelayEndpoint>`); a single-`?r=` URL is the back-compatible degenerate case.
+45 bytes → 60 base64url chars. An IPv6 relay literal is bracketed (`?r=[2001:db8::1]:443`); `Token::from_url` strips the brackets, so each `RelayEndpoint::host` is a bare hostname/literal. One `?r=` per relay (`Token::relays: Vec<RelayEndpoint>`). A 36-byte (pre-share-id) link is refused.
 
 ### Multiple relays
 
 `Config.relays` / `Token.relays` carry one or more relay endpoints (in preference order). The model is fully generic — used for dual-stack reachability AND censorship-fallback:
 
-- **Sharer registers with ALL relays** on one socket. The socket is dual-stack (`::`, `IPV6_V6ONLY` off) when the relay set includes any v6 endpoint, so it reaches both families and accepts client Initials forwarded by any relay (v4 relays appear v4-mapped); a pure-v4 relay set keeps a plain `0.0.0.0` socket. `register_loop` takes a `Vec<SocketAddr>` and tolerates per-relay send failures (a v4-only host silently skips a v6 relay).
+- **Sharer registers with ALL relays of the share** on one socket (each with its own credential). The socket is dual-stack (`::`, `IPV6_V6ONLY` off) when the relay set includes any v6 endpoint, so it reaches both families and accepts client Initials forwarded by any relay (v4 relays appear v4-mapped); a pure-v4 relay set keeps a plain `0.0.0.0` socket. `register_loop` takes a `Vec<SocketAddr>` and tolerates per-relay send failures (a v4-only host silently skips a v6 relay).
 - **Client tries relays IPv6-first** (`resolve_relays_preferring_v6`), each with a family-matched socket, under `Timings.relay_dial_timeout` (default 8s), until one bootstraps a relay-via session. The list is re-resolved and re-ordered on every (re)dial (`resolve_for_dial`), so DNS changes and censorship failover take effect on reconnect; a lookup that fails falls back to the last addresses that resolved — a poisoned resolver must not cost the client the addresses it already had — and both the failure and the fallback land in the connection record. Regression test: `cargo test -p spora-lab --test record -- redial`. Preferring a v6 relay is the lever that drives a v6 hole punch (`path_ipv6` comes from the chosen relay's family), which succeeds far more often (firewall-only, no NAT). A dead relay, a censored one, and a relay the sharer never registered with (family mismatch) all look identical — a dropped Initial — and all fail over to the next.
 - **A hostname with A+AAAA records expands to two endpoints** at resolve time (`resolve_one_relay` returns every resolved address), independently on each side — so it behaves exactly as if both IPs were listed.
 - The relay itself is unchanged: each does its dumb DCID-routed forwarding; the sharer's registrations and the clients' flows are per-relay and independent.
@@ -291,7 +297,7 @@ Both axes are supported and lab-tested (`cargo test -p spora-lab --test ipv6`; n
 
 ### Connection log (`spora-core/src/connlog.rs`, see `.local/docs/connection-logging.md`)
 
-The sharer keeps a local NetFlow-style per-flow record ("which client connected to destination IP X during [T1,T2]") — the sharer's egress accountability record for abuse/LE queries. `Config.conn_log: Option<ConnLogConfig>`; core defaults to off, **platforms enable by default** (CLI: `$XDG_STATE_HOME/spora/connlog/<routing-key>/`, `--no-conn-log` to disable; FFI: `conn_log_dir` param; wincore: proto fields, `%PROGRAMDATA%\Spora\connlog\<rk>`). Key facts:
+The sharer keeps a local NetFlow-style per-flow record ("which client connected to destination IP X during [T1,T2]") — the sharer's egress accountability record for abuse/LE queries. `Config.conn_log: Option<ConnLogConfig>`; core defaults to off, **platforms enable by default** (CLI: `$XDG_STATE_HOME/spora/connlog/<routing-hash>/` (one per share), `--no-conn-log` to disable; FFI: `conn_log_dir` param; wincore: proto fields, `%PROGRAMDATA%\Spora\connlog\<rk>`). Key facts:
 
 - Storage is SQLite (WAL) on a dedicated writer thread fed by a bounded channel — hooks never block the tunnel; overflow/IO trouble becomes visible `log_gap` marks (plus `clock_jump`, `share_start/stop`, `flow_throttle`), because an absence of records must be distinguishable from absence of traffic. `share()` fails loudly if the log dir is unwritable.
 - Two meters, one log: the netstack exit logs flows at its re-origination points (TCP/UDP, byte counts via `CountedIo`/NAT-entry counters, and `getsockname()` as the **egress source address** — the attribution-critical field; forwarded DNS is one flow per query, against the upstream actually used); `ExitMode::Custom` gets a passive `MeteredTransport` wrapped around the handler's transport (records marked `confirmed=false`, "offered to tunnel"); `--os-routing` enriches those with the post-MASQUERADE port via a conntrack lookup. Flow records are rate-limited per session (token bucket; suppression summarized in marks). `FlowGuard` is a Drop-guard, so abort-driven teardown still closes records.
@@ -588,7 +594,7 @@ Composition (client side): `QuicPeerTransport → UpgradableTransport → KeepAl
 - Default relay: `167.71.66.250:443` (UDP, not TLS now — the relay speaks no protocol other than the magic-prefix control packets and QUIC pass-through)
 - Default telemetry API: `https://truecdn.net` (`spora_service::DEFAULT_API_BASES`, the built-in API's fronts; a release may change them without devices re-registering) — PRODUCTION; dev runs pin `SPORA_API` (see "Never contact production from development").
 - Telemetry: uploader every 15 min, nudged passes ~2 s after the nudge, backoff 1 min → 1 h (a server's `Retry-After` honoured up to 24 h), force flag fetched at most daily, at most 4 parked registrations; chunks ≤ 256 KiB, a line ≤ 1 MiB; refused files rest 24 h. Diagnostic log: 1 MiB files, 16 MiB / 14 days in all, per call site 60 lines then 1 per 10 s. Bug report: 72 h, 24 MiB.
-- Routing-key length: 20 bytes (fits in a QUIC v1 DCID)
+- Routing-hash and cert-hash length: 20 bytes (fits in a QUIC v1 DCID); share id 8 bytes
 - Secret length: 16 bytes
 - Register interval: 30s. Relay registration timeout: 120s. Flow timeout: 60s.
 - DNS forwarder: synthetic resolver `100.64.0.53:53` (CGNAT space, never a LAN); 2s per attempt, 3 attempts per query, 3 strikes → 30s quarantine, system list re-read every 30s; public fallback 8.8.8.8 + 1.1.1.1.

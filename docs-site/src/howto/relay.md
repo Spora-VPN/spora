@@ -8,9 +8,9 @@ holds no keys, and speaks no protocol of its own beyond a registration
 message.
 
 The relay ships as its own tarball in the same GitHub release
-(`spora-relay-…`, which contains the `spora-relay` binary and the
-`spora-issuer` token tool) and builds from the same repository (where a
-source build names the binary plain `relay`).
+(`spora-relay-…`, which contains the `spora-relay` binary) and builds from
+the same repository (where a source build names the binary plain
+`relay`).
 
 ```bash
 # on a machine with a public address
@@ -42,7 +42,16 @@ both and let clients fall back.
 ## Restricting who may use your relay
 
 An open relay forwards for any sharer that registers. To limit yours to
-sharers you have authorized, the relay supports capability tokens; the
-repository's [relay/README.md](https://github.com/Spora-VPN/spora/blob/main/relay/README.md)
-covers issuing them, the alternative TCP and Noise carriers for networks
-that block UDP or fingerprint QUIC, and the relay's own session log.
+sharers you have given a token, start it with one:
+
+```bash
+spora-relay --port 51820 --token-file relay.token
+
+spora share --relay your.host:51820 --relay-token relay.token
+```
+
+The token stays on the sharing machine, in the share; it is not part of
+the URL. The repository's
+[relay/README.md](https://github.com/Spora-VPN/spora/blob/main/relay/README.md)
+covers the alternative TCP and Noise carriers for networks that block UDP
+or fingerprint QUIC, and the relay's own session log.

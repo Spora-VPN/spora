@@ -10,17 +10,17 @@ same text.
 
 ## `spora share`
 
-Share over a tunnel. Loads (or creates on first run) a persistent identity at $XDG_CONFIG_HOME/spora/identity.bin so the share URL stays the same across invocations
+Share over a tunnel. Serves the share kept at $XDG_CONFIG_HOME/spora/share.bin (made on the first run), so the share URL stays the same across invocations. The relays are part of the share (and of its URL): relay flags that differ from the stored share's make a new share, with a new URL
 
 ```text
 spora share [OPTIONS]
 ```
 
-**`--identity-file <IDENTITY_FILE>`**  
-Override the identity file path
+**`--share-file <SHARE_FILE>`**  
+Override the share file path
 
 **`--fresh`** *(default `false`)*  
-Generate a fresh identity for this run and overwrite the persisted one
+Make a new share (a new URL) and overwrite the stored one
 
 **`--os-routing`** *(default `false`)*  
 Bypass the userland netstack: write client packets to a TUN device and let the kernel route/NAT them. Requires root (or CAP_NET_ADMIN). Linux only
@@ -56,7 +56,7 @@ Override the ordered STUN servers (host:port) used for direct-upgrade endpoint d
 Keep the session on its initial relay/carrier path instead of attempting a direct upgrade
 
 **`--relay-token <RELAY_TOKEN>`**  
-Capability token authorizing this sharer to use the relay(s), when the relay requires one. Accepts a base64url token (as printed by `spora-issuer issue`) or a path to a file containing it. Not needed for open-mode relays
+Token for the relays given with --relay, --tcp-relay and --nz-relay, when they want one (a self-hosted relay run with --token or --token-file). The token itself or a path to a file containing it; surrounding whitespace is trimmed. Kept in the share, never in its URL
 
 **`--no-conn-log`** *(default `false`)*  
 Disable the connection log. By default the sharer keeps a local per-flow record (who connected to which destination, when) at $XDG_STATE_HOME/spora/connlog/\<routing-key\>/ (in root's home for a run with sudo), the sharer's own egress accountability record for answering abuse reports
@@ -199,10 +199,10 @@ Window end (same formats as --from)
 Machine-readable JSON output (for export/handover)
 
 **`--dir <DIR>`**  
-Log directory (default: derived from the identity file; overrides --identity-file when both are given)
+Log directory (default: derived from the share file; overrides --share-file when both are given)
 
-**`--identity-file <IDENTITY_FILE>`**  
-Identity file used to locate the default log directory
+**`--share-file <SHARE_FILE>`**  
+Share file used to locate the default log directory
 
 ## `spora log sessions`
 
@@ -214,7 +214,7 @@ spora log sessions [OPTIONS]
 
 **`--dir <DIR>`**  
 
-**`--identity-file <IDENTITY_FILE>`**  
+**`--share-file <SHARE_FILE>`**  
 
 ## `spora log hold`
 
@@ -240,10 +240,10 @@ spora log hold add [OPTIONS] --from <FROM> --to <TO>
 Why this hold exists (e.g. the case/reference number)
 
 **`--dir <DIR>`**  
-Log directory; overrides --identity-file when both are given
+Log directory; overrides --share-file when both are given
 
-**`--identity-file <IDENTITY_FILE>`**  
-Identity file used to locate the default log directory
+**`--share-file <SHARE_FILE>`**  
+Share file used to locate the default log directory
 
 ## `spora log hold list`
 
@@ -255,7 +255,7 @@ spora log hold list [OPTIONS]
 
 **`--dir <DIR>`**  
 
-**`--identity-file <IDENTITY_FILE>`**  
+**`--share-file <SHARE_FILE>`**  
 
 ## `spora log hold remove`
 
@@ -269,7 +269,7 @@ spora log hold remove [OPTIONS] <ID>
 
 **`--dir <DIR>`**  
 
-**`--identity-file <IDENTITY_FILE>`**  
+**`--share-file <SHARE_FILE>`**  
 
 ## `spora log hold help`
 
@@ -599,7 +599,7 @@ spora help [COMMAND]
 
 ## `spora help share`
 
-Share over a tunnel. Loads (or creates on first run) a persistent identity at $XDG_CONFIG_HOME/spora/identity.bin so the share URL stays the same across invocations
+Share over a tunnel. Serves the share kept at $XDG_CONFIG_HOME/spora/share.bin (made on the first run), so the share URL stays the same across invocations. The relays are part of the share (and of its URL): relay flags that differ from the stored share's make a new share, with a new URL
 
 ```text
 spora help share

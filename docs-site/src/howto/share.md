@@ -14,11 +14,14 @@ spora share
 The printed `https://spora.to/s/…` link is the whole secret: whoever has it
 can route traffic through your connection. Send it over a channel you
 trust, and to people you trust. If it leaks, run `spora share --fresh` to
-generate a new identity (and a new URL); the old link stops working.
+make a new share (and a new URL); the old link stops working.
 
-The URL stays stable across restarts because the identity behind it is
-persisted at `~/.config/spora/identity.bin`. Copy that file to move a share
-to another machine, or keep several identities with `--identity-file`.
+The URL stays stable across restarts because the share behind it is kept
+at `~/.config/spora/share.bin`, with this machine's device identity beside
+it in `device.bin`. Copy both to move a share to another machine, or keep
+several shares with `--share-file`. The relays are part of the share and
+of its URL: running with other relay flags than the share was made with
+makes a new share, with a new URL.
 
 One share serves one client at a time. If a second client connects with the
 same URL, it replaces the first.

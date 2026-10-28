@@ -2,10 +2,10 @@
 //!
 //! A acts as a QUIC server bound to a local UDP socket; B acts as a QUIC
 //! client. When B dials A through the relay, B's first Initial packet
-//! carries `DCID = routing_key` (set via `ClientConfig::initial_dst_cid_provider`)
+//! carries `DCID = routing_hash` (set via `ClientConfig::initial_dst_cid_provider`)
 //! so the dumb forwarder can match B to a registered A.
 //!
-//! Cert pinning uses [`RoutingKeyVerifier`] on B's side. After the QUIC
+//! Cert pinning uses [`CertHashVerifier`] on B's side. After the QUIC
 //! handshake completes, B opens a bidi stream and sends the 16-byte
 //! `secret`; A reads it, verifies, and accepts the session. The same bidi
 //! stream is then reused as the [`SignalChannel`] for out-of-band
@@ -20,7 +20,7 @@ use quinn::Connection;
 use subtle::ConstantTimeEq;
 
 use crate::Timings;
-use crate::identity::{Identity, ROUTING_KEY_LEN, RoutingKeyVerifier, SECRET_LEN};
+use crate::identity::{CertHash, CertHashVerifier, RoutingHash, SECRET_LEN, ShareIdentity};
 use crate::record::{Fault, Reason};
 use crate::signal::SignalChannel;
 use crate::transport::quic::{QuicPeerTransport, build_transport_config};
@@ -29,7 +29,7 @@ use crate::transport::quic::{QuicPeerTransport, build_transport_config};
 // ClientHello is derivable from a QUIC Initial, so a project-specific value
 // positively identifies Spora. Both ends still agree on this exact byte string,
 // so negotiation succeeds — no HTTP/3 semantics are involved. Authentication is
-// the cert pinning (RoutingKeyVerifier), so ALPN/SNI carry no security weight.
+// the cert pinning (CertHashVerifier), so ALPN/SNI carry no security weight.
 const E2E_ALPN: &[u8] = b"h3";
 // rustls verification name for the (fingerprint-pinned) connection. SNI is
 // suppressed on the wire (`enable_sni = false`, see `client_endpoint`), so this
@@ -58,7 +58,7 @@ pub struct E2eSession {
 /// used afterwards (e.g. for direct-upgrade attempts).
 pub fn server_endpoint(
     socket: std::net::UdpSocket,
-    identity: &Identity,
+    identity: &ShareIdentity,
     timings: &Timings,
 ) -> Result<quinn::Endpoint, Fault> {
     let mut server_crypto = rustls::ServerConfig::builder()
@@ -190,14 +190,15 @@ pub async fn authenticate_incoming(
 // ---------- Client (B) ----------
 
 /// Build a quinn client `Endpoint` for B, bound to `socket`. The
-/// `ClientConfig` pins certs to `routing_key` and overrides the initial
-/// DCID to the same value so the dumb relay can route the first Initial.
+/// `ClientConfig` pins certs to `cert_hash` and overrides the initial DCID to
+/// `routing_hash` so the dumb relay can route the first Initial.
 pub fn client_endpoint(
     socket: std::net::UdpSocket,
-    routing_key: [u8; ROUTING_KEY_LEN],
+    cert_hash: CertHash,
+    routing_hash: RoutingHash,
     timings: &Timings,
 ) -> Result<quinn::Endpoint, Fault> {
-    client_endpoint_with_dcid(socket, routing_key, timings, true)
+    client_endpoint_with_dcid(socket, cert_hash, routing_hash, timings, true)
 }
 
 /// [`client_endpoint`] with the initial-DCID override selectable. The
@@ -207,15 +208,16 @@ pub fn client_endpoint(
 /// draining on the sharer's endpoint, quinn routes a new client's Initials
 /// into it and they are swallowed without a response. `rk_initial_dcid:
 /// false` keeps quinn's random DCIDs (cert pinning is unaffected — that runs
-/// on `routing_key` regardless).
+/// on `cert_hash` regardless).
 pub fn client_endpoint_with_dcid(
     socket: std::net::UdpSocket,
-    routing_key: [u8; ROUTING_KEY_LEN],
+    cert_hash: CertHash,
+    routing_hash: RoutingHash,
     timings: &Timings,
     rk_initial_dcid: bool,
 ) -> Result<quinn::Endpoint, Fault> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = Arc::new(RoutingKeyVerifier::new(routing_key, provider.clone()));
+    let verifier = Arc::new(CertHashVerifier::new(cert_hash, provider.clone()));
 
     let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -224,7 +226,7 @@ pub fn client_endpoint_with_dcid(
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     client_crypto.alpn_protocols = vec![E2E_ALPN.to_vec()];
-    // Don't advertise SNI: pinning is by routing key (cert fingerprint), so the
+    // Don't advertise SNI: pinning is by cert hash (cert fingerprint), so the
     // server name has no security value, and a fixed product-specific SNI would
     // be a global on-wire selector. (Absent SNI is itself a weak signal; a
     // realistic per-deployment SNI is a later masquerade option.)
@@ -236,7 +238,7 @@ pub fn client_endpoint_with_dcid(
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
     client_config.transport_config(Arc::new(build_transport_config(timings.quic_idle_timeout)));
     if rk_initial_dcid {
-        let rk_bytes = routing_key.to_vec();
+        let rk_bytes = routing_hash.to_vec();
         client_config
             .initial_dst_cid_provider(Arc::new(move || quinn::ConnectionId::new(&rk_bytes)));
     }
@@ -361,17 +363,17 @@ mod tests {
     fn split_a_socket(
         std_sock: std::net::UdpSocket,
         relay_addr: SocketAddr,
-        identity: &Identity,
+        identity: &ShareIdentity,
     ) -> (std::net::UdpSocket, tokio::task::JoinHandle<()>) {
         split_a_socket_token(std_sock, relay_addr, identity, None)
     }
 
-    /// Like [`split_a_socket`] but attaches a capability `token` to every
-    /// registration (for authz scenarios). `None` registers in open mode.
+    /// Like [`split_a_socket`] but presents a static `token` with every
+    /// registration (for authorization scenarios). `None` presents nothing.
     fn split_a_socket_token(
         std_sock: std::net::UdpSocket,
         relay_addr: SocketAddr,
-        identity: &Identity,
+        identity: &ShareIdentity,
         token: Option<Vec<u8>>,
     ) -> (std::net::UdpSocket, tokio::task::JoinHandle<()>) {
         let clone = std_sock.try_clone().expect("try_clone");
@@ -380,14 +382,23 @@ mod tests {
         let signer = relay_client::protocol::RegisterSigner::new(
             &identity.cert_der_bytes,
             &identity.key_der_bytes,
+            identity.share_id,
         )
-        .expect("register signer")
-        .with_token(token);
+        .expect("register signer");
+        let credential = match token {
+            Some(t) => relay_client::Credential::Static(t),
+            None => relay_client::Credential::None,
+        };
         let h = tokio::spawn(relay_client::register_loop(
             Arc::new(tokio_clone),
-            vec![relay_addr],
+            relay_client::protocol::RegisterKind::Quic,
+            vec![relay_client::RegisterTarget {
+                addr: relay_addr,
+                credential,
+            }],
             Duration::from_millis(50), // tight for tests
             Arc::new(std::sync::Mutex::new(signer)),
+            relay_client::Credentials::new(None),
         ));
         (std_sock, h)
     }
@@ -398,8 +409,8 @@ mod tests {
         let (relay_addr, _relay_h) = start_relay().await;
 
         // A's side: identity, socket, register loop, server endpoint.
-        let identity = Identity::generate();
-        let routing_key = identity.routing_key;
+        let identity = ShareIdentity::generate();
+        let routing_hash = identity.routing_hash;
         let secret = identity.secret;
 
         let a_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -413,7 +424,8 @@ mod tests {
         // B's side.
         let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         b_std.set_nonblocking(true).unwrap();
-        let b_endpoint = client_endpoint(b_std, routing_key, &Timings::default()).unwrap();
+        let b_endpoint =
+            client_endpoint(b_std, identity.cert_hash, routing_hash, &Timings::default()).unwrap();
 
         // Drive A's accept and B's connect concurrently.
         let accept_task = tokio::spawn(async move {
@@ -464,18 +476,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e2e_client_rejects_unregistered_routing_key() {
+    async fn e2e_client_rejects_unregistered_routing_hash() {
         let _ = env_logger::builder().is_test(true).try_init();
         let (relay_addr, _relay_h) = start_relay().await;
 
         // No A registered. B tries to connect with a routing key the relay
         // doesn't know — the relay drops the Initial, so B's handshake
         // times out.
-        let identity = Identity::generate();
+        let identity = ShareIdentity::generate();
 
         let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         b_std.set_nonblocking(true).unwrap();
-        let b_endpoint = client_endpoint(b_std, identity.routing_key, &Timings::default()).unwrap();
+        let b_endpoint = client_endpoint(
+            b_std,
+            identity.cert_hash,
+            identity.routing_hash,
+            &Timings::default(),
+        )
+        .unwrap();
 
         let result = client_connect(&b_endpoint, relay_addr, &identity.secret, true).await;
         assert!(result.is_err(), "should fail when no A is registered");
@@ -483,20 +501,21 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_authz_gated_relay_requires_a_valid_token() {
-        // End-to-end over real sockets: a relay configured with an issuer key
-        // only routes sharers that present a valid capability token. A tokenless
-        // sharer's registration is refused, so the client cannot be routed to it
-        // (its Initial is dropped and the handshake times out); an authorized
-        // sharer connects normally.
+        // End-to-end over real sockets: a relay that wants a token only
+        // routes sharers that present it. A tokenless sharer's registration
+        // is refused, so the client cannot be routed to it (its Initial is
+        // dropped and the handshake times out); an authorized sharer
+        // connects normally.
         let _ = env_logger::builder().is_test(true).try_init();
-        let issuer = relay_client::authz::IssuerKeyPair::generate().unwrap();
         let relay_sock = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay_sock.local_addr().unwrap();
-        let state = relay::State::default().with_issuer_keys(vec![issuer.public_key()]);
+        let state = relay::State::default().with_authorizer(Arc::new(
+            relay::authz::StaticToken::new(b"bearer".to_vec()).unwrap(),
+        ));
         let _relay_h = tokio::spawn(relay::serve(relay_sock, state));
 
-        let identity = Identity::generate();
-        let routing_key = identity.routing_key;
+        let identity = ShareIdentity::generate();
+        let routing_hash = identity.routing_hash;
         let secret = identity.secret;
 
         // Unauthorized: no token -> gated relay refuses the registration.
@@ -508,7 +527,8 @@ mod tests {
 
         let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         b_std.set_nonblocking(true).unwrap();
-        let b_endpoint = client_endpoint(b_std, routing_key, &Timings::default()).unwrap();
+        let b_endpoint =
+            client_endpoint(b_std, identity.cert_hash, routing_hash, &Timings::default()).unwrap();
         let unauthorized = client_connect(&b_endpoint, relay_addr, &secret, true).await;
         assert!(
             unauthorized.is_err(),
@@ -516,8 +536,8 @@ mod tests {
         );
         reg_h.abort();
 
-        // Authorized: a valid token for this routing key -> relay routes it.
-        let token = issuer.issue(&routing_key);
+        // Authorized: the relay's token -> relay routes it.
+        let token = b"bearer".to_vec();
         let a2_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         a2_std.set_nonblocking(true).unwrap();
         let (a2_for_quinn, _reg_h2) =
@@ -527,7 +547,13 @@ mod tests {
 
         let b2_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         b2_std.set_nonblocking(true).unwrap();
-        let b2_endpoint = client_endpoint(b2_std, routing_key, &Timings::default()).unwrap();
+        let b2_endpoint = client_endpoint(
+            b2_std,
+            identity.cert_hash,
+            routing_hash,
+            &Timings::default(),
+        )
+        .unwrap();
         let accept_task = tokio::spawn(async move {
             accept_one(&a2_endpoint, &secret, true)
                 .await
@@ -545,8 +571,8 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let (relay_addr, _relay_h) = start_relay().await;
 
-        let identity = Identity::generate();
-        let routing_key = identity.routing_key;
+        let identity = ShareIdentity::generate();
+        let routing_hash = identity.routing_hash;
         let secret = identity.secret;
 
         let a_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -561,7 +587,8 @@ mod tests {
 
         let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         b_std.set_nonblocking(true).unwrap();
-        let b_endpoint = client_endpoint(b_std, routing_key, &Timings::default()).unwrap();
+        let b_endpoint =
+            client_endpoint(b_std, identity.cert_hash, routing_hash, &Timings::default()).unwrap();
 
         let accept_task =
             tokio::spawn(async move { accept_one(&a_endpoint, &secret, true).await.unwrap() });
@@ -664,7 +691,7 @@ mod tests {
     // the whole session. This guards the premise of that timeout.
     #[tokio::test]
     async fn accept_one_blocks_without_a_peer_and_must_be_timed_out() {
-        let identity = Identity::generate();
+        let identity = ShareIdentity::generate();
         let s_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         s_std.set_nonblocking(true).unwrap();
         let server_ep = server_endpoint(s_std, &identity, &Timings::default()).unwrap();
@@ -688,9 +715,10 @@ mod tests {
     #[tokio::test]
     async fn stalled_auth_does_not_block_other_peers() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let identity = Identity::generate();
+        let identity = ShareIdentity::generate();
         let secret = identity.secret;
-        let rk = identity.routing_key;
+        let rk = identity.routing_hash;
+        let cert_hash = identity.cert_hash;
 
         let s_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         s_std.set_nonblocking(true).unwrap();
@@ -721,7 +749,7 @@ mod tests {
         let legit = tokio::time::timeout(Duration::from_secs(3), async {
             let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             b_std.set_nonblocking(true).unwrap();
-            let b_ep = client_endpoint(b_std, rk, &Timings::default()).unwrap();
+            let b_ep = client_endpoint(b_std, cert_hash, rk, &Timings::default()).unwrap();
             let _b = client_connect(&b_ep, s_addr, &secret, false)
                 .await
                 .expect("legit client should authenticate");

@@ -70,7 +70,7 @@ jobs:
 
       - name: Verify binaries
         run: |
-          for pkg in spora-cli relay spora-issuer; do
+          for pkg in spora-cli relay; do
             info=$(file -b "target/${{ matrix.target }}/release/$pkg")
             echo "$pkg: $info"
             grep -qE 'statically linked|static-pie' <<<"$info" \
@@ -91,8 +91,7 @@ jobs:
           tar -C stage -czf "dist/spora-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" spora
           rm stage/spora
           install -s -m 755 target/${{ matrix.target }}/release/relay stage/spora-relay
-          install -s -m 755 target/${{ matrix.target }}/release/spora-issuer stage/spora-issuer
-          tar -C stage -czf "dist/spora-relay-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" spora-relay spora-issuer
+          tar -C stage -czf "dist/spora-relay-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" spora-relay
 
       - uses: actions/upload-artifact@v7
         with:

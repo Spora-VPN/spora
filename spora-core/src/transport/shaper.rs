@@ -4,7 +4,7 @@
 //!
 //! It is applied between `frame_data` and the UDP socket (`obfuscate`) and
 //! reversed at the raw recv points before demux (`deobfuscate`). The key is
-//! derived from `routing_key || secret`, so both peers agree with no on-wire
+//! derived from `routing_hash || secret`, so both peers agree with no on-wire
 //! negotiation and the transform carries no cross-user signature (the AmneziaWG
 //! lesson). It is always-on for the nz carrier — the transform costs one 4-byte
 //! HMAC per data packet and adds zero data-plane bytes, so there is no reason to
@@ -15,7 +15,7 @@
 //!   demux field (the `recv_index`, or msg1's echoed `idx_B` on msg2), keyed off
 //!   the 8 wire bytes at `[4..12]` (the header-protected counter, which is unique
 //!   per packet). No length change → no MTU cost. Closes the index-echo tell.
-//! - **msg1** (the only relay-read packet) — keep `routing_key[0..20]` cleartext
+//! - **msg1** (the only relay-read packet) — keep `routing_hash[0..20]` cleartext
 //!   so the dumb relay still routes, then an 8-byte per-packet nonce, a keystream
 //!   mask over the 52-byte body (idx_B + NNpsk0 msg1), and random pad. Re-rolled
 //!   on every retransmit. Closes the fixed-size and raw-ephemeral tells on the
@@ -29,17 +29,17 @@ use std::sync::Arc;
 
 use ring::hmac;
 
-use crate::identity::ROUTING_KEY_LEN;
+use crate::identity::ROUTING_HASH_LEN;
 
 /// A shaper shared (cloned) across a session's send path, its signal channel, and
-/// its receive pump — one instance per identity, keyed off `routing_key||secret`.
+/// its receive pump — one instance per identity, keyed off `routing_hash||secret`.
 pub(crate) type SharedShaper = Arc<dyn Shaper>;
 
 /// The nz carrier's wire shaper for a given identity. Always the v1 scramble —
 /// the transform is ~free (one 4-byte HMAC per data packet, zero added bytes), so
 /// bare nz is never shipped.
-pub(crate) fn nz_shaper(routing_key: &[u8; ROUTING_KEY_LEN], secret: &[u8]) -> SharedShaper {
-    Arc::new(ScrambleV1::new(routing_key, secret))
+pub(crate) fn nz_shaper(routing_hash: &[u8; ROUTING_HASH_LEN], secret: &[u8]) -> SharedShaper {
+    Arc::new(ScrambleV1::new(routing_hash, secret))
 }
 
 /// Leading demux field masked on data-class packets (`recv_index`, or msg1's
@@ -56,20 +56,20 @@ const DATA_MASKABLE_MIN: usize = NONCE_HI;
 
 /// Per-packet nonce length on the msg1 handshake transform.
 const MSG1_NONCE: usize = 8;
-/// Fixed framed msg1 length: routing_key(20) + idx_B(4) + NNpsk0 msg1(48).
-const MSG1_FRAMED_LEN: usize = ROUTING_KEY_LEN + 4 + 48;
-/// Masked body of msg1 — everything after the cleartext routing_key.
-const MSG1_BODY: usize = MSG1_FRAMED_LEN - ROUTING_KEY_LEN;
+/// Fixed framed msg1 length: routing_hash(20) + idx_B(4) + NNpsk0 msg1(48).
+const MSG1_FRAMED_LEN: usize = ROUTING_HASH_LEN + 4 + 48;
+/// Masked body of msg1 — everything after the cleartext routing_hash.
+const MSG1_BODY: usize = MSG1_FRAMED_LEN - ROUTING_HASH_LEN;
 /// Max random pad appended to a shaped msg1, spreading it out of the fixed size.
 const MSG1_PAD_MAX: usize = 256;
-/// Smallest shaped msg1 the receiver will parse: routing_key + nonce + body.
-const MSG1_WIRE_MIN: usize = ROUTING_KEY_LEN + MSG1_NONCE + MSG1_BODY;
+/// Smallest shaped msg1 the receiver will parse: routing_hash + nonce + body.
+const MSG1_WIRE_MIN: usize = ROUTING_HASH_LEN + MSG1_NONCE + MSG1_BODY;
 
 /// A reversible, keyed, per-datagram wire transform applied outside the Noise
 /// framing. Send/receive halves share one instance (`Arc`), keyed per identity.
 pub(crate) trait Shaper: Send + Sync {
     /// Transform one fully-framed datagram for the wire. `is_first` marks the
-    /// handshake msg1, whose routing_key prefix must stay cleartext for the relay.
+    /// handshake msg1, whose routing_hash prefix must stay cleartext for the relay.
     fn obfuscate(&self, framed: &[u8], is_first: bool) -> Vec<u8>;
     /// Reverse `obfuscate`. TOTAL: returns `None` on any datagram that is not a
     /// valid shaped packet, and never panics on arbitrary/truncated input.
@@ -93,21 +93,21 @@ impl Shaper for Identity {
 /// The v1 nz shaper. See the module docs.
 pub(crate) struct ScrambleV1 {
     key: hmac::Key,
-    routing_key: [u8; ROUTING_KEY_LEN],
+    routing_hash: [u8; ROUTING_HASH_LEN],
 }
 
 impl ScrambleV1 {
-    pub(crate) fn new(routing_key: &[u8; ROUTING_KEY_LEN], secret: &[u8]) -> Self {
+    pub(crate) fn new(routing_hash: &[u8; ROUTING_HASH_LEN], secret: &[u8]) -> Self {
         // Domain-separated from derive_psk / derive_hp_key.
         let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
         ctx.update(b"spora-nz-shaper-v1");
-        ctx.update(routing_key);
+        ctx.update(routing_hash);
         ctx.update(secret);
         let mut k = [0u8; 32];
         k.copy_from_slice(ctx.finish().as_ref());
         Self {
             key: hmac::Key::new(hmac::HMAC_SHA256, &k),
-            routing_key: *routing_key,
+            routing_hash: *routing_hash,
         }
     }
 
@@ -147,7 +147,7 @@ impl ScrambleV1 {
 impl Shaper for ScrambleV1 {
     fn obfuscate(&self, framed: &[u8], is_first: bool) -> Vec<u8> {
         if is_first {
-            // msg1: routing_key(20) | nonce(8) | mask(body[52]) | pad.
+            // msg1: routing_hash(20) | nonce(8) | mask(body[52]) | pad.
             debug_assert_eq!(
                 framed.len(),
                 MSG1_FRAMED_LEN,
@@ -156,9 +156,9 @@ impl Shaper for ScrambleV1 {
             let nonce: [u8; MSG1_NONCE] = rand::random();
             let ks = self.msg1_keystream(&nonce, MSG1_BODY);
             let mut out = Vec::with_capacity(MSG1_WIRE_MIN + MSG1_PAD_MAX);
-            out.extend_from_slice(&framed[..ROUTING_KEY_LEN]);
+            out.extend_from_slice(&framed[..ROUTING_HASH_LEN]);
             out.extend_from_slice(&nonce);
-            for (b, k) in framed[ROUTING_KEY_LEN..].iter().zip(ks.iter()) {
+            for (b, k) in framed[ROUTING_HASH_LEN..].iter().zip(ks.iter()) {
                 out.push(b ^ k);
             }
             // Random-length, random-byte pad — the receiver ignores it (the real
@@ -179,16 +179,16 @@ impl Shaper for ScrambleV1 {
     }
 
     fn deobfuscate(&self, wire: &[u8]) -> Option<Vec<u8>> {
-        if wire.len() >= ROUTING_KEY_LEN && wire[..ROUTING_KEY_LEN] == self.routing_key {
+        if wire.len() >= ROUTING_HASH_LEN && wire[..ROUTING_HASH_LEN] == self.routing_hash {
             // msg1 branch — guard the full slice length before any indexing.
             if wire.len() < MSG1_WIRE_MIN {
                 return None;
             }
-            let nonce = &wire[ROUTING_KEY_LEN..ROUTING_KEY_LEN + MSG1_NONCE];
-            let body = &wire[ROUTING_KEY_LEN + MSG1_NONCE..MSG1_WIRE_MIN];
+            let nonce = &wire[ROUTING_HASH_LEN..ROUTING_HASH_LEN + MSG1_NONCE];
+            let body = &wire[ROUTING_HASH_LEN + MSG1_NONCE..MSG1_WIRE_MIN];
             let ks = self.msg1_keystream(nonce, MSG1_BODY);
             let mut out = Vec::with_capacity(MSG1_FRAMED_LEN);
-            out.extend_from_slice(&wire[..ROUTING_KEY_LEN]);
+            out.extend_from_slice(&wire[..ROUTING_HASH_LEN]);
             for (b, k) in body.iter().zip(ks.iter()) {
                 out.push(b ^ k);
             }
@@ -210,8 +210,8 @@ impl Shaper for ScrambleV1 {
 mod tests {
     use super::*;
 
-    fn rk() -> [u8; ROUTING_KEY_LEN] {
-        let mut k = [0u8; ROUTING_KEY_LEN];
+    fn rk() -> [u8; ROUTING_HASH_LEN] {
+        let mut k = [0u8; ROUTING_HASH_LEN];
         for (i, b) in k.iter_mut().enumerate() {
             *b = i as u8 + 1;
         }
@@ -260,26 +260,29 @@ mod tests {
     }
 
     #[test]
-    fn msg1_round_trips_keeps_routing_key_and_varies() {
+    fn msg1_round_trips_keeps_routing_hash_and_varies() {
         let s = shaper();
         let mut framed = vec![0u8; MSG1_FRAMED_LEN];
-        framed[..ROUTING_KEY_LEN].copy_from_slice(&rk());
-        for (i, b) in framed[ROUTING_KEY_LEN..].iter_mut().enumerate() {
+        framed[..ROUTING_HASH_LEN].copy_from_slice(&rk());
+        for (i, b) in framed[ROUTING_HASH_LEN..].iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(3).wrapping_add(1);
         }
         let w1 = s.obfuscate(&framed, true);
         let w2 = s.obfuscate(&framed, true);
         assert_eq!(
-            &w1[..ROUTING_KEY_LEN],
+            &w1[..ROUTING_HASH_LEN],
             &rk(),
-            "routing_key stays cleartext for the relay"
+            "routing_hash stays cleartext for the relay"
         );
-        assert!(w1.len() >= MSG1_WIRE_MIN, "at least routing_key+nonce+body");
+        assert!(
+            w1.len() >= MSG1_WIRE_MIN,
+            "at least routing_hash+nonce+body"
+        );
         // Fresh nonce + pad each call -> different wire bytes and (usually) length.
         assert_ne!(w1, w2, "retransmits differ (fresh nonce/pad)");
         assert_ne!(
-            &w1[ROUTING_KEY_LEN + MSG1_NONCE..MSG1_WIRE_MIN],
-            &framed[ROUTING_KEY_LEN..],
+            &w1[ROUTING_HASH_LEN + MSG1_NONCE..MSG1_WIRE_MIN],
+            &framed[ROUTING_HASH_LEN..],
             "body is masked"
         );
         assert_eq!(
@@ -293,7 +296,7 @@ mod tests {
     #[test]
     fn keyed_per_identity_no_cross_user_signature() {
         let a = ScrambleV1::new(&rk(), &[1u8; 16]);
-        let b = ScrambleV1::new(&rk(), &[2u8; 16]); // same routing_key, different secret
+        let b = ScrambleV1::new(&rk(), &[2u8; 16]); // same routing_hash, different secret
         let framed: Vec<u8> = (0..40u8).collect();
         assert_ne!(
             a.obfuscate(&framed, false),
@@ -308,15 +311,15 @@ mod tests {
         // Never panics, whatever the length or content.
         for len in 0..90usize {
             let mut buf = vec![0x5au8; len];
-            // half the cases: prefix with routing_key so the msg1 branch is exercised
-            if len >= ROUTING_KEY_LEN && len % 2 == 0 {
-                buf[..ROUTING_KEY_LEN].copy_from_slice(&rk());
+            // half the cases: prefix with routing_hash so the msg1 branch is exercised
+            if len >= ROUTING_HASH_LEN && len % 2 == 0 {
+                buf[..ROUTING_HASH_LEN].copy_from_slice(&rk());
             }
             let _ = s.deobfuscate(&buf); // must not panic
         }
-        // A routing_key-prefixed but too-short packet is rejected, not restored.
+        // A routing_hash-prefixed but too-short packet is rejected, not restored.
         let mut short = vec![0u8; MSG1_WIRE_MIN - 1];
-        short[..ROUTING_KEY_LEN].copy_from_slice(&rk());
+        short[..ROUTING_HASH_LEN].copy_from_slice(&rk());
         assert!(s.deobfuscate(&short).is_none());
     }
 

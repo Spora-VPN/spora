@@ -10,7 +10,7 @@ into the stream.
 
 | event | emitted by | meaning |
 |---|---|---|
-| `share_ready` | share | The share is up and registered. Fields: `url`, `routing_key`, `identity_file`, `tun_name` (with `--os-routing`, else `null`), `record_dir`, `upgrade_enabled`. |
+| `share_ready` | share | The share is up and registered. Fields: `url`, `routing_hash`, `cert_hash`, `share_file`, `tun_name` (with `--os-routing`, else `null`), `record_dir`, `upgrade_enabled`. |
 | `tunnel_ready` | use | The tunnel interface is up and pumping. Fields: `mode` (`"vpn"` or `"attached"`), `tun_name`, `record_dir`, `upgrade_enabled`; in `vpn` mode also `tun_addr`, `tun_addr6` (`null` with `--no-ipv6`), `mtu`, `mtu_policy` (`"auto"` or `"fixed"`), `routes`, `dns`, `dns_method` (`null` when the resolver was left alone). |
 | `stopping` | both | Shutdown has begun (Ctrl+C, SIGTERM, SIGHUP, or console close). From `use` it can also come before any `tunnel_ready`: a signal stops a dial that is still under way. |
 | `session_ended` | share | The client session ended. Field: `reason`. |

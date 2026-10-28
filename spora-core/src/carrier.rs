@@ -29,7 +29,7 @@ use tokio::net::TcpStream;
 
 use crate::e2e::{E2eSession, client_connect};
 use crate::e2e_tls;
-use crate::identity::{ROUTING_KEY_LEN, RelayProtocol, SECRET_LEN};
+use crate::identity::{CertHash, RelayProtocol, RoutingHash, SECRET_LEN};
 use crate::record::{Carrier, Fault, PathKind, Recorder, StepKind};
 use crate::signal::SignalChannel;
 use crate::transport::IpTransport;
@@ -94,7 +94,10 @@ impl PeerSession {
 /// protocols, or the peer's own address for `Direct`.
 pub(crate) struct DialCtx<'a> {
     pub target: SocketAddr,
-    pub routing_key: [u8; ROUTING_KEY_LEN],
+    /// The sharer's device, as the URL names it: what the handshake pins.
+    pub cert_hash: CertHash,
+    /// Where the relay routes us: the DCID, the nz prefix, the CONNECT key.
+    pub routing_hash: RoutingHash,
     pub secret: [u8; SECRET_LEN],
     pub protector: &'a SocketProtector,
     pub timings: &'a Timings,
@@ -128,9 +131,9 @@ pub(crate) fn relay_client_for(protocol: RelayProtocol) -> Box<dyn RelayClient> 
 }
 
 /// Shared QUIC dial (UDP relay + Direct): bind a local UDP socket in the
-/// target's family, pin the cert to `routing_key`, handshake, authenticate
+/// target's family, pin the cert to `cert_hash`, handshake, authenticate
 /// with the secret. `rk_dcid` sets the first Initial's DCID to the routing
-/// key — required on the relay path (it is how the dumb relay routes the
+/// hash — required on the relay path (it is how the dumb relay routes the
 /// Initial), harmful on a Direct dial (a shared DCID collides with the
 /// previous client's live/draining connection on the sharer's endpoint and
 /// the Initials are silently swallowed) — Direct uses random DCIDs.
@@ -154,8 +157,13 @@ async fn quic_dial(ctx: DialCtx<'_>, rk_dcid: bool) -> Result<PeerSession, Fault
             return Err(e);
         }
     };
-    let endpoint =
-        crate::e2e::client_endpoint_with_dcid(std_socket, ctx.routing_key, ctx.timings, rk_dcid)?;
+    let endpoint = crate::e2e::client_endpoint_with_dcid(
+        std_socket,
+        ctx.cert_hash,
+        ctx.routing_hash,
+        ctx.timings,
+        rk_dcid,
+    )?;
     // Handshake and authentication are one step here because `client_connect`
     // does both and the codes it returns already tell them apart.
     let hs = ctx
@@ -198,14 +206,11 @@ async fn tcp_tls_dial(ctx: DialCtx<'_>) -> Result<PeerSession, Fault> {
     };
     let _ = tcp.set_nodelay(true);
     protect_tcp(ctx.protector, &tcp);
-    tcp.write_all(&relay_client::tcp::build_preamble(
-        relay_client::tcp::role::CONNECT,
-        &ctx.routing_key,
-        &[], // clients aren't relay-authorized — their auth is the E2E secret
-    ))
-    .await
-    .map_err(|e| Fault::from_io(&e).context("tcp preamble write"))?;
-    // End-to-end TLS (pinned to routing_key) + secret over the spliced stream.
+    // Clients do not authenticate to relays: their auth is the E2E secret.
+    tcp.write_all(&relay_client::tcp::build_connect(&ctx.routing_hash))
+        .await
+        .map_err(|e| Fault::from_io(&e).context("tcp preamble write"))?;
+    // End-to-end TLS (pinned to cert_hash) + secret over the spliced stream.
     // The relay forwards ciphertext only; this is the E2E channel.
     let hs = ctx
         .rec
@@ -213,7 +218,7 @@ async fn tcp_tls_dial(ctx: DialCtx<'_>) -> Result<PeerSession, Fault> {
         .via(ctx.target)
         .carrier(Carrier::TcpTls)
         .path(PathKind::Relay);
-    let transport = match e2e_tls::connect(tcp, ctx.routing_key, &ctx.secret).await {
+    let transport = match e2e_tls::connect(tcp, ctx.cert_hash, &ctx.secret).await {
         Ok(t) => {
             hs.ok();
             t
@@ -233,7 +238,7 @@ async fn tcp_tls_dial(ctx: DialCtx<'_>) -> Result<PeerSession, Fault> {
 }
 
 /// Noise UDP relay dial: bind a local UDP socket in the relay's family, run the
-/// NNpsk0 handshake to the sharer through the relay (routed by `routing_key` on
+/// NNpsk0 handshake to the sharer through the relay (routed by `routing_hash` on
 /// the first packet), verify A's cert-auth, and hand back the data-plane
 /// transport. Non-QUIC-shaped on the wire; the relay stays dumb and keyless.
 async fn noise_dial(ctx: DialCtx<'_>) -> Result<PeerSession, Fault> {
@@ -268,7 +273,8 @@ async fn noise_dial(ctx: DialCtx<'_>) -> Result<PeerSession, Fault> {
     let mut transport = match crate::transport::noise::noise_connect(
         socket,
         ctx.target,
-        &ctx.routing_key,
+        &ctx.cert_hash,
+        &ctx.routing_hash,
         &ctx.secret,
         ctx.timings.relay_dial_timeout,
         ctx.timings.quic_idle_timeout,

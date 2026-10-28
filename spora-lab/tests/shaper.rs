@@ -75,7 +75,7 @@ fn shaped_nz_has_no_structural_tells() -> Result<(), String> {
     let sharer = peers::start_sharer(&topo.sharer, &opts)?;
     let routing_key = Token::from_url(sharer.url())
         .map_err(|e| format!("parse share url: {e}"))?
-        .routing_key;
+        .routing_hash();
     let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
     client
         .wait_event(is_relay_established, Duration::from_secs(15))

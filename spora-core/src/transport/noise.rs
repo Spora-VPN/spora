@@ -6,12 +6,12 @@
 //! [`crate::e2e_noise`]; this module is the wire framing and the socket driver.
 //!
 //! Wire image (all high-entropy; nothing a passive DPI box can pattern-match on
-//! a per-flow basis except the public `routing_key`, exactly as the QUIC DCID is
+//! a per-flow basis except the public `routing_hash`, exactly as the QUIC DCID is
 //! today):
 //!
 //! ```text
 //! handshake msg1 (B->A, the only relay-read packet):
-//!   routing_key[20] | idx_B[4] | <noise NNpsk0 msg1>          (>= NZ_MSG1_MIN)
+//!   routing_hash[20] | idx_B[4] | <noise NNpsk0 msg1>          (>= NZ_MSG1_MIN)
 //! handshake msg2 (A->B, 5-tuple routed):
 //!   idx_B[4] | idx_A[4] | <noise NNpsk0 msg2>
 //! data / auth (either direction, 5-tuple routed):
@@ -57,7 +57,7 @@ use super::shaper::{SharedShaper, nz_shaper};
 use crate::e2e_noise::{
     NOISE_TAG_LEN, NoiseHandshake, NoiseSession, build_cert_auth, verify_cert_auth,
 };
-use crate::identity::{Identity, ROUTING_KEY_LEN, SECRET_LEN};
+use crate::identity::{CertHash, ROUTING_HASH_LEN, SECRET_LEN, ShareIdentity};
 use crate::record::{Fault, Reason};
 
 /// In-band channel tags (inside the AEAD, invisible on the wire).
@@ -75,9 +75,9 @@ const HP_SAMPLE_LEN: usize = 16;
 /// Smallest legal data packet: header + 1-byte channel + AEAD tag.
 pub(crate) const DATA_MIN_LEN: usize = DATA_HEADER_LEN + 1 + NOISE_TAG_LEN;
 
-/// The relay recognises an nz handshake by a `routing_key` prefix on a packet at
-/// least this long (routing_key + idx + a full NNpsk0 msg1 = 20 + 4 + 48).
-pub(crate) const NZ_MSG1_MIN: usize = ROUTING_KEY_LEN + INDEX_LEN + 48;
+/// The relay recognises an nz handshake by a `routing_hash` prefix on a packet at
+/// least this long (routing_hash + idx + a full NNpsk0 msg1 = 20 + 4 + 48).
+pub(crate) const NZ_MSG1_MIN: usize = ROUTING_HASH_LEN + INDEX_LEN + 48;
 
 /// Fixed tunnel MTU reported to the netstack. A Noise datagram adds
 /// `header(12) + channel(1) + tag(16) = 29` over the inner IP packet; keeping
@@ -312,19 +312,20 @@ async fn recv_matching<F: Fn(&[u8]) -> bool>(
 pub(crate) async fn noise_connect(
     socket: Arc<UdpSocket>,
     relay_addr: SocketAddr,
-    routing_key: &[u8; ROUTING_KEY_LEN],
+    cert_hash: &CertHash,
+    routing_hash: &[u8; ROUTING_HASH_LEN],
     secret: &[u8; SECRET_LEN],
     hs_timeout: Duration,
     idle: Duration,
 ) -> Result<NoisePeerTransport, Fault> {
-    let shaper = nz_shaper(routing_key, secret);
+    let shaper = nz_shaper(routing_hash, secret);
     let (mut rx, pump) = spawn_socket_pump(socket.clone(), shaper.clone());
 
-    let mut hs = NoiseHandshake::initiator(routing_key, secret)?;
+    let mut hs = NoiseHandshake::initiator(routing_hash, secret)?;
     let idx_b: u32 = rand::random();
     let noise_msg1 = hs.write_message(&[])?;
-    let mut msg1 = Vec::with_capacity(ROUTING_KEY_LEN + INDEX_LEN + noise_msg1.len());
-    msg1.extend_from_slice(routing_key);
+    let mut msg1 = Vec::with_capacity(ROUTING_HASH_LEN + INDEX_LEN + noise_msg1.len());
+    msg1.extend_from_slice(routing_hash);
     msg1.extend_from_slice(&idx_b.to_be_bytes());
     msg1.extend_from_slice(&noise_msg1);
     // Retransmit msg1 until msg2 arrives or hs_timeout elapses — a lost first
@@ -413,7 +414,7 @@ pub(crate) async fn noise_connect(
             format!("nz: no cert-auth within {hs_timeout:?}"),
         )
     })??;
-    verify_cert_auth(&auth_pt, routing_key, &session.handshake_hash)?;
+    verify_cert_auth(&auth_pt, cert_hash, &session.handshake_hash)?;
 
     Ok(NoisePeerTransport::spawn(NoiseChannelInit {
         socket,
@@ -440,27 +441,27 @@ pub(crate) async fn noise_accept(
     mut rx: mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
     local_index: u32,
     pump: Option<JoinHandle<()>>,
-    identity: &Identity,
+    identity: &ShareIdentity,
     hs_timeout: Duration,
     idle: Duration,
 ) -> Result<NoisePeerTransport, Fault> {
     // The caller's pump/dispatcher already deobfuscated incoming datagrams, so
     // `rx` carries clean framed bytes; this shaper is for our OUTGOING packets.
-    let shaper = nz_shaper(&identity.routing_key, &identity.secret);
-    // Filter to our own msg1 (routing_key prefix), skipping strays — on the
+    let shaper = nz_shaper(&identity.routing_hash, &identity.secret);
+    // Filter to our own msg1 (routing_hash prefix), skipping strays — on the
     // direct path the punched socket still carries in-flight punch markers.
     let (msg1, peer_addr) = recv_matching(&mut rx, hs_timeout, |d| {
-        d.len() >= NZ_MSG1_MIN && d[0..ROUTING_KEY_LEN] == identity.routing_key
+        d.len() >= NZ_MSG1_MIN && d[0..ROUTING_HASH_LEN] == identity.routing_hash
     })
     .await?;
     let idx_b = u32::from_be_bytes(
-        msg1[ROUTING_KEY_LEN..ROUTING_KEY_LEN + INDEX_LEN]
+        msg1[ROUTING_HASH_LEN..ROUTING_HASH_LEN + INDEX_LEN]
             .try_into()
             .unwrap(),
     );
 
     let mut hs = NoiseHandshake::responder(identity)?;
-    hs.read_message(&msg1[ROUTING_KEY_LEN + INDEX_LEN..])?; // wrong secret fails here
+    hs.read_message(&msg1[ROUTING_HASH_LEN + INDEX_LEN..])?; // wrong secret fails here
     // The caller (the share-side dispatcher) assigns idx_a so it can route this
     // session's later data packets by their recv_index without a decrypt.
     let idx_a: u32 = local_index;
@@ -805,7 +806,7 @@ impl Drop for NoisePeerTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::Identity;
+    use crate::identity::ShareIdentity;
     use futures_util::{SinkExt, StreamExt};
 
     async fn udp(addr: &str) -> Arc<UdpSocket> {
@@ -813,14 +814,14 @@ mod tests {
     }
 
     /// Stand up a connected B<->A nz pair over two loopback UDP sockets.
-    async fn connected_pair(identity: Identity) -> (NoisePeerTransport, NoisePeerTransport) {
+    async fn connected_pair(identity: ShareIdentity) -> (NoisePeerTransport, NoisePeerTransport) {
         let a_sock = udp("127.0.0.1:0").await;
         let b_sock = udp("127.0.0.1:0").await;
         let a_addr = a_sock.local_addr().unwrap();
 
         let (rx_a, pump_a) = spawn_socket_pump(
             a_sock.clone(),
-            nz_shaper(&identity.routing_key, &identity.secret),
+            nz_shaper(&identity.routing_hash, &identity.secret),
         );
         let id = identity.clone();
         let accept = tokio::spawn(async move {
@@ -835,11 +836,12 @@ mod tests {
             )
             .await
         });
-        let rk = identity.routing_key;
+        let rk = identity.routing_hash;
         let secret = identity.secret;
         let connect = noise_connect(
             b_sock,
             a_addr,
+            &identity.cert_hash,
             &rk,
             &secret,
             Duration::from_secs(5),
@@ -860,7 +862,7 @@ mod tests {
 
     #[tokio::test]
     async fn carries_ip_packets_both_directions() {
-        let (mut a, mut b) = connected_pair(Identity::generate()).await;
+        let (mut a, mut b) = connected_pair(ShareIdentity::generate()).await;
 
         let p1 = ipv4_udp(64);
         b.send(p1.clone()).await.unwrap();
@@ -883,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_packet_fragments_and_reassembles_at_the_far_side() {
-        let (mut a, mut b) = connected_pair(Identity::generate()).await;
+        let (mut a, mut b) = connected_pair(ShareIdentity::generate()).await;
         // A 3000-byte IPv4 packet is far larger than NZ_TUNNEL_MTU -> multiple
         // datagrams, each an IPv4 fragment the receiver's stack reassembles. We
         // observe the fragments here.
@@ -930,8 +932,8 @@ mod tests {
     /// if the fast backend is lost, not from machine noise.
     #[test]
     fn crypto_backend_is_fast_enough() {
-        let identity = Identity::generate();
-        let mut hs_b = NoiseHandshake::initiator(&identity.routing_key, &identity.secret).unwrap();
+        let identity = ShareIdentity::generate();
+        let mut hs_b = NoiseHandshake::initiator(&identity.routing_hash, &identity.secret).unwrap();
         let mut hs_a = NoiseHandshake::responder(&identity).unwrap();
         let m1 = hs_b.write_message(&[]).unwrap();
         hs_a.read_message(&m1).unwrap();
@@ -959,8 +961,8 @@ mod tests {
     fn header_protection_hides_the_counter_and_round_trips() {
         // Two packets with adjacent counters must not differ by a fixed +1 in
         // the on-wire counter field, and must still deframe correctly.
-        let identity = Identity::generate();
-        let mut hs_b = NoiseHandshake::initiator(&identity.routing_key, &identity.secret).unwrap();
+        let identity = ShareIdentity::generate();
+        let mut hs_b = NoiseHandshake::initiator(&identity.routing_hash, &identity.secret).unwrap();
         let mut hs_a = NoiseHandshake::responder(&identity).unwrap();
         let m1 = hs_b.write_message(&[]).unwrap();
         hs_a.read_message(&m1).unwrap();
@@ -992,14 +994,14 @@ mod tests {
     /// this asserts the properties on the exact bytes the framing emits.)
     #[test]
     fn wire_image_carries_no_quic_or_counter_fingerprint() {
-        let identity = Identity::generate();
-        let mut hs_b = NoiseHandshake::initiator(&identity.routing_key, &identity.secret).unwrap();
+        let identity = ShareIdentity::generate();
+        let mut hs_b = NoiseHandshake::initiator(&identity.routing_hash, &identity.secret).unwrap();
         let idx_b: u32 = 0xDEAD_BEEF;
         let noise_msg1 = hs_b.write_message(&[]).unwrap();
 
         // Reconstruct the on-wire msg1 exactly as noise_connect frames it.
         let mut msg1 = Vec::new();
-        msg1.extend_from_slice(&identity.routing_key);
+        msg1.extend_from_slice(&identity.routing_hash);
         msg1.extend_from_slice(&idx_b.to_be_bytes());
         msg1.extend_from_slice(&noise_msg1);
 
@@ -1064,7 +1066,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_band_signal_round_trips_both_directions() {
-        let (mut a, mut b) = connected_pair(Identity::generate()).await;
+        let (mut a, mut b) = connected_pair(ShareIdentity::generate()).await;
         let mut a_sig = a.take_signal().expect("A has a signal channel");
         let mut b_sig = b.take_signal().expect("B has a signal channel");
 

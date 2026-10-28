@@ -1,8 +1,9 @@
 use clap::{Parser, Subcommand};
 #[cfg(target_os = "linux")]
 use spora_core::ExitMode;
+use spora_core::identity::{DeviceIdentity, RelayEntry, RoutingHash, Share, hex};
 use spora_core::record::Record;
-use spora_core::{Config, connect, identity::Identity, share};
+use spora_core::{Config, connect};
 use std::path::PathBuf;
 use url::Url;
 
@@ -52,15 +53,16 @@ struct Args {
 
 #[derive(Subcommand, Debug, Clone)]
 enum Mode {
-    /// Share over a tunnel. Loads (or creates on first run) a persistent
-    /// identity at $XDG_CONFIG_HOME/spora/identity.bin so the share URL stays
-    /// the same across invocations.
+    /// Share over a tunnel. Serves the share kept at
+    /// $XDG_CONFIG_HOME/spora/share.bin (made on the first run), so the share
+    /// URL stays the same across invocations. The relays are part of the
+    /// share (and of its URL): relay flags that differ from the stored
+    /// share's make a new share, with a new URL.
     Share {
-        /// Override the identity file path.
-        #[arg(long)]
-        identity_file: Option<PathBuf>,
-        /// Generate a fresh identity for this run and overwrite the
-        /// persisted one.
+        /// Override the share file path.
+        #[arg(long, alias = "identity-file")]
+        share_file: Option<PathBuf>,
+        /// Make a new share (a new URL) and overwrite the stored one.
         #[arg(long)]
         fresh: bool,
         /// Bypass the userland netstack: write client packets to a TUN device
@@ -120,10 +122,11 @@ enum Mode {
         /// attempting a direct upgrade.
         #[arg(long)]
         no_direct_upgrade: bool,
-        /// Capability token authorizing this sharer to use the relay(s), when
-        /// the relay requires one. Accepts a base64url token (as printed by
-        /// `spora-issuer issue`) or a path to a file containing it. Not needed
-        /// for open-mode relays.
+        /// Token for the relays given with --relay, --tcp-relay and
+        /// --nz-relay, when they want one (a self-hosted relay run with
+        /// --token or --token-file). The token itself or a path to a file
+        /// containing it; surrounding whitespace is trimmed. Kept in the
+        /// share, never in its URL.
         #[arg(long)]
         relay_token: Option<String>,
         /// Disable the connection log. By default the sharer keeps a local
@@ -414,20 +417,20 @@ enum LogCmd {
         /// Machine-readable JSON output (for export/handover).
         #[arg(long)]
         json: bool,
-        /// Log directory (default: derived from the identity file;
-        /// overrides --identity-file when both are given).
+        /// Log directory (default: derived from the share file;
+        /// overrides --share-file when both are given).
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// Identity file used to locate the default log directory.
-        #[arg(long)]
-        identity_file: Option<PathBuf>,
+        /// Share file used to locate the default log directory.
+        #[arg(long, alias = "identity-file")]
+        share_file: Option<PathBuf>,
     },
     /// List sessions with their address records.
     Sessions {
         #[arg(long)]
         dir: Option<PathBuf>,
-        #[arg(long)]
-        identity_file: Option<PathBuf>,
+        #[arg(long, alias = "identity-file")]
+        share_file: Option<PathBuf>,
     },
     /// Manage legal holds: time ranges pinned against retention expiry
     /// (e.g. after receiving a preservation request).
@@ -448,19 +451,19 @@ enum HoldCmd {
         /// Why this hold exists (e.g. the case/reference number).
         #[arg(long)]
         note: Option<String>,
-        /// Log directory; overrides --identity-file when both are given.
+        /// Log directory; overrides --share-file when both are given.
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// Identity file used to locate the default log directory.
-        #[arg(long)]
-        identity_file: Option<PathBuf>,
+        /// Share file used to locate the default log directory.
+        #[arg(long, alias = "identity-file")]
+        share_file: Option<PathBuf>,
     },
     /// List active holds.
     List {
         #[arg(long)]
         dir: Option<PathBuf>,
-        #[arg(long)]
-        identity_file: Option<PathBuf>,
+        #[arg(long, alias = "identity-file")]
+        share_file: Option<PathBuf>,
     },
     /// Remove a hold by id (records it pinned become subject to retention
     /// again on the next sweep).
@@ -468,8 +471,8 @@ enum HoldCmd {
         id: i64,
         #[arg(long)]
         dir: Option<PathBuf>,
-        #[arg(long)]
-        identity_file: Option<PathBuf>,
+        #[arg(long, alias = "identity-file")]
+        share_file: Option<PathBuf>,
     },
 }
 
@@ -508,15 +511,19 @@ fn parse_resolver(s: &str) -> Result<std::net::SocketAddr, String> {
         .map_err(|_| format!("'{s}' is not an IP address or ip:port (a v6 literal with a port is bracketed: [::1]:53)"))
 }
 
-/// Load a relay capability token from `--relay-token`: either a path to a file
-/// containing the base64url token, or the token string itself. Returns the raw
-/// (decoded) token bytes for `Config::relay_token`.
+/// Load a relay token from `--relay-token`: either a path to a file
+/// containing it, or the token itself. Surrounding whitespace is trimmed, as
+/// the relay trims its own copy.
 fn load_relay_token(arg: &str) -> Result<Vec<u8>, String> {
     let text = match std::fs::read_to_string(arg) {
         Ok(contents) => contents,
         Err(_) => arg.to_string(), // not a readable file: treat as a literal token
     };
-    spora_core::authz::decode_b64(text.trim()).map_err(|e| format!("--relay-token: {e}"))
+    let token = text.trim();
+    if token.is_empty() {
+        return Err("--relay-token: the token is empty".into());
+    }
+    Ok(token.as_bytes().to_vec())
 }
 
 /// Split `host:port` on the LAST ':' (so bracketed IPv6 like `[::1]:443`
@@ -680,7 +687,7 @@ async fn final_upload(human: bool, shutdown: &Shutdown) {
 async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std::error::Error>> {
     match mode {
         Mode::Share {
-            identity_file,
+            share_file,
             fresh,
             os_routing,
             tun_addr,
@@ -708,31 +715,43 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
             json,
         } => {
             let shutdown = shutdown.expect("share watches for stop signals");
-            let path = identity_file.unwrap_or_else(default_identity_path);
-            let identity = load_or_create_identity(&path, fresh)?;
+            let path = share_file.unwrap_or_else(default_share_path);
             let mut config = Config::default();
-            if let Some(tok) = relay_token {
-                config.relay_token = Some(load_relay_token(&tok)?);
-            }
-            // --relay (UDP-QUIC) and --direct (relay-less) endpoints compose into
-            // one preference-ordered list; if any is given it replaces the
-            // built-in default relay.
-            let mut relays = Vec::with_capacity(relay.len() + direct.len());
+            // --relay (UDP-QUIC), --direct (relay-less), --tcp-relay and
+            // --nz-relay endpoints compose into one preference-ordered list,
+            // which is the share's own; without any, the share keeps the
+            // relays it was made with (a new one gets the default relay).
+            let static_token = relay_token.as_deref().map(load_relay_token).transpose()?;
+            let credential = match &static_token {
+                Some(t) => spora_core::identity::Credential::Static(t.clone()),
+                None => spora_core::identity::Credential::None,
+            };
+            let mut relays = Vec::new();
+            let relayed = |host: String, port: u16, protocol| spora_core::identity::RelayEntry {
+                endpoint: spora_core::identity::RelayEndpoint::with_protocol(host, port, protocol),
+                credential: credential.clone(),
+            };
             for r in &relay {
                 let (host, port) = parse_host_port(r).map_err(|e| format!("--relay: {}", e))?;
-                relays.push(spora_core::identity::RelayEndpoint::new(host, port));
+                relays.push(relayed(
+                    host,
+                    port,
+                    spora_core::identity::RelayProtocol::UdpQuic,
+                ));
             }
             for d in &direct {
                 let (host, port) = parse_host_port(d).map_err(|e| format!("--direct: {}", e))?;
-                relays.push(spora_core::identity::RelayEndpoint::with_protocol(
-                    host,
-                    port,
-                    spora_core::identity::RelayProtocol::Direct,
+                relays.push(spora_core::identity::RelayEntry::open(
+                    spora_core::identity::RelayEndpoint::with_protocol(
+                        host,
+                        port,
+                        spora_core::identity::RelayProtocol::Direct,
+                    ),
                 ));
             }
             for t in &tcp_relay {
                 let (host, port) = parse_host_port(t).map_err(|e| format!("--tcp-relay: {}", e))?;
-                relays.push(spora_core::identity::RelayEndpoint::with_protocol(
+                relays.push(relayed(
                     host,
                     port,
                     spora_core::identity::RelayProtocol::TcpTls,
@@ -740,15 +759,29 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
             }
             for z in &nz_relay {
                 let (host, port) = parse_host_port(z).map_err(|e| format!("--nz-relay: {}", e))?;
-                relays.push(spora_core::identity::RelayEndpoint::with_protocol(
+                relays.push(relayed(
                     host,
                     port,
                     spora_core::identity::RelayProtocol::NoiseUdp,
                 ));
             }
-            if !relays.is_empty() {
-                config.relays = relays;
+            if static_token.is_some()
+                && relay.is_empty()
+                && tcp_relay.is_empty()
+                && nz_relay.is_empty()
+            {
+                return Err(
+                    "--relay-token is for the relays given with --relay, --tcp-relay or --nz-relay"
+                        .into(),
+                );
             }
+            let device = load_device(&path)?;
+            let share = load_or_make_share(
+                &path,
+                fresh,
+                &device,
+                (!relays.is_empty()).then_some(relays),
+            )?;
             if !stun.is_empty() {
                 for server in &stun {
                     parse_host_port(server).map_err(|e| format!("--stun: {}", e))?;
@@ -764,7 +797,8 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
             let connlog_dir = if no_conn_log {
                 None
             } else {
-                let dir = conn_log_dir.unwrap_or_else(|| default_connlog_dir(&identity));
+                let dir =
+                    conn_log_dir.unwrap_or_else(|| default_connlog_dir(&share.routing_hash()));
                 let mut cl = spora_core::connlog::ConnLogConfig::in_dir(&dir);
                 cl.retention =
                     std::time::Duration::from_secs(u64::from(conn_log_retention_days) * 86_400);
@@ -802,20 +836,22 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
                     return Err("--os-routing is only available on Linux (it drives iptables and kernel forwarding); the default netstack exit works everywhere".into());
                 }
             }
-            let routing_key_hex = spora_core::authz::hex_encode(&identity.routing_key);
+            let routing_hash_hex = hex(&share.routing_hash());
+            let cert_hash_hex = hex(&share.cert_hash);
             let upgrade_enabled = config.enable_direct_upgrade;
             let telemetry = start_telemetry();
             // A stop signal that comes while this sets up is kept and acted
             // on once the share is up: setting up resolves and binds, and
             // never waits for a peer.
-            let session = share(identity, config).await?;
+            let session = spora_core::share(device, share, config).await?;
             if json {
                 let ready = emit_json_event(serde_json::json!({
                     "v": 1,
                     "event": "share_ready",
                     "url": session.url.as_str(),
-                    "routing_key": routing_key_hex,
-                    "identity_file": path,
+                    "routing_hash": routing_hash_hex,
+                    "cert_hash": cert_hash_hex,
+                    "share_file": path,
                     "tun_name": routing.as_ref().map(|g| g.tun_name()),
                     "record_dir": record_dir,
                     "upgrade_enabled": upgrade_enabled,
@@ -835,11 +871,7 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
             } else {
                 say!("Share this URL with the peer that wants to connect:");
                 say!("{}", session.url);
-                say!("(Identity persisted at {})", path.display());
-                say!(
-                    "Routing key: {} (give this to your relay operator if the relay requires authorization)",
-                    routing_key_hex
-                );
+                say!("(Share kept at {})", path.display());
                 if let Some(g) = &routing {
                     say!(
                         "OS routing enabled: client traffic is forwarded by the kernel via {}.",
@@ -1492,9 +1524,9 @@ fn run_log_cmd(cmd: LogCmd) -> Result<(), Box<dyn std::error::Error>> {
             to,
             json,
             dir,
-            identity_file,
+            share_file,
         } => {
-            let dir = resolve_connlog_dir(dir, identity_file, "log query")?;
+            let dir = resolve_connlog_dir(dir, share_file, "log query")?;
             let db = connlog::open_readonly(&dir)?;
             let q = connlog::FlowQuery {
                 ip,
@@ -1519,8 +1551,8 @@ fn run_log_cmd(cmd: LogCmd) -> Result<(), Box<dyn std::error::Error>> {
                 print_query_human(&flows, &sessions, &marks);
             }
         }
-        LogCmd::Sessions { dir, identity_file } => {
-            let dir = resolve_connlog_dir(dir, identity_file, "log sessions")?;
+        LogCmd::Sessions { dir, share_file } => {
+            let dir = resolve_connlog_dir(dir, share_file, "log sessions")?;
             let db = connlog::open_readonly(&dir)?;
             for s in connlog::query_sessions(&db, None)? {
                 print_session(&s);
@@ -1532,9 +1564,9 @@ fn run_log_cmd(cmd: LogCmd) -> Result<(), Box<dyn std::error::Error>> {
                 to,
                 note,
                 dir,
-                identity_file,
+                share_file,
             } => {
-                let dir = resolve_connlog_dir(dir, identity_file, "log hold add")?;
+                let dir = resolve_connlog_dir(dir, share_file, "log hold add")?;
                 let db = connlog::open_readwrite(&dir)?;
                 let id =
                     connlog::add_hold(&db, parse_time(&from)?, parse_time(&to)?, note.as_deref())?;
@@ -1543,8 +1575,8 @@ fn run_log_cmd(cmd: LogCmd) -> Result<(), Box<dyn std::error::Error>> {
                     id, from, to
                 );
             }
-            HoldCmd::List { dir, identity_file } => {
-                let dir = resolve_connlog_dir(dir, identity_file, "log hold list")?;
+            HoldCmd::List { dir, share_file } => {
+                let dir = resolve_connlog_dir(dir, share_file, "log hold list")?;
                 let db = connlog::open_readonly(&dir)?;
                 let holds = connlog::list_holds(&db)?;
                 if holds.is_empty() {
@@ -1563,9 +1595,9 @@ fn run_log_cmd(cmd: LogCmd) -> Result<(), Box<dyn std::error::Error>> {
             HoldCmd::Remove {
                 id,
                 dir,
-                identity_file,
+                share_file,
             } => {
-                let dir = resolve_connlog_dir(dir, identity_file, "log hold remove")?;
+                let dir = resolve_connlog_dir(dir, share_file, "log hold remove")?;
                 let db = connlog::open_readwrite(&dir)?;
                 if connlog::remove_hold(&db, id)? {
                     println!("hold {} removed", id);
@@ -1795,26 +1827,26 @@ fn parse_time(s: &str) -> Result<i64, String> {
 }
 
 /// The connection-log directory for `spora <cmd>`: `dir`, or the one of the
-/// share identity's in the state directory.
+/// share's in the state directory.
 fn resolve_connlog_dir(
     dir: Option<PathBuf>,
-    identity_file: Option<PathBuf>,
+    share_file: Option<PathBuf>,
     cmd: &str,
 ) -> Result<PathBuf, String> {
     if let Some(d) = dir {
         return Ok(d);
     }
     let elsewhere = sudo_elsewhere("connection log", cmd);
-    let path = identity_file.unwrap_or_else(default_identity_path);
+    let path = share_file.unwrap_or_else(default_share_path);
     let bytes = std::fs::read(&path).map_err(|e| {
         format!(
-            "cannot read identity {} to locate the log ({}); pass --dir explicitly{elsewhere}",
+            "cannot read share {} to locate the log ({}); pass --dir explicitly{elsewhere}",
             path.display(),
             e
         )
     })?;
-    let identity = spora_core::identity::Identity::from_bytes(&bytes)?;
-    let dir = default_connlog_dir(&identity);
+    let share = Share::from_blob(&bytes)?;
+    let dir = default_connlog_dir(&share.routing_hash());
     match std::fs::metadata(&dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
             "no connection log at {} (pass --dir{elsewhere})",
@@ -1829,13 +1861,9 @@ fn resolve_connlog_dir(
     }
 }
 
-fn default_connlog_dir(identity: &spora_core::identity::Identity) -> PathBuf {
-    let rk_hex: String = identity
-        .routing_key
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
-    connlog_base_dir().join(rk_hex)
+/// One connection log per share, named by its routing hash.
+fn default_connlog_dir(routing_hash: &RoutingHash) -> PathBuf {
+    connlog_base_dir().join(hex(routing_hash))
 }
 
 fn connlog_base_dir() -> PathBuf {
@@ -3130,43 +3158,95 @@ impl Shutdown {
 }
 
 #[cfg(not(windows))]
-fn default_identity_path() -> PathBuf {
+fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("spora").join("identity.bin")
+    base.join("spora")
 }
 
 #[cfg(windows)]
-fn default_identity_path() -> PathBuf {
+fn config_dir() -> PathBuf {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("spora")
-        .join("identity.bin")
 }
 
-fn load_or_create_identity(
-    path: &std::path::Path,
-    fresh: bool,
-) -> Result<Identity, Box<dyn std::error::Error>> {
-    if !fresh && let Ok(bytes) = std::fs::read(path) {
-        return Ok(Identity::from_bytes(&bytes)?);
+fn default_share_path() -> PathBuf {
+    config_dir().join("share.bin")
+}
+
+/// The device identity the share at `share_path` is served under: kept
+/// beside it as `device.bin`, made on first use.
+fn load_device(share_path: &std::path::Path) -> Result<DeviceIdentity, Box<dyn std::error::Error>> {
+    let path = share_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("device.bin");
+    if let Ok(bytes) = std::fs::read(&path) {
+        return DeviceIdentity::from_bytes(&bytes)
+            .map_err(|e| format!("device identity {}: {e}", path.display()).into());
     }
-    let identity = Identity::generate();
+    let device = DeviceIdentity::generate();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    write_identity_atomically(path, &identity.to_bytes())?;
-    Ok(identity)
+    write_private_atomically(&path, &device.to_bytes())?;
+    Ok(device)
 }
 
-/// Persist the identity (private key + secret) durably and privately.
+/// The share at `path`, or a new one (written there) when there is none,
+/// `fresh` asks for one, it was made under another device, or `relays` (the
+/// relay flags, if any were given) are not the ones it was made with: the
+/// relays are in the URL, so other relays are another share.
+fn load_or_make_share(
+    path: &std::path::Path,
+    fresh: bool,
+    device: &DeviceIdentity,
+    relays: Option<Vec<RelayEntry>>,
+) -> Result<Share, Box<dyn std::error::Error>> {
+    if !fresh && let Ok(bytes) = std::fs::read(path) {
+        let why_new = match Share::from_blob(&bytes) {
+            Err(e) => Some(format!("it cannot be read ({e})")),
+            Ok(share) if share.cert_hash != device.cert_hash() => {
+                Some("it was made under another device identity".to_string())
+            }
+            Ok(share) => match &relays {
+                Some(wanted) if *wanted != share.relays => {
+                    Some("the relays given are not the ones it was made with".to_string())
+                }
+                _ => return Ok(share),
+            },
+        };
+        if let Some(why) = why_new {
+            say!(
+                "Making a new share (a new URL) in place of the one at {}: {why}.",
+                path.display()
+            );
+        }
+    }
+    let relays = relays.unwrap_or_else(|| {
+        vec![RelayEntry::open(spora_core::identity::RelayEndpoint::new(
+            spora_core::DEFAULT_RELAY.0,
+            spora_core::DEFAULT_RELAY.1,
+        ))]
+    });
+    let share = Share::new(device, relays)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_private_atomically(path, &share.to_blob())?;
+    Ok(share)
+}
+
+/// Persist a private file (the device key, a share's secret) durably and
+/// privately.
 ///
 /// `std::fs::write` truncates-then-writes in place: a crash or power loss
-/// mid-write leaves a torn file, and `Identity::from_bytes` then fails on every
-/// later launch — bricking `spora share` and the user's stable URL. It also
+/// mid-write leaves a torn file, which then fails to parse on every later
+/// launch — costing the user their stable URL. It also
 /// creates the file with the umask (typically world-/group-readable) and only
 /// chmods afterward, leaving a window where the private key is exposed.
 ///
@@ -3175,7 +3255,7 @@ fn load_or_create_identity(
 /// either the old file or the complete new one, never a truncated mix, and the
 /// key bytes are never group/world-readable.
 #[cfg(unix)]
-fn write_identity_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_private_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -3183,7 +3263,7 @@ fn write_identity_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::R
     let stem = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("identity.bin");
+        .unwrap_or("share.bin");
     // Per-process temp name so a concurrent writer can't clobber our partial
     // file before the rename.
     let tmp = dir.join(format!(".{}.{}.tmp", stem, std::process::id()));
@@ -3207,13 +3287,13 @@ fn write_identity_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::R
 /// Windows: the same temp-file-then-rename, without a POSIX mode (the file
 /// inherits the profile directory's ACL, which is per-user).
 #[cfg(windows)]
-fn write_identity_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_private_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let stem = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("identity.bin");
+        .unwrap_or("share.bin");
     let tmp = dir.join(format!(".{}.{}.tmp", stem, std::process::id()));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -3249,24 +3329,83 @@ mod identity_persistence_tests {
         dir
     }
 
+    fn relay(port: u16) -> Vec<RelayEntry> {
+        vec![RelayEntry::open(spora_core::identity::RelayEndpoint::new(
+            "127.0.0.1",
+            port,
+        ))]
+    }
+
     #[test]
-    fn created_identity_is_private_and_round_trips() {
+    fn created_device_and_share_are_private_and_round_trip() {
         let dir = scratch("create");
-        let path = dir.join("identity.bin");
+        let path = dir.join("share.bin");
 
-        let id = load_or_create_identity(&path, false).unwrap();
+        let device = load_device(&path).unwrap();
+        let share = load_or_make_share(&path, false, &device, None).unwrap();
 
-        // The private key must never be group/world readable, even briefly.
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "identity file must be 0600");
+        // The private key and the secret must never be group/world readable,
+        // even briefly.
+        for f in [&path, &dir.join("device.bin")] {
+            let mode = std::fs::metadata(f).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{} must be 0600", f.display());
+        }
 
-        // Loading again (fresh=false) returns the SAME identity, not a new one.
-        let again = load_or_create_identity(&path, false).unwrap();
-        assert_eq!(
-            id.to_bytes(),
-            again.to_bytes(),
-            "persisted identity must be stable across launches"
+        // Loading again returns the SAME device and share, not new ones.
+        let device2 = load_device(&path).unwrap();
+        assert_eq!(device2.cert_hash(), device.cert_hash());
+        let again = load_or_make_share(&path, false, &device2, None).unwrap();
+        assert_eq!(again, share, "the share must be stable across launches");
+        assert_eq!(again.url(), share.url());
+
+        // The same relay flags keep it too.
+        let given = load_or_make_share(&path, false, &device, Some(share.relays.clone())).unwrap();
+        assert_eq!(given, share);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn other_relays_fresh_or_another_device_make_a_new_share() {
+        let dir = scratch("renew");
+        let path = dir.join("share.bin");
+        let device = load_device(&path).unwrap();
+        let first = load_or_make_share(&path, false, &device, Some(relay(1))).unwrap();
+
+        let moved = load_or_make_share(&path, false, &device, Some(relay(2))).unwrap();
+        assert_ne!(
+            moved.share_id, first.share_id,
+            "other relays: another share"
         );
+        assert_eq!(moved.relays, relay(2));
+        // ...and it is now the stored one.
+        assert_eq!(
+            load_or_make_share(&path, false, &device, None).unwrap(),
+            moved
+        );
+
+        let fresh = load_or_make_share(&path, true, &device, None).unwrap();
+        assert_ne!(fresh.share_id, moved.share_id, "--fresh: another share");
+        assert_eq!(
+            fresh.endpoints(),
+            vec![spora_core::identity::RelayEndpoint::new(
+                spora_core::DEFAULT_RELAY.0,
+                spora_core::DEFAULT_RELAY.1
+            )],
+            "a new share without relay flags gets the default relay"
+        );
+
+        let other = DeviceIdentity::generate();
+        let rebuilt = load_or_make_share(&path, false, &other, None).unwrap();
+        assert_eq!(
+            rebuilt.cert_hash,
+            other.cert_hash(),
+            "made under the device in use"
+        );
+
+        std::fs::write(&path, b"garbage").unwrap();
+        let recovered = load_or_make_share(&path, false, &device, None).unwrap();
+        assert_eq!(recovered.cert_hash, device.cert_hash());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3274,17 +3413,17 @@ mod identity_persistence_tests {
     #[test]
     fn atomic_write_replaces_without_leaving_a_temp() {
         let dir = scratch("atomic");
-        let path = dir.join("identity.bin");
+        let path = dir.join("share.bin");
 
-        write_identity_atomically(&path, b"first-version").unwrap();
-        write_identity_atomically(&path, b"second-version-which-is-longer").unwrap();
+        write_private_atomically(&path, b"first-version").unwrap();
+        write_private_atomically(&path, b"second-version-which-is-longer").unwrap();
 
         // The final file holds the complete new content (never a torn mix)...
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"second-version-which-is-longer"
         );
-        // ...and the rename consumed the temp — no `.identity.bin.<pid>.tmp` litter.
+        // ...and the rename consumed the temp — no `.share.bin.<pid>.tmp` litter.
         let leftover: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -3444,19 +3583,24 @@ mod state_dir_tests {
         );
 
         let note = sudo_elsewhere("connection log", "log query");
-        let e = resolve_connlog_dir(None, Some(dir.join("identity.bin")), "log query").unwrap_err();
+        let e = resolve_connlog_dir(None, Some(dir.join("share.bin")), "log query").unwrap_err();
         assert!(e.ends_with(&format!("pass --dir explicitly{note}")), "{e}");
-        // An identity whose log was never written (in this process's state
+        // A share whose log was never written (in this process's state
         // directory, which this only reads).
         std::fs::create_dir_all(&dir).unwrap();
-        let identity = spora_core::identity::Identity::generate();
-        std::fs::write(dir.join("identity.bin"), identity.to_bytes()).unwrap();
-        let e = resolve_connlog_dir(None, Some(dir.join("identity.bin")), "log query").unwrap_err();
+        let device = DeviceIdentity::generate();
+        let share = Share::open(
+            &device,
+            vec![spora_core::identity::RelayEndpoint::new("127.0.0.1", 1)],
+        )
+        .unwrap();
+        std::fs::write(dir.join("share.bin"), share.to_blob()).unwrap();
+        let e = resolve_connlog_dir(None, Some(dir.join("share.bin")), "log query").unwrap_err();
         assert_eq!(
             e,
             format!(
                 "no connection log at {} (pass --dir{note})",
-                default_connlog_dir(&identity).display()
+                default_connlog_dir(&share.routing_hash()).display()
             )
         );
         std::fs::remove_dir_all(&dir).ok();

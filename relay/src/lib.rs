@@ -2,32 +2,41 @@
 //! [`serve`].
 //!
 //! Wire protocol (see also `relay_client::protocol`):
-//!   - A (sharer) sends a signed `REGISTER` (routing key + timestamp + cert +
-//!     signature) to the relay every ~30s. The relay verifies the signature
-//!     and the `routing_key == SHA-256(cert)[..20]` commitment, enforces a
-//!     strictly-increasing timestamp (replay guard), and stores
-//!     `routing_key -> A's UDP addr`. It holds no secret — it only verifies.
-//!   - B (client) sends a QUIC Initial with DCID = `routing_key`. The relay
-//!     reads the DCID out of the long header, looks up A's addr, installs
-//!     a bidirectional flow `(B_addr <-> A_addr)`, and forwards.
+//!   - A (sharer) sends a signed `REGISTER_V2` (share id + timestamp + cert +
+//!     signature, then its relay token) to the relay every ~30s per share.
+//!     The relay derives the routing hash `SHA-256(SHA-256(cert)[..20] ||
+//!     share_id)[..20]`, verifies the signature, enforces a strictly-
+//!     increasing timestamp per routing hash (replay guard), asks its
+//!     [`authz::Authorizer`] about the token, and stores
+//!     `routing_hash -> A's UDP addr`. It holds no secret — it only verifies.
+//!   - B (client) sends a QUIC Initial with DCID = the routing hash. The
+//!     relay reads the DCID out of the long header, looks up A's addr,
+//!     installs a bidirectional flow `(B_addr <-> A_addr)`, and forwards.
 //!   - Subsequent packets (long or short header) from either flow endpoint
-//!     are forwarded by source-address lookup.
+//!     are forwarded by source-address lookup. The authorizer is consulted at
+//!     registration only, never on the forwarding path: a registration
+//!     refused later (a lapsed token) stops new clients from finding the
+//!     share, and its live flows run on until they fall idle.
 //!   - Idle entries time out (registrations ~120s, flows ~60s).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use log::{debug, info, warn};
 use tokio::net::UdpSocket;
 
-use relay_client::authz::{self, ISSUER_PUBKEY_LEN};
-use relay_client::protocol::{self, Classified, ROUTING_KEY_LEN};
+use relay_client::protocol::{self, CertHash, Classified, ROUTING_HASH_LEN, RegisterKind, hex};
 
+pub mod authz;
+pub mod server;
 pub mod sessionlog;
 pub mod tcp;
+use authz::{Authorizer, Carrier, RegistrationCtx};
 use sessionlog::{SessionLog, SessionState};
+
+pub use relay_client::protocol::RoutingHash;
 
 pub const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(120);
 pub const FLOW_TIMEOUT: Duration = Duration::from_secs(60);
@@ -35,10 +44,11 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 pub const RECV_BUF: usize = 4096;
 
 /// Smallest `nz` (Noise UDP) carrier first packet the relay will route by its
-/// leading routing-key prefix: `routing_key(20) | session index(4) | a Noise
-/// NNpsk0 msg1 (32-byte ephemeral + 16-byte tag = 48)`. The relay reads only the
-/// public 20-byte prefix — the same thing it reads from a QUIC Initial's DCID.
-pub const NZ_MSG1_MIN: usize = ROUTING_KEY_LEN + 4 + 48;
+/// leading routing-hash prefix: `routing_hash(20) | session index(4) | a
+/// Noise NNpsk0 msg1 (32-byte ephemeral + 16-byte tag = 48)`. The relay reads
+/// only the public 20-byte prefix — the same thing it reads from a QUIC
+/// Initial's DCID.
+pub const NZ_MSG1_MIN: usize = ROUTING_HASH_LEN + 4 + 48;
 
 /// How long after the sharer last sent toward its client the flow still counts
 /// as "actively serving" (and so blocks a new client). Must exceed the sharer's
@@ -47,7 +57,16 @@ pub const NZ_MSG1_MIN: usize = ROUTING_KEY_LEN + 4 + 48;
 /// frees the slot quickly. See the one-at-a-time logic in `handle_packet`.
 pub const REVERSE_ACTIVITY_GRACE: Duration = Duration::from_secs(20);
 
-pub type RoutingKey = [u8; ROUTING_KEY_LEN];
+/// One share's registration: where its sharer is, when it last refreshed,
+/// the last signed timestamp accepted (the replay guard), and which device it
+/// is (for the session log).
+#[derive(Clone, Copy)]
+struct Registration {
+    addr: SocketAddr,
+    seen: Instant,
+    last_ts: u64,
+    cert_hash: CertHash,
+}
 
 /// A forwarding-table entry. Stored under both endpoints of a flow.
 #[derive(Clone)]
@@ -71,22 +90,20 @@ struct Flow {
 }
 
 pub struct State {
-    /// `routing_key -> (sharer addr, last-seen Instant, last-accepted signed
-    /// timestamp)`. The timestamp is the replay guard: a REGISTER is only
+    /// `(routing_hash, kind) -> registration`: a share's QUIC listener and
+    /// its nz socket are different sockets, registered separately, and a QUIC
+    /// Initial is routed to the one, an nz first packet to the other. The
+    /// registration's `last_ts` is the replay guard: a REGISTER is only
     /// accepted if its signed timestamp strictly exceeds the stored one, so a
     /// captured registration replayed (e.g. from another source) is rejected
     /// while the genuine sharer keeps refreshing.
-    registrations: HashMap<RoutingKey, (SocketAddr, Instant, u64)>,
+    registrations: HashMap<(RoutingHash, RegisterKind), Registration>,
     flows: HashMap<SocketAddr, Flow>,
     registration_timeout: Duration,
     flow_timeout: Duration,
     sweep_interval: Duration,
-    /// Trusted capability-token issuer public keys. **Empty means open mode**:
-    /// any validly self-signed registration is accepted (today's behavior).
-    /// When non-empty, a registration must carry a capability token that is
-    /// signed by one of these issuers, marked allowed, and bound to the routing
-    /// key being registered — see [`authz`].
-    issuer_keys: Vec<[u8; ISSUER_PUBKEY_LEN]>,
+    /// Who may register (see [`authz`]). [`authz::Open`] by default.
+    authorizer: Arc<dyn Authorizer>,
     /// Optional persistent session log (off by default; the deployed binary
     /// attaches one). Records each matched flow for operator accountability —
     /// see [`sessionlog`].
@@ -143,7 +160,7 @@ impl State {
             registration_timeout,
             flow_timeout,
             sweep_interval,
-            issuer_keys: Vec::new(),
+            authorizer: Arc::new(authz::Open),
             session_log: None,
         }
     }
@@ -156,18 +173,11 @@ impl State {
         self
     }
 
-    /// Require capability-token authorization, trusting the given issuer public
-    /// keys. Builder-style; passing an empty set leaves the relay in open mode.
-    /// See [`authz`] and [`State::handle_control`].
-    pub fn with_issuer_keys(mut self, keys: Vec<[u8; ISSUER_PUBKEY_LEN]>) -> State {
-        self.issuer_keys = keys;
+    /// Decide who may register with `authorizer` instead of accepting every
+    /// signed registration. Builder-style. See [`authz`].
+    pub fn with_authorizer(mut self, authorizer: Arc<dyn Authorizer>) -> State {
+        self.authorizer = authorizer;
         self
-    }
-
-    /// Whether the relay requires capability-token authorization (i.e. it has at
-    /// least one trusted issuer key configured).
-    pub fn requires_authorization(&self) -> bool {
-        !self.issuer_keys.is_empty()
     }
 
     /// Decide what to do with a packet from `src`. Updates internal state
@@ -203,32 +213,37 @@ impl State {
         }
 
         // Unmatched source — install a new flow if the packet carries a
-        // registered routing key. Two carriers present it two ways, and the relay
-        // treats them identically once the 20-byte key is in hand:
+        // registered routing hash. Two carriers present it two ways, and the
+        // relay treats them identically once the 20 bytes are in hand:
         //   - UdpQuic: a QUIC Initial's DCID (at the QUIC offset).
-        //   - NoiseUdp: an nz first packet's leading routing_key prefix.
+        //   - NoiseUdp: an nz first packet's leading routing-hash prefix.
         // The nz check runs even when classify() bucketed the (random) first byte
         // as a QUIC long header, as long as the QUIC-DCID lookup missed — so an nz
         // msg1 that merely looks QUIC-shaped is still routed.
-        let mut matched_rk: Option<RoutingKey> = None;
+        let mut matched: Option<(RoutingHash, RegisterKind)> = None;
         if let Classified::QuicLongHeader { dcid } = classified
-            && dcid.len() == ROUTING_KEY_LEN
+            && dcid.len() == ROUTING_HASH_LEN
         {
-            let mut rk: RoutingKey = [0u8; ROUTING_KEY_LEN];
+            let mut rk: RoutingHash = [0u8; ROUTING_HASH_LEN];
             rk.copy_from_slice(dcid);
-            if self.registrations.contains_key(&rk) {
-                matched_rk = Some(rk);
+            if self.registrations.contains_key(&(rk, RegisterKind::Quic)) {
+                matched = Some((rk, RegisterKind::Quic));
             }
         }
-        if matched_rk.is_none() && pkt.len() >= NZ_MSG1_MIN {
-            let mut rk: RoutingKey = [0u8; ROUTING_KEY_LEN];
-            rk.copy_from_slice(&pkt[..ROUTING_KEY_LEN]);
-            if self.registrations.contains_key(&rk) {
-                matched_rk = Some(rk);
+        if matched.is_none() && pkt.len() >= NZ_MSG1_MIN {
+            let mut rk: RoutingHash = [0u8; ROUTING_HASH_LEN];
+            rk.copy_from_slice(&pkt[..ROUTING_HASH_LEN]);
+            if self.registrations.contains_key(&(rk, RegisterKind::Nz)) {
+                matched = Some((rk, RegisterKind::Nz));
             }
         }
-        if let Some(rk) = matched_rk
-            && let Some((sharer_addr, reg_ts, _)) = self.registrations.get(&rk).copied()
+        if let Some(key @ (rk, _)) = matched
+            && let Some(Registration {
+                addr: sharer_addr,
+                seen: reg_ts,
+                cert_hash,
+                ..
+            }) = self.registrations.get(&key).copied()
         {
             // Refuse a self-referential or non-relayable flow *before* the
             // one-at-a-time check, so a spoofed packet can neither bootstrap
@@ -239,9 +254,9 @@ impl State {
             // forever from a single (spoofed) packet.
             if src == sharer_addr || !is_relayable(&src) {
                 debug!(
-                    "refusing self-referential/non-relayable flow for {} (rk {:x?})",
+                    "refusing self-referential/non-relayable flow for {} (rh {})",
                     src,
-                    &rk[..4]
+                    hex(&rk[..4])
                 );
                 return Action::Drop;
             }
@@ -252,10 +267,10 @@ impl State {
             // to its address that blocks its one-flow slot until the
             // flow itself times out.
             if now.duration_since(reg_ts) >= self.registration_timeout {
-                self.registrations.remove(&rk);
+                self.registrations.remove(&key);
                 debug!(
-                    "ignoring expired registration rk {:x?} for client {}",
-                    &rk[..4],
+                    "ignoring expired registration rh {} for client {}",
+                    hex(&rk[..4]),
                     src
                 );
                 return Action::Drop;
@@ -285,10 +300,10 @@ impl State {
                         .is_some_and(|t| now.duration_since(t) < REVERSE_ACTIVITY_GRACE);
                     if serving {
                         debug!(
-                            "dropping client {} for actively-serving sharer {} (rk {:x?})",
+                            "dropping client {} for actively-serving sharer {} (rh {})",
                             src,
                             sharer_addr,
-                            &rk[..4]
+                            hex(&rk[..4])
                         );
                         return Action::Drop;
                     }
@@ -304,7 +319,7 @@ impl State {
             // allocated when logging is on, so the no-log path stays free.
             let session = match (reused_session, &self.session_log) {
                 (Some(s), _) => Some(s),
-                (None, Some(log)) => Some(log.open_session(&rk, src, sharer_addr)),
+                (None, Some(log)) => Some(log.open_session(&rk, &cert_hash, src, sharer_addr)),
                 (None, None) => None,
             };
             if let Some(s) = &session {
@@ -332,10 +347,10 @@ impl State {
                 },
             );
             info!(
-                "matched client {} <-> sharer {} on rk {:x?}",
+                "matched client {} <-> sharer {} on rh {}",
                 src,
                 sharer_addr,
-                &rk[..4]
+                hex(&rk[..4])
             );
             return Action::Forward(sharer_addr);
         }
@@ -344,66 +359,85 @@ impl State {
     }
 
     fn handle_control(&mut self, src: SocketAddr, ty: u8, body: &[u8], now: Instant) {
-        match ty {
-            protocol::ctrl::REGISTER => {
+        match RegisterKind::from_ctrl(ty) {
+            Some(kind) => {
                 // Cheap source check before spending a signature verification.
                 if !is_relayable(&src) {
                     warn!("ignoring REGISTER from non-relayable source {}", src);
                     return;
                 }
-                // Verify the signature and that the routing key commits to the
-                // presented cert. We hold no secret — this only proves the
-                // registration was authorized by the key the routing key pins.
-                let (rk, ts, token) = match protocol::verify_signed_register(body) {
+                // Verify the signature and derive the routing hash from the
+                // cert and share id. We hold no secret — this only proves the
+                // registration was made by the key behind the cert hash.
+                let (reg, token) = match protocol::verify_register(kind, body) {
                     Ok(v) => v,
                     Err(e) => {
                         warn!("rejecting REGISTER from {}: {:?}", src, e);
                         return;
                     }
                 };
-                // Authorization: in authorized mode (issuer keys configured) the
-                // registration must carry a valid capability token bound to this
-                // routing key. The registration signature above already proved
-                // possession of the key, so a token that names this routing key
-                // is non-transferable. In open mode (no issuer keys) any token
-                // (including none) is accepted — today's behavior.
-                if !self.issuer_keys.is_empty()
-                    && let Err(e) = authz::verify_token(token, &rk, &self.issuer_keys)
-                {
-                    warn!(
-                        "rejecting unauthorized REGISTER for rk {:x?} from {}: {:?}",
-                        &rk[..4],
-                        src,
-                        e
-                    );
-                    return;
-                }
+                let rk = reg.routing_hash;
+                let key = (rk, kind);
                 // Replay guard: the signed timestamp must strictly exceed the
-                // last one accepted for this key. A captured registration
-                // replayed (e.g. from an attacker's address) carries an
-                // already-seen timestamp and is dropped; the genuine sharer's
-                // next refresh always carries a fresh higher one.
-                if let Some((_, _, last_ts)) = self.registrations.get(&rk)
-                    && ts <= *last_ts
+                // last one accepted for this routing hash. A captured
+                // registration replayed (e.g. from an attacker's address)
+                // carries an already-seen timestamp and is dropped; the
+                // genuine sharer's next refresh always carries a fresh higher
+                // one.
+                if let Some(existing) = self.registrations.get(&key)
+                    && reg.timestamp_millis <= existing.last_ts
                 {
                     debug!(
-                        "rejecting stale/replayed REGISTER for rk {:x?} from {} (ts {} <= {})",
-                        &rk[..4],
+                        "rejecting stale/replayed REGISTER for rh {} from {} (ts {} <= {})",
+                        hex(&rk[..4]),
                         src,
-                        ts,
-                        last_ts
+                        reg.timestamp_millis,
+                        existing.last_ts
                     );
                     return;
                 }
-                let is_new = !self.registrations.contains_key(&rk);
-                self.registrations.insert(rk, (src, now, ts));
+                // Authorization last, so the authorizer only ever sees
+                // authenticated, fresh registrations.
+                let ctx = RegistrationCtx {
+                    cert_hash: reg.cert_hash,
+                    share_id: reg.share_id,
+                    routing_hash: rk,
+                    source: src,
+                    carrier: match kind {
+                        RegisterKind::Quic => Carrier::Quic,
+                        RegisterKind::Nz => Carrier::Nz,
+                    },
+                };
+                if !self.authorizer.authorize(&ctx, token, SystemTime::now()) {
+                    debug!(
+                        "refusing unauthorized REGISTER for rh {} (device {}) from {}",
+                        hex(&rk[..4]),
+                        hex(&reg.cert_hash[..4]),
+                        src
+                    );
+                    return;
+                }
+                let is_new = !self.registrations.contains_key(&key);
+                self.registrations.insert(
+                    key,
+                    Registration {
+                        addr: src,
+                        seen: now,
+                        last_ts: reg.timestamp_millis,
+                        cert_hash: reg.cert_hash,
+                    },
+                );
                 if is_new {
-                    info!("REGISTER rk {:x?} from {}", &rk[..4], src);
+                    info!("REGISTER {kind:?} rh {} from {}", hex(&rk[..4]), src);
                 } else {
-                    debug!("REGISTER refresh rk {:x?} from {}", &rk[..4], src);
+                    debug!(
+                        "REGISTER {kind:?} refresh rh {} from {}",
+                        hex(&rk[..4]),
+                        src
+                    );
                 }
             }
-            other => warn!("unknown control type 0x{:02x} from {}", other, src),
+            None => warn!("unknown control type 0x{:02x} from {}", ty, src),
         }
     }
 
@@ -414,7 +448,7 @@ impl State {
         let registration_timeout = self.registration_timeout;
         let flow_timeout = self.flow_timeout;
         self.registrations
-            .retain(|_, (_, ts, _)| now.duration_since(*ts) < registration_timeout);
+            .retain(|_, r| now.duration_since(r.seen) < registration_timeout);
         // Close the session log entry for each expired flow before dropping it.
         // The shared `SessionState` makes the close idempotent, so the flow's
         // two entries (which may expire in different sweeps) emit exactly one
@@ -475,25 +509,70 @@ pub async fn serve(socket: UdpSocket, mut state: State) {
 mod tests {
     use super::*;
     use relay_client::protocol::RegisterSigner;
+    use std::sync::Mutex;
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
     }
 
-    /// A sharer-side signer with a fresh random ECDSA-P256 cert. Its
-    /// `routing_key()` is the SHA-256 commitment the relay verifies, and
-    /// `next_register_packet()` produces a valid signed REGISTER each call.
-    fn registrar() -> RegisterSigner {
-        let ck = rcgen::generate_simple_self_signed(vec!["spora.peer".to_string()]).unwrap();
-        RegisterSigner::new(&ck.cert.der().to_vec(), &ck.key_pair.serialize_der()).unwrap()
+    /// A sharer-side registrar for one share of a fresh device (random
+    /// ECDSA-P256 cert): `routing_key()` is the routing hash the relay
+    /// derives, and `next_register_packet()` a valid REGISTER_V2 each call.
+    struct Reg {
+        signer: RegisterSigner,
+        token: Vec<u8>,
     }
 
-    /// A registrar carrying a valid "allowed" capability token issued for its
-    /// own routing key by `issuer`.
-    fn authorized_registrar(issuer: &authz::IssuerKeyPair) -> RegisterSigner {
-        let signer = registrar();
-        let token = issuer.issue(&signer.routing_key());
-        signer.with_token(Some(token))
+    impl Reg {
+        fn routing_key(&self) -> RoutingHash {
+            self.signer.routing_hash()
+        }
+
+        fn next_register_packet(&mut self) -> Vec<u8> {
+            self.signer.register_packet(RegisterKind::Quic, &self.token)
+        }
+
+        fn with_token(mut self, token: &[u8]) -> Reg {
+            self.token = token.to_vec();
+            self
+        }
+    }
+
+    fn registrar() -> Reg {
+        let ck = rcgen::generate_simple_self_signed(vec!["spora.peer".to_string()]).unwrap();
+        Reg {
+            signer: RegisterSigner::new(
+                ck.cert.der(),
+                &ck.key_pair.serialize_der(),
+                rand::random(),
+            )
+            .unwrap(),
+            token: Vec::new(),
+        }
+    }
+
+    /// An authorizer that records what it was asked and answers `allow`.
+    struct Recording {
+        allow: bool,
+        seen: Mutex<Vec<(RegistrationCtx, Vec<u8>)>>,
+    }
+
+    impl Authorizer for Recording {
+        fn authorize(&self, ctx: &RegistrationCtx, token: &[u8], _: SystemTime) -> bool {
+            self.seen.lock().unwrap().push((*ctx, token.to_vec()));
+            self.allow
+        }
+
+        fn describe(&self) -> String {
+            "recording".into()
+        }
+    }
+
+    fn recording(allow: bool) -> Arc<Recording> {
+        Arc::new(Recording {
+            allow,
+            seen: Mutex::new(Vec::new()),
+        })
     }
 
     fn initial_with_dcid(dcid: &[u8]) -> Vec<u8> {
@@ -508,8 +587,8 @@ mod tests {
         vec![0x40, 0x11, 0x22, 0x33, 0x44]
     }
 
-    fn rk(seed: u8) -> RoutingKey {
-        [seed; ROUTING_KEY_LEN]
+    fn rk(seed: u8) -> RoutingHash {
+        [seed; ROUTING_HASH_LEN]
     }
 
     #[test]
@@ -892,14 +971,13 @@ mod tests {
         );
     }
 
-    // --- Capability-token authorization ---
+    // --- Authorization ---
 
     #[test]
     fn open_mode_accepts_tokenless_registration() {
-        // No issuer keys configured => open mode: a plain (tokenless) signed
-        // registration is accepted, exactly as before authz existed.
+        // The default authorizer is Open: a plain (tokenless) signed
+        // registration is accepted.
         let mut s = State::default();
-        assert!(!s.requires_authorization());
         let mut reg = registrar();
         s.handle_packet(
             addr("10.0.0.1:1"),
@@ -910,109 +988,223 @@ mod tests {
     }
 
     #[test]
-    fn authorized_mode_rejects_tokenless_registration() {
-        let issuer = authz::IssuerKeyPair::generate().unwrap();
-        let mut s = State::default().with_issuer_keys(vec![issuer.public_key()]);
-        assert!(s.requires_authorization());
-        // A perfectly valid signed registration, but with no capability token.
-        let mut reg = registrar();
-        s.handle_packet(
-            addr("10.0.0.1:1"),
-            &reg.next_register_packet(),
-            Instant::now(),
-        );
-        assert_eq!(
-            s.registration_count(),
-            0,
-            "tokenless register must be refused when gated"
-        );
+    fn the_authorizer_sees_the_derived_identity_and_the_token() {
+        let auth = recording(true);
+        let mut s = State::default().with_authorizer(auth.clone());
+        let mut reg = registrar().with_token(b"tok");
+        let a = addr("10.0.0.1:1111");
+        s.handle_packet(a, &reg.next_register_packet(), Instant::now());
+        assert_eq!(s.registration_count(), 1);
+        let seen = auth.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (ctx, token) = &seen[0];
+        assert_eq!(ctx.routing_hash, reg.routing_key());
+        assert_eq!(ctx.cert_hash, reg.signer.cert_hash());
+        assert_eq!(ctx.source, a);
+        assert_eq!(ctx.carrier, Carrier::Quic);
+        assert_eq!(token, b"tok");
     }
 
     #[test]
-    fn authorized_mode_accepts_valid_token_and_routes() {
-        let issuer = authz::IssuerKeyPair::generate().unwrap();
-        let mut s = State::default().with_issuer_keys(vec![issuer.public_key()]);
+    fn a_refused_registration_binds_nothing_and_burns_no_timestamp() {
+        let auth = recording(false);
+        let mut s = State::default().with_authorizer(auth.clone());
+        let mut reg = registrar();
+        let refused = reg.next_register_packet();
+        s.handle_packet(addr("10.0.0.1:1"), &refused, Instant::now());
+        assert_eq!(s.registration_count(), 0);
+        // The same packet, once the authorizer relents, is still fresh: a
+        // refusal must not advance the replay guard.
+        s.authorizer = Arc::new(authz::Open);
+        s.handle_packet(addr("10.0.0.1:1"), &refused, Instant::now());
+        assert_eq!(s.registration_count(), 1);
+    }
+
+    #[test]
+    fn stale_and_replayed_registrations_never_reach_the_authorizer() {
+        let auth = recording(true);
+        let mut s = State::default().with_authorizer(auth.clone());
+        let mut reg = registrar();
+        let pkt = reg.next_register_packet();
+        s.handle_packet(addr("10.0.0.1:1"), &pkt, Instant::now());
+        s.handle_packet(addr("10.9.9.9:9"), &pkt, Instant::now());
+        assert_eq!(auth.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn static_token_mode_routes_the_holder_and_refuses_the_rest() {
+        let mut s = State::default().with_authorizer(Arc::new(
+            authz::StaticToken::new(b"bearer".to_vec()).unwrap(),
+        ));
         let now = Instant::now();
+        let mut without = registrar();
+        s.handle_packet(addr("10.0.0.5:5"), &without.next_register_packet(), now);
+        let mut wrong = registrar().with_token(b"guess");
+        s.handle_packet(addr("10.0.0.6:6"), &wrong.next_register_packet(), now);
+        assert_eq!(s.registration_count(), 0);
+
+        let mut reg = registrar().with_token(b"bearer");
         let a = addr("10.0.0.1:1111");
-        let b = addr("10.0.0.2:2222");
-
-        let mut reg = authorized_registrar(&issuer);
-        let key = reg.routing_key();
         s.handle_packet(a, &reg.next_register_packet(), now);
-        assert_eq!(s.registration_count(), 1, "valid token must be accepted");
-
-        // ...and the authorized sharer routes a client normally.
+        assert_eq!(s.registration_count(), 1);
         assert_eq!(
-            s.handle_packet(b, &initial_with_dcid(&key), now),
+            s.handle_packet(
+                addr("10.0.0.2:2222"),
+                &initial_with_dcid(&reg.routing_key()),
+                now
+            ),
             Action::Forward(a)
         );
     }
 
     #[test]
-    fn authorized_mode_rejects_token_from_untrusted_issuer() {
-        let trusted = authz::IssuerKeyPair::generate().unwrap();
-        let rogue = authz::IssuerKeyPair::generate().unwrap();
-        let mut s = State::default().with_issuer_keys(vec![trusted.public_key()]);
-        // Token signed by an issuer the relay does not trust.
-        let mut reg = authorized_registrar(&rogue);
-        s.handle_packet(
-            addr("10.0.0.1:1"),
-            &reg.next_register_packet(),
-            Instant::now(),
-        );
-        assert_eq!(
-            s.registration_count(),
-            0,
-            "untrusted-issuer token must be refused"
-        );
-    }
-
-    #[test]
-    fn authorized_mode_rejects_token_bound_to_a_different_key() {
-        // A token is bound to a routing key (its subject). Attaching a token
-        // issued for someone else's key to my own registration is refused, so a
-        // token cannot be transplanted onto a different identity.
-        let issuer = authz::IssuerKeyPair::generate().unwrap();
-        let mut s = State::default().with_issuer_keys(vec![issuer.public_key()]);
-        // A token issued for a foreign routing key, attached to our signer.
-        let foreign_key = registrar().routing_key();
-        let token = issuer.issue(&foreign_key);
-        let mut reg = registrar().with_token(Some(token));
-        assert_ne!(reg.routing_key(), foreign_key);
-        s.handle_packet(
-            addr("10.0.0.1:1"),
-            &reg.next_register_packet(),
-            Instant::now(),
-        );
-        assert_eq!(
-            s.registration_count(),
-            0,
-            "token bound to another key must be refused"
-        );
-    }
-
-    #[test]
-    fn forged_register_for_known_routing_key_is_rejected() {
-        // Knowing the (public) routing key is not enough: an attacker using
-        // their own cert/key cannot register someone else's routing key,
-        // because it no longer commits to the presented cert.
+    fn two_shares_of_one_device_register_side_by_side() {
+        let ck = rcgen::generate_simple_self_signed(vec!["spora.peer".to_string()]).unwrap();
+        let key = ck.key_pair.serialize_der();
+        let mut one = RegisterSigner::new(ck.cert.der(), &key, [1; 8]).unwrap();
+        let mut two = RegisterSigner::new(ck.cert.der(), &key, [2; 8]).unwrap();
+        assert_ne!(one.routing_hash(), two.routing_hash());
         let mut s = State::default();
         let now = Instant::now();
-        let victim_key = registrar().routing_key();
+        let a1 = addr("10.0.0.1:1");
+        let a2 = addr("10.0.0.1:2");
+        s.handle_packet(a1, &one.register_packet(RegisterKind::Quic, &[]), now);
+        s.handle_packet(a2, &two.register_packet(RegisterKind::Quic, &[]), now);
+        assert_eq!(s.registration_count(), 2);
+        assert_eq!(
+            s.handle_packet(
+                addr("10.0.0.9:9"),
+                &initial_with_dcid(&two.routing_hash()),
+                now
+            ),
+            Action::Forward(a2)
+        );
+    }
 
-        let mut attacker = registrar();
-        let pkt = attacker.next_register_packet();
-        let mut body = pkt[protocol::CTRL_MAGIC.len() + 1..].to_vec();
-        body[..ROUTING_KEY_LEN].copy_from_slice(&victim_key);
-        s.handle_control(addr("10.9.9.9:9"), protocol::ctrl::REGISTER, &body, now);
+    fn nz_msg1(rh: &RoutingHash) -> Vec<u8> {
+        let mut pkt = rh.to_vec();
+        pkt.extend_from_slice(&[0x11; NZ_MSG1_MIN - ROUTING_HASH_LEN]);
+        pkt
+    }
+
+    #[test]
+    fn a_shares_quic_and_nz_sockets_register_side_by_side() {
+        // One relay port serving both carriers: the share's QUIC listener
+        // and nz socket each keep their own registration, and each carrier's
+        // first packet goes to its own socket.
+        let mut s = State::default();
+        let now = Instant::now();
+        let mut reg = registrar();
+        let quic_sock = addr("10.0.0.1:1000");
+        let nz_sock = addr("10.0.0.1:2000");
+        s.handle_packet(
+            quic_sock,
+            &reg.signer.register_packet(RegisterKind::Quic, &[]),
+            now,
+        );
+        s.handle_packet(
+            nz_sock,
+            &reg.signer.register_packet(RegisterKind::Nz, &[]),
+            now,
+        );
+        // A later QUIC refresh does not take the nz route over.
+        s.handle_packet(
+            quic_sock,
+            &reg.signer.register_packet(RegisterKind::Quic, &[]),
+            now,
+        );
+        assert_eq!(s.registration_count(), 2);
+        let rh = reg.routing_key();
+        assert_eq!(
+            s.handle_packet(addr("10.0.0.7:7"), &initial_with_dcid(&rh), now),
+            Action::Forward(quic_sock)
+        );
+        assert_eq!(
+            s.handle_packet(addr("10.0.0.8:8"), &nz_msg1(&rh), now),
+            Action::Forward(nz_sock)
+        );
+    }
+
+    #[test]
+    fn an_nz_registration_does_not_route_quic_and_the_reverse() {
+        let mut s = State::default();
+        let now = Instant::now();
+        let mut reg = registrar();
+        s.handle_packet(
+            addr("10.0.0.1:2000"),
+            &reg.signer.register_packet(RegisterKind::Nz, &[]),
+            now,
+        );
+        assert_eq!(
+            s.handle_packet(
+                addr("10.0.0.7:7"),
+                &initial_with_dcid(&reg.routing_key()),
+                now
+            ),
+            Action::Drop
+        );
+        let mut other = registrar();
+        s.handle_packet(
+            addr("10.0.0.2:1000"),
+            &other.signer.register_packet(RegisterKind::Quic, &[]),
+            now,
+        );
+        assert_eq!(
+            s.handle_packet(addr("10.0.0.8:8"), &nz_msg1(&other.routing_key()), now),
+            Action::Drop
+        );
+    }
+
+    #[test]
+    fn the_retired_register_type_is_ignored() {
+        let mut s = State::default();
+        let mut reg = registrar();
+        let mut pkt = reg.next_register_packet();
+        pkt[protocol::CTRL_MAGIC.len()] = 0x01;
+        s.handle_packet(addr("10.0.0.1:1"), &pkt, Instant::now());
+        assert_eq!(s.registration_count(), 0);
+    }
+
+    #[test]
+    fn forged_register_for_a_known_share_is_rejected() {
+        // Knowing a share's (public) cert and share id is not enough: a
+        // registration naming the victim's cert but signed with another key
+        // does not verify, and the attacker's own cert derives a different
+        // routing hash.
+        let mut s = State::default();
+        let now = Instant::now();
+        let victim = rcgen::generate_simple_self_signed(vec!["spora.peer".to_string()]).unwrap();
+        let attacker = rcgen::generate_simple_self_signed(vec!["spora.peer".to_string()]).unwrap();
+        let share_id = [0x5A; 8];
+        let victim_rh = routing_hash_of(victim.cert.der(), &share_id);
+
+        let mut forged = RegisterSigner::new(
+            victim.cert.der(),
+            &attacker.key_pair.serialize_der(),
+            share_id,
+        )
+        .unwrap();
+        s.handle_packet(
+            addr("10.9.9.9:9"),
+            &forged.register_packet(RegisterKind::Quic, &[]),
+            now,
+        );
         assert_eq!(s.registration_count(), 0, "forged register must not bind");
+        assert_eq!(
+            s.handle_packet(addr("10.0.0.2:2"), &initial_with_dcid(&victim_rh), now),
+            Action::Drop
+        );
+    }
+
+    fn routing_hash_of(cert: &[u8], share_id: &[u8; 8]) -> RoutingHash {
+        protocol::routing_hash(&protocol::cert_hash(cert), share_id)
     }
 
     #[test]
     fn malformed_register_is_ignored() {
         let mut s = State::default();
         let mut bad = protocol::CTRL_MAGIC.to_vec();
-        bad.push(protocol::ctrl::REGISTER);
+        bad.push(protocol::ctrl::REGISTER_V2);
         bad.extend_from_slice(&[0xFFu8; 5]);
         assert_eq!(
             s.handle_packet(addr("1.2.3.4:5"), &bad, Instant::now()),
@@ -1127,11 +1319,12 @@ mod tests {
         // Dropping State drops the SessionLog → writer flushes and exits.
         drop(s);
 
-        let key_hex: String = key.iter().map(|x| format!("{:02x}", x)).collect();
+        let key_hex = hex(&key);
+        let device_hex = hex(&reg.signer.cert_hash());
         wait_session(&path, |db| {
             db.query_row(
-                "SELECT client_addr, sharer_addr, pkts_c2s, pkts_s2c, end_reason
-                 FROM sessions WHERE routing_key=?1",
+                "SELECT client_addr, sharer_addr, pkts_c2s, pkts_s2c, end_reason, cert_hash
+                 FROM sessions WHERE routing_hash=?1",
                 [&key_hex],
                 |r| {
                     Ok((
@@ -1140,12 +1333,14 @@ mod tests {
                         r.get::<_, i64>(2)?,
                         r.get::<_, i64>(3)?,
                         r.get::<_, Option<String>>(4)?,
+                        r.get::<_, String>(5)?,
                     ))
                 },
             )
-            .map(|(client, sharer, c2s, s2c, reason)| {
+            .map(|(client, sharer, c2s, s2c, reason, device)| {
                 client == "10.0.0.2:2222"
                     && sharer == "10.0.0.1:1111"
+                    && device == device_hex
                     && c2s == 2 // Initial + one short-header
                     && s2c == 1
                     && reason.as_deref() == Some("idle")

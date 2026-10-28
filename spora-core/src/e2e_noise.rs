@@ -1,9 +1,9 @@
 //! End-to-end Noise handshake for the `nz` (Noise UDP) carrier.
 //!
 //! This is the crypto core: a `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` handshake
-//! plus the identity binding that keeps one 20-byte `routing_key` pin
+//! plus the identity binding that keeps one 20-byte cert-hash pin
 //! authenticating the sharer across QUIC, TLS *and* Noise — without migrating
-//! `Identity` to an X25519 static key.
+//! the device identity to an X25519 static key.
 //!
 //! Two factors, exactly mirroring the QUIC/TLS carriers:
 //!
@@ -11,13 +11,15 @@
 //!   first ephemeral), so the initiator's first message carries an AEAD tag that
 //!   only a holder of the off-wire `secret` can produce. A responder drops a
 //!   wrong-secret first message before doing any DH — a cheap probe/DoS filter
-//!   and the passive-DPI-resistance property in one, with no `routing_key`-keyed
-//!   MAC that a passive censor could recompute.
+//!   and the passive-DPI-resistance property in one, with no MAC keyed by
+//!   public values that a passive censor could recompute. The PSK is
+//!   `H(domain || routing hash || secret)`, which ties the secret to this one
+//!   share of this one device.
 //! - **Identity (the cert pin):** after the handshake completes, the responder
 //!   (the sharer, A) sends a cert-auth message — its self-signed ECDSA cert plus
 //!   a signature over the Noise channel-binding hash — as the first transport
-//!   message. The initiator (B) checks `SHA-256(cert)[..20] == routing_key` and
-//!   verifies the signature. Signing the channel-binding hash binds A's identity
+//!   message. The initiator (B) checks `SHA-256(cert)[..20]` against the URL's
+//!   cert hash and verifies the signature. Signing the channel-binding hash binds A's identity
 //!   to *this* session's ephemerals, so the signature cannot be replayed into
 //!   another session. A URL/secret holder still cannot impersonate A.
 //!
@@ -33,7 +35,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair};
 use rustls::pki_types::CertificateDer;
 
-use crate::identity::{Identity, ROUTING_KEY_LEN, SECRET_LEN};
+use crate::identity::{CertHash, ROUTING_HASH_LEN, SECRET_LEN, ShareIdentity, cert_hash};
 use crate::record::{Fault, Reason};
 
 /// The Noise pattern. `NN` (no static keys) + `psk0` (secret mixed first). A's
@@ -41,8 +43,8 @@ use crate::record::{Fault, Reason};
 const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 /// Domain separation for the PSK derivation.
 const PSK_DOMAIN: &[u8] = b"spora-noise-psk-v1";
-/// Prologue prefix; the full prologue is `PROLOGUE_PREFIX || routing_key`, so
-/// the routing key (identity + version framing) is authenticated by the
+/// Prologue prefix; the full prologue is `PROLOGUE_PREFIX || routing_hash`, so
+/// the routing hash (share + version framing) is authenticated by the
 /// handshake even though it also rides in the clear for relay routing.
 const PROLOGUE_PREFIX: &[u8] = b"spora-noise-v1";
 /// Domain separation for the cert-auth signature over the channel-binding hash.
@@ -52,25 +54,26 @@ const AUTH_SIG_DOMAIN: &[u8] = b"spora-noise-auth-v1";
 /// 32-byte ephemeral + 16-byte tag). Generous headroom.
 pub(crate) const NOISE_HS_MAX: usize = 128;
 
-/// PSK = SHA-256(domain || routing_key || secret). Both peers derive it: B from
-/// the URL's `routing_key`/`secret`, A from its own `Identity`.
+/// PSK = SHA-256(domain || routing_hash || secret). Both peers derive it: B from
+/// the URL (the routing hash derived from its cert hash and share id), A from
+/// its own [`ShareIdentity`].
 pub(crate) fn derive_psk(
-    routing_key: &[u8; ROUTING_KEY_LEN],
+    routing_hash: &[u8; ROUTING_HASH_LEN],
     secret: &[u8; SECRET_LEN],
 ) -> [u8; 32] {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
     ctx.update(PSK_DOMAIN);
-    ctx.update(routing_key);
+    ctx.update(routing_hash);
     ctx.update(secret);
     let mut psk = [0u8; 32];
     psk.copy_from_slice(ctx.finish().as_ref());
     psk
 }
 
-fn prologue(routing_key: &[u8; ROUTING_KEY_LEN]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(PROLOGUE_PREFIX.len() + ROUTING_KEY_LEN);
+fn prologue(routing_hash: &[u8; ROUTING_HASH_LEN]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(PROLOGUE_PREFIX.len() + ROUTING_HASH_LEN);
     p.extend_from_slice(PROLOGUE_PREFIX);
-    p.extend_from_slice(routing_key);
+    p.extend_from_slice(routing_hash);
     p
 }
 
@@ -82,12 +85,12 @@ pub(crate) struct NoiseHandshake {
 
 impl NoiseHandshake {
     fn build(
-        routing_key: &[u8; ROUTING_KEY_LEN],
+        routing_hash: &[u8; ROUTING_HASH_LEN],
         secret: &[u8; SECRET_LEN],
         initiator: bool,
     ) -> Result<Self, Fault> {
-        let psk = derive_psk(routing_key, secret);
-        let prologue = prologue(routing_key);
+        let psk = derive_psk(routing_hash, secret);
+        let prologue = prologue(routing_hash);
         let params = NOISE_PARAMS
             .parse()
             .map_err(|e| Fault::new(Reason::CryptoError, format!("noise params: {e}")))?;
@@ -107,15 +110,15 @@ impl NoiseHandshake {
 
     /// B side: dials the sharer.
     pub(crate) fn initiator(
-        routing_key: &[u8; ROUTING_KEY_LEN],
+        routing_hash: &[u8; ROUTING_HASH_LEN],
         secret: &[u8; SECRET_LEN],
     ) -> Result<Self, Fault> {
-        Self::build(routing_key, secret, true)
+        Self::build(routing_hash, secret, true)
     }
 
     /// A side: derives the PSK from its own identity.
-    pub(crate) fn responder(identity: &Identity) -> Result<Self, Fault> {
-        Self::build(&identity.routing_key, &identity.secret, false)
+    pub(crate) fn responder(identity: &ShareIdentity) -> Result<Self, Fault> {
+        Self::build(&identity.routing_hash, &identity.secret, false)
     }
 
     /// Write the next handshake message; returns the bytes to send.
@@ -203,7 +206,7 @@ impl NoiseSession {
 /// `AUTH_SIG_DOMAIN || handshake_hash`. The caller encrypts this with the
 /// session and sends it as the first transport message.
 pub(crate) fn build_cert_auth(
-    identity: &Identity,
+    identity: &ShareIdentity,
     handshake_hash: &[u8; 32],
 ) -> Result<Vec<u8>, Fault> {
     let rng = SystemRandom::new();
@@ -234,13 +237,13 @@ pub(crate) fn build_cert_auth(
     Ok(out)
 }
 
-/// Verify A's cert-auth plaintext against the pinned `routing_key` and the
-/// channel-binding `handshake_hash`. Confirms (1) the cert commits to the
-/// routing key (`SHA-256(cert)[..20] == routing_key`) and (2) the cert's key
-/// signed this session's handshake hash.
+/// Verify A's cert-auth plaintext against the pinned `expected` cert hash and
+/// the channel-binding `handshake_hash`. Confirms (1) the cert is the one the
+/// URL names (`SHA-256(cert)[..20] == expected`) and (2) the cert's key signed
+/// this session's handshake hash.
 pub(crate) fn verify_cert_auth(
     auth: &[u8],
-    routing_key: &[u8; ROUTING_KEY_LEN],
+    expected: &CertHash,
     handshake_hash: &[u8; 32],
 ) -> Result<(), Fault> {
     if auth.len() < 2 {
@@ -259,13 +262,12 @@ pub(crate) fn verify_cert_auth(
     let cert_der = &auth[2..2 + cert_len];
     let signature = &auth[2 + cert_len..];
 
-    // The routing key must commit to this cert — otherwise a valid signature by
-    // some *other* identity would be accepted.
-    let digest = ring::digest::digest(&ring::digest::SHA256, cert_der);
-    if digest.as_ref()[..ROUTING_KEY_LEN] != routing_key[..] {
+    // The URL's cert hash must name this cert — otherwise a valid signature
+    // by some *other* device would be accepted.
+    if cert_hash(cert_der) != *expected {
         return Err(Fault::new(
             Reason::CertMismatch,
-            "noise auth: routing key does not match cert",
+            "noise auth: the cert is not the one the link names",
         ));
     }
 
@@ -283,13 +285,13 @@ pub(crate) fn verify_cert_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::Identity;
+    use crate::identity::ShareIdentity;
 
     /// Drive a full B<->A handshake in memory and return both sessions.
     fn handshake_pair(
-        rk: &[u8; ROUTING_KEY_LEN],
+        rk: &[u8; ROUTING_HASH_LEN],
         b_secret: &[u8; SECRET_LEN],
-        identity: &Identity,
+        identity: &ShareIdentity,
     ) -> Result<(NoiseSession, NoiseSession), Fault> {
         let mut b = NoiseHandshake::initiator(rk, b_secret)?; // B: URL secret
         let mut a = NoiseHandshake::responder(identity)?; // A: own identity
@@ -305,8 +307,8 @@ mod tests {
 
     #[test]
     fn full_handshake_and_cert_auth_succeeds() {
-        let identity = Identity::generate();
-        let rk = identity.routing_key;
+        let identity = ShareIdentity::generate();
+        let rk = identity.routing_hash;
         let (a_sess, b_sess) = handshake_pair(&rk, &identity.secret, &identity).expect("handshake");
 
         // Same channel binding on both sides.
@@ -316,7 +318,10 @@ mod tests {
         let auth = build_cert_auth(&identity, &a_sess.handshake_hash).expect("build auth");
         let ct = a_sess.encrypt(0, &auth).expect("encrypt auth");
         let pt = b_sess.decrypt(0, &ct).expect("decrypt auth");
-        verify_cert_auth(&pt, &rk, &b_sess.handshake_hash).expect("auth must verify");
+        verify_cert_auth(&pt, &identity.cert_hash, &b_sess.handshake_hash)
+            .expect("auth must verify");
+        // The routing hash is not what the cert is pinned by.
+        assert!(verify_cert_auth(&pt, &rk, &b_sess.handshake_hash).is_err());
 
         // And the data plane carries bytes both ways under increasing counters.
         let c1 = a_sess.encrypt(1, b"hello from A").unwrap();
@@ -327,8 +332,8 @@ mod tests {
 
     #[test]
     fn wrong_secret_fails_the_first_message() {
-        let identity = Identity::generate();
-        let rk = identity.routing_key;
+        let identity = ShareIdentity::generate();
+        let rk = identity.routing_hash;
         // B dials with the wrong secret: the psk0 tag on msg1 won't verify, so A
         // rejects before any DH — never reaching msg2.
         let wrong = [0xABu8; SECRET_LEN];
@@ -344,16 +349,16 @@ mod tests {
     }
 
     #[test]
-    fn cert_auth_rejects_a_routing_key_mismatch() {
-        let identity = Identity::generate();
+    fn cert_auth_rejects_a_cert_hash_mismatch() {
+        let identity = ShareIdentity::generate();
         let (a_sess, b_sess) =
-            handshake_pair(&identity.routing_key, &identity.secret, &identity).unwrap();
+            handshake_pair(&identity.routing_hash, &identity.secret, &identity).unwrap();
         let auth = build_cert_auth(&identity, &a_sess.handshake_hash).unwrap();
         let pt = b_sess
             .decrypt(0, &a_sess.encrypt(0, &auth).unwrap())
             .unwrap();
-        // Pin to a different routing key than the cert commits to.
-        let mut bogus = identity.routing_key;
+        // Pin to a different cert hash than the cert's.
+        let mut bogus = identity.cert_hash;
         bogus[0] ^= 0xFF;
         let err = verify_cert_auth(&pt, &bogus, &b_sess.handshake_hash).unwrap_err();
         assert_eq!(err.reason, Reason::CertMismatch, "{err}");
@@ -361,28 +366,41 @@ mod tests {
 
     #[test]
     fn cert_auth_rejects_a_tampered_signature() {
-        let identity = Identity::generate();
+        let identity = ShareIdentity::generate();
         let (a_sess, b_sess) =
-            handshake_pair(&identity.routing_key, &identity.secret, &identity).unwrap();
+            handshake_pair(&identity.routing_hash, &identity.secret, &identity).unwrap();
         let mut auth = build_cert_auth(&identity, &a_sess.handshake_hash).unwrap();
         // Flip a byte in the trailing signature.
         let last = auth.len() - 1;
         auth[last] ^= 0x01;
         let ct = a_sess.encrypt(0, &auth).unwrap();
         let pt = b_sess.decrypt(0, &ct).unwrap();
-        assert!(verify_cert_auth(&pt, &identity.routing_key, &b_sess.handshake_hash).is_err());
+        assert!(verify_cert_auth(&pt, &identity.cert_hash, &b_sess.handshake_hash).is_err());
+    }
+
+    #[test]
+    fn another_share_of_the_same_device_has_another_psk() {
+        // The secret of one share must not open another share's handshake,
+        // even under the same device key: the routing hash is in the PSK.
+        let identity = ShareIdentity::generate();
+        let mut other = identity.clone();
+        other.share_id[0] ^= 0xFF;
+        other.routing_hash = crate::identity::routing_hash(&other.cert_hash, &other.share_id);
+        assert!(handshake_pair(&identity.routing_hash, &identity.secret, &other).is_err());
     }
 
     #[test]
     fn cert_auth_rejects_a_different_sessions_hash() {
         // A signature from one session must not verify against another session's
         // channel binding (replay/relay resistance).
-        let identity = Identity::generate();
-        let (a1, _b1) = handshake_pair(&identity.routing_key, &identity.secret, &identity).unwrap();
-        let (_a2, b2) = handshake_pair(&identity.routing_key, &identity.secret, &identity).unwrap();
+        let identity = ShareIdentity::generate();
+        let (a1, _b1) =
+            handshake_pair(&identity.routing_hash, &identity.secret, &identity).unwrap();
+        let (_a2, b2) =
+            handshake_pair(&identity.routing_hash, &identity.secret, &identity).unwrap();
         assert_ne!(a1.handshake_hash, b2.handshake_hash, "sessions differ");
         let auth = build_cert_auth(&identity, &a1.handshake_hash).unwrap();
         // Verify against session 2's binding: must fail.
-        assert!(verify_cert_auth(&auth, &identity.routing_key, &b2.handshake_hash).is_err());
+        assert!(verify_cert_auth(&auth, &identity.cert_hash, &b2.handshake_hash).is_err());
     }
 }

@@ -433,8 +433,9 @@ fn a_dial_stopped_by_a_signal_ends_its_record_and_sends_it() {
     let api = FakeApi::start();
     let home = scratch("dial");
     seed_registered(&home, &api.base);
-    // Any 36 bytes make a token; this one leads nowhere but a closed port.
-    let url = format!("https://spora.invalid/s/{}?r={NOWHERE}", "A".repeat(48));
+    // The version byte and any 44 bytes make a token; this one leads nowhere
+    // but a closed port.
+    let url = format!("https://spora.invalid/s/AQ{}?r={NOWHERE}", "A".repeat(58));
     let mut child = spora(&home, &api.base)
         .args(["use", "--tun-name", "nosuchtun", "--stun", NOWHERE, &url])
         .spawn()

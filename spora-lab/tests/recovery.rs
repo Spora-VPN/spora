@@ -45,7 +45,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
 use spora_core::TunnelEvent;
-use spora_core::identity::{Identity, RelayEndpoint, RelayProtocol};
+use spora_core::identity::{RelayEndpoint, RelayProtocol};
 use spora_lab::netns::Netns;
 use spora_lab::peers::{self, ClientHandle, LabPeerOpts, SharerHandle};
 use spora_lab::services::{self, WanHandle};
@@ -758,7 +758,7 @@ fn quic_sharer_restart_same_identity() -> Result<(), String> {
     let topo = pr_pr()?;
     let wan = services::start_wan(&topo.wan, scaled_relay_state)?;
     let mut opts = carrier_opts(&wan, RelayProtocol::UdpQuic);
-    opts.identity = Some(Identity::generate());
+    opts.pin_share();
 
     let (sharer1, mut client) = establish(&topo, &opts, RelayProtocol::UdpQuic)?;
     let url = sharer1.url().clone();

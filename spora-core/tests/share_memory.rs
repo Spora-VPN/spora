@@ -14,7 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::UdpSocket as TokioUdp;
 
 use spora_core::e2e::{E2eSession, client_connect, client_endpoint};
-use spora_core::identity::{Identity, Token};
+use spora_core::identity::Token;
 use spora_core::{Config, Timings, share};
 
 fn rss_kb() -> usize {
@@ -42,15 +42,23 @@ async fn start_relay() -> std::net::SocketAddr {
 
 async fn start_share() -> (std::net::SocketAddr, Token, spora_core::ShareSession) {
     let relay_addr = start_relay().await;
-    let identity = Identity::generate();
     let config = Config {
-        relays: vec![spora_core::identity::RelayEndpoint::new(
-            "127.0.0.1",
-            relay_addr.port(),
-        )],
         ..Config::default()
     };
-    let session = share(identity, config).await.expect("share()");
+    let session = {
+        let device = spora_core::identity::DeviceIdentity::generate();
+        let sh = spora_core::identity::Share::open(
+            &device,
+            vec![spora_core::identity::RelayEndpoint::new(
+                "127.0.0.1",
+                relay_addr.port(),
+            )],
+        )
+        .unwrap();
+        share(device, sh, config)
+    }
+    .await
+    .expect("share()");
     let token = Token::from_url(&session.url).expect("parse url");
     tokio::time::sleep(Duration::from_millis(300)).await;
     (relay_addr, token, session)
@@ -59,8 +67,13 @@ async fn start_share() -> (std::net::SocketAddr, Token, spora_core::ShareSession
 async fn open_client(relay_addr: std::net::SocketAddr, token: &Token) -> E2eSession {
     let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     b_std.set_nonblocking(true).unwrap();
-    let b_endpoint =
-        client_endpoint(b_std, token.routing_key, &Timings::default()).expect("client_endpoint");
+    let b_endpoint = client_endpoint(
+        b_std,
+        token.cert_hash,
+        token.routing_hash(),
+        &Timings::default(),
+    )
+    .expect("client_endpoint");
     // Endpoint must outlive the connection; we leak it deliberately for the
     // lifetime of the test process (tests are short-lived).
     let endpoint = Box::leak(Box::new(b_endpoint));

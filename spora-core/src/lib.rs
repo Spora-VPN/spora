@@ -31,7 +31,10 @@ use url::Url;
 
 use crate::connlog::{AddrKind, ConnLog, ConnLogConfig, SessionLog};
 use crate::e2e::{authenticate_incoming, client_connect, client_endpoint, server_endpoint};
-use crate::identity::{Identity, ROUTING_KEY_LEN, RelayEndpoint, RelayProtocol, SECRET_LEN, Token};
+use crate::identity::{
+    CertHash, Credentials, DeviceIdentity, ROUTING_HASH_LEN, RelayEndpoint, RelayEntry,
+    RelayProtocol, RoutingHash, SECRET_LEN, Share, ShareIdentity, Token,
+};
 use crate::neg::{NegChannel, SignalNegChannel};
 use crate::record::{
     Carrier, EndpointRef, Fault, MtuSource, Outcome, PathKind, PathState, Reason, Recorder, Role,
@@ -47,10 +50,8 @@ use crate::transport::keepalive::{
     KeepAliveConfig, KeepAliveMode, KeepAliveTransport, LinkCounters,
 };
 use crate::transport::upgradable::{UpgradeSender, upgradable_transport};
-/// Capability-token authorization helpers (issuer keys, token encode/decode).
-/// Re-exported so platform front-ends can present a `Config::relay_token`
-/// without depending on `relay-client` directly.
-pub use relay_client::authz;
+pub use relay_client::RegisterTarget;
+use relay_client::protocol::RegisterKind;
 
 /// Callback invoked once after the end-to-end QUIC connection's PMTUD has
 /// converged. The application can use this to configure its TUN device.
@@ -307,11 +308,6 @@ pub struct Config {
     /// service gets a bounded query attempt; the socket from the first
     /// successful response is retained for punching.
     pub stun_servers: Vec<String>,
-    /// Relays to use, in preference order. The sharer registers with ALL of
-    /// them; the client tries them IPv6-first until one bootstraps a session
-    /// (so a censored/dead relay fails over to the next). A hostname that has
-    /// both A and AAAA records expands to two endpoints at resolve time.
-    pub relays: Vec<crate::identity::RelayEndpoint>,
     pub protector: SocketProtector,
     pub mtu_callback: MtuCallback,
     /// Share side only: what consumes the tunneled IP packets.
@@ -342,11 +338,13 @@ pub struct Config {
     /// core's. Platforms that want the "send logs" story, and the lab, set a
     /// directory here.
     pub record: Option<record::RecordConfig>,
-    /// Share side only: an opaque capability token attached to every relay
-    /// registration, proving this sharer is authorized to use the relay(s).
-    /// `None` registers in open mode (accepted by relays configured without
-    /// issuer keys). Obtain one from the relay operator; see
-    /// `relay_client::authz`.
+    /// Share side only: the device's current relay token, presented to every
+    /// relay endpoint of the share whose credential is
+    /// [`Credential::Spora`](crate::identity::Credential::Spora) (the same
+    /// bytes for every such relay of every share). Opaque here. `None` starts
+    /// the share degraded: those relays get tokenless registrations, which an
+    /// authorizing relay refuses, until
+    /// [`ShareSession::update_relay_token`] brings one.
     pub relay_token: Option<Vec<u8>>,
 }
 
@@ -354,7 +352,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             stun_servers: default_stun_servers(),
-            relays: vec![crate::identity::RelayEndpoint::new("167.71.66.250", 443)],
             protector: None,
             mtu_callback: None,
             exit_mode: ExitMode::Netstack,
@@ -399,6 +396,10 @@ pub fn default_stun_servers() -> Vec<String> {
         .collect()
 }
 
+/// The built-in relay: the default for a share with no relay of its own
+/// choosing (tests, the lab, a CLI given none and no API).
+pub const DEFAULT_RELAY: (&str, u16) = ("167.71.66.250", 443);
+
 pub struct ShareSession {
     pub url: Url,
     pub cancel: CancellationToken,
@@ -408,9 +409,23 @@ pub struct ShareSession {
     /// `Config::record` asked for one. The share loop closes it however the
     /// share ends.
     pub record: Recorder,
+    /// The share's credential state: what its registrars and park workers
+    /// present. Clone it to renew the relay token from elsewhere.
+    pub credentials: Credentials,
 }
 
 impl ShareSession {
+    /// Present `token` from now on to every relay of this share that wants
+    /// the device's relay token: one write, then every registrar of the
+    /// current listener generation (QUIC and nz) sends a REGISTER at once,
+    /// and an empty TCP park pool refills at once. Sessions, direct
+    /// upgrades, sockets and the connection log are untouched; healthy
+    /// parked connections stay (a relay checks tokens when it parks, never
+    /// while it forwards).
+    pub fn update_relay_token(&self, token: Option<Vec<u8>>) {
+        self.credentials.set_spora_token(token);
+    }
+
     pub async fn stop(self) {
         self.cancel.cancel();
         let _ = self.task.await;
@@ -422,48 +437,48 @@ impl ShareSession {
     }
 }
 
-/// Start sharing under the given `Identity` (cert + key + secret).
+/// Start serving `share` under `device` (the identity the share was made
+/// under; any other is refused with an
+/// [`IDENTITY_MISMATCH`](crate::identity::IDENTITY_MISMATCH) error).
 ///
-/// Identity persistence is the caller's responsibility. Use
-/// `Identity::generate()` once and persist `identity.to_bytes()` somewhere
-/// platform-appropriate (a file under XDG_CONFIG_HOME on the CLI,
-/// SharedPreferences on Android, the registry on Windows, etc.), then load
-/// it back with `Identity::from_bytes()` on subsequent launches so the share
-/// URL stays the same.
-pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, String> {
-    let identity = Arc::new(identity);
-    let routing_key = identity.routing_key;
-
-    if config.relays.is_empty() {
-        return Err("share: Config.relays is empty".into());
+/// Persistence is the caller's: the device identity (spora-service keeps it)
+/// and the share's blob ([`Share::to_blob`], the platform keeps it). The URL
+/// is the share's ([`Share::url`]): the same every time the same share is
+/// started. The relays come from the share, each with its credential;
+/// `config.relay_token` is the device's relay token for the `Spora` ones.
+pub async fn share(
+    device: DeviceIdentity,
+    share: Share,
+    config: Config,
+) -> Result<ShareSession, String> {
+    let identity = Arc::new(ShareIdentity::new(&device, &share)?);
+    let routing_hash = identity.routing_hash;
+    let relays: Vec<RelayEntry> = share.relays.clone();
+    if relays.is_empty() {
+        return Err("share: the share has no relays".into());
     }
-    let url = identity.token(config.relays.clone()).to_url();
+    let endpoints = share.endpoints();
+    let url = share.url();
+    let credentials = Credentials::new(config.relay_token.clone());
 
     // Resolve only the UDP-QUIC relays — the ones the signed-REGISTER loop
     // announces to. `TcpTls` relays are reached by the sharer connecting OUT
     // (spawn_tcp_registrars), not by UDP registration. A `Direct` endpoint is
     // the sharer's own advertised listener (the CLIENT resolves the name), so a
     // Direct/TcpTls hostname the sharer can't resolve locally must NOT abort it.
-    let udp_relays: Vec<RelayEndpoint> = config
-        .relays
+    let register_targets: Vec<RegisterTarget> = if relays
         .iter()
-        .filter(|r| r.protocol == RelayProtocol::UdpQuic)
-        .cloned()
-        .collect();
-    let register_addrs: Vec<SocketAddr> = if udp_relays.is_empty() {
-        Vec::new()
+        .any(|r| r.endpoint.protocol == RelayProtocol::UdpQuic)
+    {
+        resolve_register_targets(&relays, RelayProtocol::UdpQuic).map_err(|f| f.detail)?
     } else {
-        resolve_relays(&udp_relays)?
-            .into_iter()
-            .map(|(a, _)| a)
-            .collect()
+        Vec::new()
     };
 
     // A `Direct` (relay-less) sharer must bind the advertised port so clients
     // can dial it; a relay-only sharer keeps an ephemeral port (0). One socket
     // means one port, so all Direct endpoints must agree on it.
-    let direct_ports: std::collections::BTreeSet<u16> = config
-        .relays
+    let direct_ports: std::collections::BTreeSet<u16> = endpoints
         .iter()
         .filter(|r| !r.protocol.is_relayed())
         .map(|r| r.port)
@@ -484,39 +499,40 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     // AAAA record the client will dial). Only a Direct *v4 literal* stays v4-only
     // — resolving the advertised name here (which may be external-only) is
     // avoided, so a dual-stack socket serves whichever family the client picks.
-    let want_v6 = register_addrs.iter().any(|a| a.is_ipv6())
-        || config
-            .relays
+    let want_v6 = register_targets.iter().any(|t| t.addr.is_ipv6())
+        || endpoints
             .iter()
             .any(|r| !r.protocol.is_relayed() && r.host.parse::<std::net::Ipv4Addr>().is_err());
 
-    // Sign each relay registration with the identity's certificate key, so the
-    // relay (which holds no secret) can verify the routing key is ours and
-    // reject an on-path attacker's attempt to rebind it. ONE signer is shared
-    // by every registrar generation (see QuicListenerCtx): its strictly-
-    // increasing timestamp series must not restart when the listener rolls.
+    // Sign each relay registration with the device's certificate key, so the
+    // relay (which holds no secret) can verify the routing hash is ours and
+    // reject an on-path attacker's attempt to rebind it. ONE signer per share,
+    // shared by every registrar generation (see QuicListenerCtx), the nz
+    // carrier and the TCP park pool: one strictly-increasing timestamp series
+    // per routing hash, which must not restart when the listener rolls.
     let signer = Arc::new(std::sync::Mutex::new(
         relay_client::protocol::RegisterSigner::new(
             &identity.cert_der_bytes,
             &identity.key_der_bytes,
+            identity.share_id,
         )
-        .map_err(|e| format!("build register signer: {}", e))?
-        .with_token(config.relay_token.clone()),
+        .map_err(|e| format!("build register signer: {}", e))?,
     ));
 
     let cancel = CancellationToken::new();
     let rec = open_record(
         &config,
         Role::Exit,
-        Some(&routing_key),
-        endpoint_refs(&config.relays),
+        Some(&routing_hash),
+        endpoint_refs(&endpoints),
     );
     let listener_ctx = QuicListenerCtx {
         protector: config.protector.clone(),
         want_v6,
-        register_addrs,
+        register_targets,
         register_interval: config.timings.register_interval,
-        signer,
+        signer: signer.clone(),
+        credentials: credentials.clone(),
         identity: identity.clone(),
         timings: config.timings.clone(),
         cancel: cancel.clone(),
@@ -557,9 +573,13 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
         }
     };
     info!(
-        "share: e2e endpoint up, rk {:x?}, registering with {:?}, direct bind_port {}",
-        &routing_key[..4],
-        listener_ctx.register_addrs,
+        "share: e2e endpoint up, rh {:x?}, registering with {:?}, direct bind_port {}",
+        &routing_hash[..4],
+        listener_ctx
+            .register_targets
+            .iter()
+            .map(|t| t.addr)
+            .collect::<Vec<_>>(),
         bind_port
     );
 
@@ -584,11 +604,17 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     let config_for_loop = config.clone();
     let identity_for_loop = identity.clone();
     let record = rec.clone();
+    let carriers = ShareCarriers {
+        relays,
+        signer,
+        credentials: credentials.clone(),
+    };
     let task = tokio::spawn(run_share_loop(
         listener,
         listener_ctx,
         direct_endpoint,
         identity_for_loop,
+        carriers,
         cancel_child,
         config_for_loop,
         conn_log,
@@ -600,7 +626,17 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
         cancel,
         task,
         record,
+        credentials,
     })
+}
+
+/// What a share's non-QUIC carriers (TCP park pool, nz) need beyond the
+/// config: the share's relays with their credentials, its one signer, and
+/// its credential state.
+struct ShareCarriers {
+    relays: Vec<RelayEntry>,
+    signer: Arc<std::sync::Mutex<relay_client::protocol::RegisterSigner>>,
+    credentials: Credentials,
 }
 
 /// Closes the exit's record however `run_share_loop` ends — including the
@@ -648,10 +684,11 @@ impl Drop for ShareRecordGuard {
 struct QuicListenerCtx {
     protector: SocketProtector,
     want_v6: bool,
-    register_addrs: Vec<SocketAddr>,
+    register_targets: Vec<RegisterTarget>,
     register_interval: Duration,
     signer: Arc<std::sync::Mutex<relay_client::protocol::RegisterSigner>>,
-    identity: Arc<Identity>,
+    credentials: Credentials,
+    identity: Arc<ShareIdentity>,
     timings: Timings,
     cancel: CancellationToken,
     rec: Recorder,
@@ -707,19 +744,27 @@ impl QuicListenerCtx {
             .mark(StepKind::Register)
             .detail(format!(
                 "announcing to {} relay(s) every {:?}; relays do not acknowledge",
-                self.register_addrs.len(),
+                self.register_targets.len(),
                 self.register_interval
             ))
             .ok();
-        let registrar = (!self.register_addrs.is_empty()).then(|| {
-            let addrs = self.register_addrs.clone();
+        let registrar = (!self.register_targets.is_empty()).then(|| {
+            let targets = self.register_targets.clone();
             let interval = self.register_interval;
             let signer = self.signer.clone();
+            let credentials = self.credentials.clone();
             let cancel = self.cancel.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = cancel.cancelled() => {}
-                    _ = relay_client::register_loop(registrar_sock, addrs, interval, signer) => {}
+                    _ = relay_client::register_loop(
+                        registrar_sock,
+                        RegisterKind::Quic,
+                        targets,
+                        interval,
+                        signer,
+                        credentials,
+                    ) => {}
                 }
             })
         });
@@ -743,41 +788,47 @@ impl QuicListener {
     }
 }
 
-/// Spawn TCP/TLS registrar pools for every `TcpTls` relay in the config. Each
+/// Spawn TCP/TLS registrar pools for every `TcpTls` relay of the share. Each
 /// pool worker parks a connection at the relay; when a client is spliced in it
 /// runs the E2E TLS server and delivers the session, then re-parks to refill.
 fn spawn_tcp_registrars(
     config: &Config,
-    identity: Arc<Identity>,
+    carriers: &ShareCarriers,
+    identity: Arc<ShareIdentity>,
     session_tx: tokio::sync::mpsc::UnboundedSender<(carrier::PeerSession, Option<u64>)>,
     cancel: CancellationToken,
     rec: &Recorder,
 ) {
     // Connections kept parked per relay so a client always finds one.
     const POOL_SIZE: usize = 4;
-    // Capability token presented in each REGISTER; empty for an open-mode relay.
-    let token = config.relay_token.clone().unwrap_or_default();
-    for relay in config
+    for relay in carriers
         .relays
         .iter()
-        .filter(|r| r.protocol == RelayProtocol::TcpTls)
+        .filter(|r| r.endpoint.protocol == RelayProtocol::TcpTls)
     {
-        let addrs = match resolve_one_relay(relay) {
+        let addrs = match resolve_one_relay(&relay.endpoint) {
             Ok(a) => a,
             Err(e) => {
-                warn!("tcp registrar: skipping unresolvable {}: {}", relay.host, e);
+                warn!(
+                    "tcp registrar: skipping unresolvable {}: {}",
+                    relay.endpoint.host, e
+                );
                 continue;
             }
         };
         for addr in addrs {
             for _ in 0..POOL_SIZE {
                 tokio::spawn(tcp_park_worker(
-                    addr,
+                    ParkTarget {
+                        addr,
+                        credential: relay.credential.clone(),
+                        signer: carriers.signer.clone(),
+                        credentials: carriers.credentials.clone(),
+                    },
                     identity.clone(),
                     session_tx.clone(),
                     cancel.clone(),
                     config.protector.clone(),
-                    token.clone(),
                     rec.clone(),
                 ));
             }
@@ -785,18 +836,35 @@ fn spawn_tcp_registrars(
     }
 }
 
-/// One pool worker: keep a connection parked at `relay_addr`, delivering a
+/// One TCP relay a park worker keeps a connection at, and what it presents
+/// there (read afresh for every connection it opens).
+struct ParkTarget {
+    addr: SocketAddr,
+    credential: crate::identity::Credential,
+    signer: Arc<std::sync::Mutex<relay_client::protocol::RegisterSigner>>,
+    credentials: Credentials,
+}
+
+/// How long a park worker waits after the relay refused or reaped its
+/// connection: 500 ms, doubling while the refusals continue (a lapsed or
+/// missing token is refused every time), at most a minute. A new relay
+/// token cuts the wait short.
+const PARK_RETRY_FIRST: Duration = Duration::from_millis(500);
+const PARK_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// One pool worker: keep a connection parked at the target, delivering a
 /// session whenever a client is spliced in, until cancelled.
-#[allow(clippy::too_many_arguments)]
 async fn tcp_park_worker(
-    relay_addr: SocketAddr,
-    identity: Arc<Identity>,
+    target: ParkTarget,
+    identity: Arc<ShareIdentity>,
     session_tx: tokio::sync::mpsc::UnboundedSender<(carrier::PeerSession, Option<u64>)>,
     cancel: CancellationToken,
     protector: SocketProtector,
-    token: Vec<u8>,
     rec: Recorder,
 ) {
+    let relay_addr = target.addr;
+    let mut token_changed = target.credentials.subscribe();
+    let mut retry = PARK_RETRY_FIRST;
     loop {
         if cancel.is_cancelled() {
             return;
@@ -805,34 +873,42 @@ async fn tcp_park_worker(
             .step_now(StepKind::RelayPark)
             .via(relay_addr)
             .carrier(Carrier::TcpTls);
-        match park_and_accept(relay_addr, identity.as_ref(), &protector, &token, &cancel).await {
+        let wait = match park_and_accept(&target, identity.as_ref(), &protector, &cancel).await {
             Ok(Some(session)) => {
                 parking.detail("a client was spliced in").ok();
                 if session_tx.send((session, None)).is_err() {
                     return; // the share loop is gone
                 }
+                retry = PARK_RETRY_FIRST;
+                continue;
             }
-            // Reaped (idle) or refused (a gated relay rejecting a bad/absent
-            // token) — re-park after a short pause so a refusal doesn't become a
-            // tight reconnect loop.
+            // Reaped (idle) or refused (a relay that will not take this
+            // share: a bad, lapsed or absent token) — re-park after a pause
+            // so a refusal doesn't become a tight reconnect loop.
             Ok(None) => {
                 // The relay does not say which of the two this was, and this
                 // is not the place to guess.
                 parking.fail(
                     Reason::PeerClosed,
-                    "the relay closed the parked connection (idle reap, or a refused token)",
+                    "the relay closed the parked connection (idle reap, or a refused park)",
                 );
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-                }
+                let w = retry;
+                retry = (retry * 2).min(PARK_RETRY_MAX);
+                w
             }
             Err(e) => {
                 debug!("tcp registrar {}: {}", relay_addr, e);
                 parking.fail_with(&e);
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                Duration::from_secs(1)
+            }
+        };
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(wait) => {}
+            r = token_changed.changed() => {
+                // A new token: whatever the relay refused may now be taken.
+                if r.is_ok() {
+                    retry = PARK_RETRY_FIRST;
                 }
             }
         }
@@ -840,32 +916,39 @@ async fn tcp_park_worker(
 }
 
 /// Park one connection at the relay; when a client is spliced in, run the E2E
-/// TLS server and return the session. `Ok(None)` = the relay reaped an idle
-/// parked connection (re-park). Cancellable while parked.
+/// TLS server and return the session. `Ok(None)` = the relay closed the
+/// parked connection (an idle reap, or a refusal; re-park). Cancellable while
+/// parked.
 async fn park_and_accept(
-    relay_addr: SocketAddr,
-    identity: &Identity,
+    target: &ParkTarget,
+    identity: &ShareIdentity,
     protector: &SocketProtector,
-    token: &[u8],
     cancel: &CancellationToken,
 ) -> Result<Option<carrier::PeerSession>, Fault> {
     use tokio::io::AsyncWriteExt;
+    let relay_addr = target.addr;
     let mut tcp = tokio::net::TcpStream::connect(relay_addr)
         .await
         .map_err(|e| Fault::from_io(&e).context("connect relay"))?;
     let _ = tcp.set_nodelay(true);
     carrier::protect_tcp(protector, &tcp);
-    tcp.write_all(&relay_client::tcp::build_preamble(
-        relay_client::tcp::role::REGISTER,
-        &identity.routing_key,
-        token,
-    ))
-    .await
-    .map_err(|e| Fault::from_io(&e).context("register preamble"))?;
+    // Signed after the connect, just before the write: the relay wants each
+    // park's timestamp above the last it took for this share, so the less
+    // time between signing and arriving, the less a sibling worker's park can
+    // overtake it (a park that does lose that race is refused and retried).
+    let token = target.credentials.token(&target.credential);
+    let preamble = target
+        .signer
+        .lock()
+        .expect("register signer")
+        .park_preamble(&token);
+    tcp.write_all(&preamble)
+        .await
+        .map_err(|e| Fault::from_io(&e).context("park preamble"))?;
 
     // Park: wait (no timeout, cancellable) for the first byte — a client was
     // spliced in. EOF (0) means the relay reaped this idle parked connection
-    // (its PARK_TTL); the caller re-parks.
+    // (its PARK_TTL) or refused it; the caller re-parks.
     let mut peek = [0u8; 1];
     let n = tokio::select! {
         _ = cancel.cancelled() => {
@@ -891,57 +974,45 @@ async fn park_and_accept(
 /// Sharer-side Noise UDP carrier. Bind a dedicated socket, register every
 /// `NoiseUdp` relay from it (so those relays route clients here), and run a
 /// multi-client accept dispatcher that delivers each authenticated client as a
-/// session into `session_tx`. A no-op when the config lists no `NoiseUdp` relay.
+/// session into `session_tx`. A no-op when the share lists no `NoiseUdp` relay.
 fn spawn_noise_registrar(
     config: &Config,
-    identity: Arc<Identity>,
+    carriers: &ShareCarriers,
+    identity: Arc<ShareIdentity>,
     session_tx: tokio::sync::mpsc::UnboundedSender<(carrier::PeerSession, Option<u64>)>,
     cancel: CancellationToken,
 ) {
-    let nz_relays: Vec<RelayEndpoint> = config
+    if !carriers
         .relays
         .iter()
-        .filter(|r| r.protocol == RelayProtocol::NoiseUdp)
-        .cloned()
-        .collect();
-    if nz_relays.is_empty() {
+        .any(|r| r.endpoint.protocol == RelayProtocol::NoiseUdp)
+    {
         return;
     }
+    let nz_relays = carriers.relays.clone();
     let protector = config.protector.clone();
-    let token = config.relay_token.clone();
-    let cert_der = identity.cert_der_bytes.clone();
-    let key_der = identity.key_der_bytes.clone();
+    let signer = carriers.signer.clone();
+    let credentials = carriers.credentials.clone();
     let register_interval = config.timings.register_interval;
     let hs_timeout = config.timings.relay_dial_timeout;
     let idle = config.timings.quic_idle_timeout;
 
     tokio::spawn(async move {
-        let addrs: Vec<SocketAddr> = match resolve_relays(&nz_relays) {
-            Ok(a) => a.into_iter().map(|(a, _)| a).collect(),
+        let targets = match resolve_register_targets(&nz_relays, RelayProtocol::NoiseUdp) {
+            Ok(t) => t,
             Err(e) => {
                 warn!("[share] nz: cannot resolve relays: {e}");
                 return;
             }
         };
-        if addrs.is_empty() {
-            return;
-        }
-        let want_v6 = addrs.iter().any(|a| a.is_ipv6());
-        // One signer across every generation: the strictly-increasing
-        // timestamp series must survive listener rolls (see QuicListenerCtx).
-        let signer = match relay_client::protocol::RegisterSigner::new(&cert_der, &key_der) {
-            Ok(s) => Arc::new(std::sync::Mutex::new(s.with_token(token))),
-            Err(e) => {
-                warn!("[share] nz: build register signer: {e}");
-                return;
-            }
-        };
+        let want_v6 = targets.iter().any(|t| t.addr.is_ipv6());
 
         // Rolling listener, nz edition: each generation binds a fresh socket,
         // registers it, and serves handshakes until its dispatcher delivers a
         // session — that socket then belongs to the session (the dispatcher
         // keeps pumping it, but stops accepting new handshakes) and the next
-        // generation takes over the routing key.
+        // generation takes over the routing hash. The share's one signer
+        // spans every generation (see QuicListenerCtx).
         loop {
             // A transient bind failure must not kill the nz carrier for the
             // share's lifetime — retry until it works or the share stops.
@@ -964,17 +1035,28 @@ fn spawn_noise_registrar(
                     }
                 }
             };
-            info!("[share] nz carrier up, registering with {:?}", addrs);
+            info!(
+                "[share] nz carrier up, registering with {:?}",
+                targets.iter().map(|t| t.addr).collect::<Vec<_>>()
+            );
 
             let registrar = {
                 let sock = socket.clone();
-                let addrs = addrs.clone();
+                let targets = targets.clone();
                 let signer = signer.clone();
+                let credentials = credentials.clone();
                 let cancel = cancel.clone();
                 tokio::spawn(async move {
                     tokio::select! {
                         _ = cancel.cancelled() => {}
-                        _ = relay_client::register_loop(sock, addrs, register_interval, signer) => {}
+                        _ = relay_client::register_loop(
+                            sock,
+                            RegisterKind::Nz,
+                            targets,
+                            register_interval,
+                            signer,
+                            credentials,
+                        ) => {}
                     }
                 })
             };
@@ -1009,7 +1091,7 @@ fn spawn_noise_registrar(
 }
 
 /// Read the shared nz socket and route each datagram: to an existing session by
-/// its `recv_index`, or — a fresh `routing_key`-prefixed msg1 — to a new
+/// its `recv_index`, or — a fresh `routing_hash`-prefixed msg1 — to a new
 /// `noise_accept` whose dispatcher-assigned index we record for routing. The
 /// relay is dumb, so all clients arrive from the relay's one address; demux is
 /// purely by the session index, never by source address.
@@ -1022,7 +1104,7 @@ fn spawn_noise_registrar(
 #[allow(clippy::too_many_arguments)]
 async fn noise_accept_dispatcher(
     socket: Arc<UdpSocket>,
-    identity: Arc<Identity>,
+    identity: Arc<ShareIdentity>,
     session_tx: tokio::sync::mpsc::UnboundedSender<(carrier::PeerSession, Option<u64>)>,
     hs_timeout: Duration,
     idle: Duration,
@@ -1038,10 +1120,10 @@ async fn noise_accept_dispatcher(
     // re-delivered to the same session instead of spawning a duplicate.
     let mut by_client: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     // One deobfuscator for this identity's whole flow. It reverses the wire
-    // shaping before we inspect recv_index/routing_key at fixed offsets; the
+    // shaping before we inspect recv_index/routing_hash at fixed offsets; the
     // clean bytes are what we route AND forward to the per-session channels.
-    let shaper = crate::transport::shaper::nz_shaper(&identity.routing_key, &identity.secret);
-    // The `routing_key` prefix is cleartext on the wire (a passive censor learns
+    let shaper = crate::transport::shaper::nz_shaper(&identity.routing_hash, &identity.secret);
+    // The `routing_hash` prefix is cleartext on the wire (a passive censor learns
     // it), so an attacker can forge msg1-shaped packets. We insert routing entries
     // BEFORE the psk-gated handshake completes (they're needed to route msg1
     // retransmits), so a failed accept must reap its entries or the tables grow
@@ -1112,10 +1194,10 @@ async fn noise_accept_dispatcher(
             }
         }
 
-        // 2) A handshake msg1 addressed to us (routing_key prefix)?
-        if clean.len() >= NZ_MSG1_MIN && clean[0..ROUTING_KEY_LEN] == identity.routing_key {
+        // 2) A handshake msg1 addressed to us (routing_hash prefix)?
+        if clean.len() >= NZ_MSG1_MIN && clean[0..ROUTING_HASH_LEN] == identity.routing_hash {
             let idx_b = u32::from_be_bytes(
-                clean[ROUTING_KEY_LEN..ROUTING_KEY_LEN + 4]
+                clean[ROUTING_HASH_LEN..ROUTING_HASH_LEN + 4]
                     .try_into()
                     .unwrap(),
             );
@@ -1208,7 +1290,8 @@ async fn run_share_loop(
     mut listener: QuicListener,
     roll_ctx: QuicListenerCtx,
     direct_endpoint: Option<quinn::Endpoint>,
-    identity: Arc<Identity>,
+    identity: Arc<ShareIdentity>,
+    carriers: ShareCarriers,
     cancel: CancellationToken,
     config: Config,
     conn_log: Option<ConnLog>,
@@ -1255,6 +1338,7 @@ async fn run_share_loop(
     // deliver each spliced client as a session into the same channel.
     spawn_tcp_registrars(
         &config,
+        &carriers,
         identity.clone(),
         session_tx.clone(),
         cancel.clone(),
@@ -1266,6 +1350,7 @@ async fn run_share_loop(
     // channel. No-op when the config lists no NoiseUdp relay.
     spawn_noise_registrar(
         &config,
+        &carriers,
         identity.clone(),
         session_tx.clone(),
         cancel.clone(),
@@ -1530,7 +1615,7 @@ impl futures_util::Sink<Vec<u8>> for ExitTransport {
 #[allow(clippy::too_many_arguments)]
 fn spawn_responder_tunnel(
     session: carrier::PeerSession,
-    identity: Arc<Identity>,
+    identity: Arc<ShareIdentity>,
     config: &Config,
     tunnel_cancel: CancellationToken,
     // The share's own token (`tunnel_cancel`'s parent): cancelled, the
@@ -1792,7 +1877,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     let rec = open_record(
         config,
         Role::Client,
-        Some(&token.routing_key),
+        Some(&token.routing_hash()),
         endpoint_refs(&token.relays),
     );
     rec.mark(StepKind::TokenParse).ok();
@@ -1816,9 +1901,9 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         }
     };
     info!(
-        "connect: relays {:?} for rk {:x?}",
+        "connect: relays {:?} for rh {:x?}",
         relay_addrs,
-        &token.routing_key[..4]
+        &token.routing_hash()[..4]
     );
 
     let cancel = CancellationToken::new();
@@ -2085,7 +2170,7 @@ async fn dial_initiator(
     live_session: &SessionSlot,
 ) -> Result<IpTransport, Fault> {
     // Select the client-side dialer for this endpoint's protocol. The returned
-    // session is end-to-end authenticated (routing-key pinned + secret) whatever
+    // session is end-to-end authenticated (cert-hash pinned + secret) whatever
     // the protocol; the relay is never trusted. Relay path: require the sharer's
     // accept ack so a bad/expired token fails here instead of reconnect-looping.
     let client = carrier::relay_client_for(protocol);
@@ -2093,7 +2178,8 @@ async fn dial_initiator(
     let session = client
         .dial(carrier::DialCtx {
             target: relay_addr,
-            routing_key: token.routing_key,
+            cert_hash: token.cert_hash,
+            routing_hash: token.routing_hash(),
             secret: token.secret,
             protector: &config.protector,
             timings: &config.timings,
@@ -2208,7 +2294,8 @@ async fn dial_initiator(
     if attempt_upgrade {
         let signal = signal.expect("attempt_upgrade requires a signal channel");
         let role = DirectRole::Initiator {
-            routing_key: token.routing_key,
+            cert_hash: token.cert_hash,
+            routing_hash: token.routing_hash(),
             secret: token.secret,
         };
         let stun_servers = config.stun_servers.clone();
@@ -2285,14 +2372,14 @@ async fn dial_initiator(
 fn open_record(
     config: &Config,
     role: Role,
-    routing_key: Option<&[u8]>,
+    routing_hash: Option<&[u8]>,
     endpoints: Vec<EndpointRef>,
 ) -> Recorder {
     match config.record.as_ref() {
         Some(cfg) => Recorder::start(
             cfg,
             role,
-            routing_key,
+            routing_hash,
             endpoints,
             config.enable_direct_upgrade,
         ),
@@ -2501,11 +2588,12 @@ fn spawn_sampler(meters: SessionMeters, cancel: CancellationToken, ended: Cancel
 
 pub(crate) enum DirectRole {
     Initiator {
-        routing_key: [u8; ROUTING_KEY_LEN],
+        cert_hash: CertHash,
+        routing_hash: RoutingHash,
         secret: [u8; SECRET_LEN],
     },
     Responder {
-        identity: Arc<Identity>,
+        identity: Arc<ShareIdentity>,
     },
 }
 
@@ -2814,7 +2902,8 @@ pub(crate) async fn try_direct_upgrade(
 
         let result = match &role {
             DirectRole::Initiator {
-                routing_key,
+                cert_hash,
+                routing_hash,
                 secret,
             } => {
                 try_direct_as_initiator(
@@ -2822,7 +2911,8 @@ pub(crate) async fn try_direct_upgrade(
                     stun_servers,
                     path_ipv6,
                     protector,
-                    *routing_key,
+                    *cert_hash,
+                    *routing_hash,
                     *secret,
                     &timings,
                     &meters.rec,
@@ -2967,7 +3057,7 @@ pub(crate) async fn try_direct_upgrade(
 }
 
 /// Initiator (B): STUN, exchange endpoint, punch, build direct QUIC client
-/// (cert-pinned to `routing_key`, sends `secret` on auth stream). On success
+/// (cert-pinned to `routing_hash`, sends `secret` on auth stream). On success
 /// also returns the punched socket's local address (for event reporting).
 /// The direct path a successful upgrade round produced, carrier-neutral. The
 /// old `(transport, quinn::Connection, local)` triple was QUIC-specific; nz has
@@ -2989,7 +3079,8 @@ async fn try_direct_as_initiator(
     stun_servers: &[String],
     path_ipv6: bool,
     protector: &SocketProtector,
-    routing_key: [u8; ROUTING_KEY_LEN],
+    cert_hash: CertHash,
+    routing_hash: RoutingHash,
     secret: [u8; SECRET_LEN],
     timings: &Timings,
     rec: &Recorder,
@@ -3080,7 +3171,8 @@ async fn try_direct_as_initiator(
         let mut transport = match crate::transport::noise::noise_connect(
             socket,
             learned_peer,
-            &routing_key,
+            &cert_hash,
+            &routing_hash,
             &secret,
             timings.relay_dial_timeout,
             timings.quic_idle_timeout,
@@ -3110,8 +3202,8 @@ async fn try_direct_as_initiator(
     let std_sock = socket
         .into_std()
         .map_err(|e| DirectError::transient(Fault::from_io(&e).context("into_std")))?;
-    let endpoint =
-        client_endpoint(std_sock, routing_key, timings).map_err(DirectError::transient)?;
+    let endpoint = client_endpoint(std_sock, cert_hash, routing_hash, timings)
+        .map_err(DirectError::transient)?;
     // Dial the address the peer's packets actually came from — our NAT has a
     // mapping open toward it, which may not be true of the signaled address.
     // No accept ack on the direct path: the secret is already proven good, and
@@ -3149,7 +3241,7 @@ async fn try_direct_as_responder(
     signal: &mut SignalChannel,
     stun_servers: &[String],
     protector: &SocketProtector,
-    identity: &Identity,
+    identity: &ShareIdentity,
     timings: &Timings,
     conn_log: Option<&SessionLog>,
     rec: &Recorder,
@@ -3235,7 +3327,7 @@ async fn try_direct_as_responder(
     // the relay path; independent keys.
     if signal.is_noise() {
         let socket = std::sync::Arc::new(socket);
-        let shaper = crate::transport::shaper::nz_shaper(&identity.routing_key, &identity.secret);
+        let shaper = crate::transport::shaper::nz_shaper(&identity.routing_hash, &identity.secret);
         let (rx, pump) = crate::transport::noise::spawn_socket_pump(socket.clone(), shaper);
         let mut transport = match crate::transport::noise::noise_accept(
             socket,
@@ -3404,6 +3496,38 @@ fn resolve_relays_preferring_v6(
     let mut addrs = resolve_relays(relays)?;
     addrs.sort_by_key(|(a, _)| !a.is_ipv6()); // false(0)=v6 first, true(1)=v4
     Ok(addrs)
+}
+
+/// Resolve the share's `protocol` relays into registration targets, each
+/// address keeping its endpoint's credential (an address listed twice keeps
+/// the first). Unresolvable endpoints are skipped; none at all is an error.
+fn resolve_register_targets(
+    relays: &[RelayEntry],
+    protocol: RelayProtocol,
+) -> Result<Vec<RegisterTarget>, Fault> {
+    let mut out: Vec<RegisterTarget> = Vec::new();
+    for relay in relays.iter().filter(|r| r.endpoint.protocol == protocol) {
+        match resolve_one_relay(&relay.endpoint) {
+            Ok(addrs) => {
+                for addr in addrs {
+                    if !out.iter().any(|t| t.addr == addr) {
+                        out.push(RegisterTarget {
+                            addr,
+                            credential: relay.credential.clone(),
+                        });
+                    }
+                }
+            }
+            Err(e) => warn!("skipping unresolvable relay: {}", e),
+        }
+    }
+    if out.is_empty() {
+        return Err(Fault::new(
+            Reason::DnsNoRecords,
+            "no relay address resolved from the configured relays",
+        ));
+    }
+    Ok(out)
 }
 
 /// Bind the sharer's UDP socket. When the relay set spans IPv6 (or is mixed),
@@ -3901,7 +4025,7 @@ mod tests {
     async fn responder_upgrade_terminates_when_signal_closes() {
         let _ = env_logger::builder().is_test(true).try_init();
         let timings = Timings::default();
-        let identity = Arc::new(Identity::generate());
+        let identity = Arc::new(ShareIdentity::generate());
         let secret = identity.secret;
 
         // Direct A<->B QUIC session on loopback (no relay needed: we only
@@ -3913,7 +4037,8 @@ mod tests {
 
         let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         b_std.set_nonblocking(true).unwrap();
-        let b_endpoint = client_endpoint(b_std, identity.routing_key, &timings).unwrap();
+        let b_endpoint =
+            client_endpoint(b_std, identity.cert_hash, identity.routing_hash, &timings).unwrap();
 
         let accept_task = tokio::spawn(async move {
             accept_one(&a_endpoint, &secret, false)
@@ -3990,12 +4115,13 @@ mod tests {
             validated: Some(true),
         };
         let config = Config {
-            relays: vec![RelayEndpoint::new("127.0.0.1", relay_port)],
             dns_forwarder: None,
             record: Some(RecordConfig::in_memory().with_network(wifi)),
             ..Config::default()
         };
-        let session = share(Identity::generate(), config).await.expect("share()");
+        let device = DeviceIdentity::generate();
+        let sh = Share::open(&device, vec![RelayEndpoint::new("127.0.0.1", relay_port)]).unwrap();
+        let session = share(device, sh, config).await.expect("share()");
         let record = session.record.clone();
         let cellular = NetworkState {
             kind: NetworkKind::Cellular,

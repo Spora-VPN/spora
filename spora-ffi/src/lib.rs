@@ -275,13 +275,30 @@ fn wrap_protector(cb: Box<dyn SocketProtectorCallback>) -> spora_core::SocketPro
     }))
 }
 
-/// Generate a fresh identity and return its serialized bytes. The platform
-/// (Android app) is expected to persist these bytes — e.g. in
-/// SharedPreferences — and pass them back to `share()` on subsequent
-/// invocations so the share URL stays stable across launches.
+/// Generate a fresh device identity and return its serialized bytes. The
+/// platform persists them and passes them back to `make_share()` and
+/// `share()`.
 #[uniffi::export]
 pub fn make_identity() -> Vec<u8> {
-    spora_core::identity::Identity::generate().to_bytes()
+    spora_core::identity::DeviceIdentity::generate().to_bytes()
+}
+
+/// Make a new share of the device `identity_bytes` over the built-in relay
+/// and return its blob. The platform persists the blob and passes it back
+/// to `share()`, so the share URL stays stable across launches.
+#[uniffi::export]
+pub fn make_share(identity_bytes: Vec<u8>) -> Result<Vec<u8>, ShareError> {
+    let device = spora_core::identity::DeviceIdentity::from_bytes(&identity_bytes)
+        .map_err(ShareError::Generic)?;
+    let share = spora_core::identity::Share::open(
+        &device,
+        vec![spora_core::identity::RelayEndpoint::new(
+            spora_core::DEFAULT_RELAY.0,
+            spora_core::DEFAULT_RELAY.1,
+        )],
+    )
+    .map_err(ShareError::Generic)?;
+    Ok(share.to_blob())
 }
 
 /// Starts sharing this device's connection.
@@ -304,14 +321,16 @@ pub fn make_identity() -> Vec<u8> {
 #[uniffi::export(default(record_dir = None))]
 pub fn share(
     identity_bytes: Vec<u8>,
+    share_blob: Vec<u8>,
     protector: Option<Box<dyn SocketProtectorCallback>>,
     conn_log_dir: Option<String>,
     conn_log_retention_days: Option<u32>,
     conn_log_sessions_only: bool,
     record_dir: Option<String>,
 ) -> Result<ShareResult, ShareError> {
-    let identity =
-        spora_core::identity::Identity::from_bytes(&identity_bytes).map_err(ShareError::Generic)?;
+    let device = spora_core::identity::DeviceIdentity::from_bytes(&identity_bytes)
+        .map_err(ShareError::Generic)?;
+    let share = spora_core::identity::Share::from_blob(&share_blob).map_err(ShareError::Generic)?;
     let conn_log = conn_log_dir.map(|dir| {
         let mut cfg = spora_core::connlog::ConnLogConfig::in_dir(dir);
         if let Some(days) = conn_log_retention_days {
@@ -332,7 +351,7 @@ pub fn share(
         ..spora_core::Config::default()
     };
     let session = RUNTIME
-        .block_on(spora_core::share(identity, config))
+        .block_on(spora_core::share(device, share, config))
         .map_err(|e| ShareError::Generic(e.to_string()))?;
 
     let url = session.url.to_string();
@@ -770,9 +789,10 @@ mod tests {
             drop(conn);
         });
         let dir = tempfile::tempdir().unwrap();
+        // The version byte and any 44 bytes make a token.
         let url = format!(
-            "https://example.invalid/s/{}?r=tcptls/127.0.0.1:{port}",
-            "A".repeat(48)
+            "https://example.invalid/s/AQ{}?r=tcptls/127.0.0.1:{port}",
+            "A".repeat(58)
         );
         let result = connect(
             url,

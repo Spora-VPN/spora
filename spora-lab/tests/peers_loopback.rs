@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use spora_core::identity::{Identity, RelayEndpoint, RelayProtocol};
+use spora_core::identity::{RelayEndpoint, RelayProtocol};
 use spora_core::record::{Carrier, PathKind};
 use spora_core::{CancellationToken, ExitMode, IpTransport, SessionHandler, TunnelEvent};
 use spora_lab::peers::{self, LabPeerOpts};
@@ -42,7 +42,7 @@ async fn udp_echo_over_loopback_relay() {
     // instead of the netstack (which would need real egress).
     let (mut share_cfg, mut share_events) = opts.config();
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let session = spora_core::share(Identity::generate(), share_cfg)
+    let session = peers::share_over(opts.relays.clone(), share_cfg)
         .await
         .expect("share() starts");
     let url = session.url.clone();
@@ -172,7 +172,7 @@ async fn udp_echo_over_v6_loopback_relay() {
 
     let (mut share_cfg, _share_events) = opts.config();
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let session = spora_core::share(Identity::generate(), share_cfg)
+    let session = peers::share_over(opts.relays.clone(), share_cfg)
         .await
         .expect("share() starts against a v6 relay");
     assert!(
@@ -244,9 +244,8 @@ async fn udp_echo_over_relayless_direct() {
     let opts = LabPeerOpts::new("127.0.0.1:0".parse().unwrap(), "stun.invalid:3478");
 
     let (mut share_cfg, _share_events) = opts.config();
-    share_cfg.relays = vec![direct];
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let session = spora_core::share(Identity::generate(), share_cfg)
+    let session = peers::share_over(vec![direct], share_cfg)
         .await
         .expect("relay-less share() starts");
     assert!(
@@ -344,9 +343,8 @@ async fn udp_echo_over_tcp_tls_relay() {
     opts.enable_direct_upgrade = false;
 
     let (mut share_cfg, _share_events) = opts.config();
-    share_cfg.relays = vec![tcp_ep];
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let session = spora_core::share(Identity::generate(), share_cfg)
+    let session = peers::share_over(vec![tcp_ep], share_cfg)
         .await
         .expect("tcp-tls share() starts");
     assert!(
@@ -427,9 +425,8 @@ async fn udp_echo_over_nz_relay() {
     opts.enable_direct_upgrade = false;
 
     let (mut share_cfg, _share_events) = opts.config();
-    share_cfg.relays = vec![nz_ep];
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let session = spora_core::share(Identity::generate(), share_cfg)
+    let session = peers::share_over(vec![nz_ep], share_cfg)
         .await
         .expect("nz share() starts");
     assert!(
@@ -481,18 +478,18 @@ async fn udp_echo_over_nz_relay() {
     session.abort();
 }
 
-/// End-to-end authorization over the TCP/TLS relay: a gated relay (issuer key
-/// configured) parks — and thus serves — only a sharer presenting a valid
-/// capability token bound to its routing key. Without one, the sharer's REGISTER
-/// is refused, so it never parks and the client cannot be routed to it.
+/// End-to-end authorization over the TCP/TLS relay: a relay that wants a
+/// token parks — and thus serves — only a sharer presenting it. Without one,
+/// the sharer's park is refused, so the client cannot be routed to it.
 #[tokio::test(flavor = "multi_thread")]
 async fn tcp_tls_gated_relay_requires_a_valid_token() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let issuer = spora_core::authz::IssuerKeyPair::generate().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_addr = listener.local_addr().unwrap();
-    let state = relay::tcp::TcpRelayState::with_issuer_keys(vec![issuer.public_key()]);
+    let state = relay::tcp::TcpRelayState::with_authorizer(std::sync::Arc::new(
+        relay::authz::StaticToken::new(b"bearer".to_vec()).unwrap(),
+    ));
     tokio::spawn(relay::tcp::serve_tcp(listener, state));
 
     let tcp_ep = spora_core::identity::RelayEndpoint::with_protocol(
@@ -506,16 +503,18 @@ async fn tcp_tls_gated_relay_requires_a_valid_token() {
         o
     };
 
-    // --- Authorized: a valid token for the sharer's routing key -> reachable ---
-    let identity = Identity::generate();
-    let token = issuer.issue(&identity.routing_key);
+    // --- Authorized: the relay's token -> reachable ---
     let (mut share_cfg, _e) = opts.config();
-    share_cfg.relays = vec![tcp_ep.clone()];
-    share_cfg.relay_token = Some(token);
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let session = spora_core::share(identity, share_cfg)
-        .await
-        .expect("authorized share() starts");
+    let session = peers::share_entries(
+        vec![spora_core::identity::RelayEntry {
+            endpoint: tcp_ep.clone(),
+            credential: spora_core::identity::Credential::Static(b"bearer".to_vec()),
+        }],
+        share_cfg,
+    )
+    .await
+    .expect("authorized share() starts");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let (client_cfg, _ce) = opts.config();
@@ -548,9 +547,8 @@ async fn tcp_tls_gated_relay_requires_a_valid_token() {
 
     // --- Unauthorized: no token -> REGISTER refused -> sharer unreachable ---
     let (mut un_share_cfg, _e2) = opts.config();
-    un_share_cfg.relays = vec![tcp_ep];
     un_share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let un_session = spora_core::share(Identity::generate(), un_share_cfg)
+    let un_session = peers::share_over(vec![tcp_ep], un_share_cfg)
         .await
         .expect("share() still starts — it can't know the relay will refuse");
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -582,18 +580,18 @@ async fn relayless_share_with_unresolvable_advertised_host_starts() {
     };
     let opts = LabPeerOpts::new("127.0.0.1:0".parse().unwrap(), "stun.invalid:3478");
     let (mut share_cfg, _events) = opts.config();
-    share_cfg.relays = vec![spora_core::identity::RelayEndpoint::with_protocol(
-        "sharer.unresolvable.invalid",
-        port,
-        spora_core::identity::RelayProtocol::Direct,
-    )];
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
 
-    let session = spora_core::share(Identity::generate(), share_cfg)
-        .await
-        .expect(
-            "relay-less share() must start even when the advertised host does not resolve locally",
-        );
+    let session = peers::share_over(
+        vec![spora_core::identity::RelayEndpoint::with_protocol(
+            "sharer.unresolvable.invalid",
+            port,
+            spora_core::identity::RelayProtocol::Direct,
+        )],
+        share_cfg,
+    )
+    .await
+    .expect("relay-less share() must start even when the advertised host does not resolve locally");
     assert!(
         session
             .url
@@ -668,7 +666,7 @@ async fn carrier_fallback_quic_to_noise() {
 
     let (mut share_cfg, _share_events) = opts.config();
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let session = spora_core::share(Identity::generate(), share_cfg)
+    let session = peers::share_over(opts.relays.clone(), share_cfg)
         .await
         .expect("mixed-carrier share starts");
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -731,7 +729,7 @@ async fn carrier_fallback_udp_to_tcp_tls() {
 
     let (mut share_cfg, _share_events) = opts.config();
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let session = spora_core::share(Identity::generate(), share_cfg)
+    let session = peers::share_over(opts.relays.clone(), share_cfg)
         .await
         .expect("mixed UDP/TCP share starts");
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -795,7 +793,7 @@ async fn reconnect_switches_to_next_carrier() {
 
     let (mut share_cfg, _share_events) = opts.config();
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let session = spora_core::share(Identity::generate(), share_cfg)
+    let session = peers::share_over(opts.relays.clone(), share_cfg)
         .await
         .expect("two-carrier share starts");
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -878,7 +876,7 @@ async fn multi_relay_prefers_ipv6() {
     let opts = LabPeerOpts::new(v4_relay, "127.0.0.1:3478").with_relays([v4_relay, v6_relay]);
     let (mut share_cfg, _se) = opts.config();
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let session = spora_core::share(Identity::generate(), share_cfg)
+    let session = peers::share_over(opts.relays.clone(), share_cfg)
         .await
         .expect("share() starts with two relays");
 
@@ -937,7 +935,7 @@ async fn multi_relay_fails_over_when_preferred_is_dead() {
 
     let (mut share_cfg, _se) = opts.config();
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let session = spora_core::share(Identity::generate(), share_cfg)
+    let session = peers::share_over(opts.relays.clone(), share_cfg)
         .await
         .expect("share() starts");
 
@@ -999,7 +997,7 @@ async fn pump_cpu_time_grows_with_work() {
 
     let (mut share_cfg, _share_events) = opts.config();
     share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
-    let session = spora_core::share(Identity::generate(), share_cfg)
+    let session = peers::share_over(opts.relays.clone(), share_cfg)
         .await
         .expect("share() starts");
 

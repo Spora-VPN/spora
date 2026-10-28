@@ -106,23 +106,49 @@ impl TcpRelayState {
         None
     }
 
-    /// Whether `ts` is fresh for `rk` (strictly above the last accepted).
-    fn is_fresh(&self, rk: &RoutingHash, ts: u64, now: Instant) -> bool {
+    /// Take `ts` as the last park timestamp of `rk` if it is fresh
+    /// (strictly above the last one taken): checked and taken under one
+    /// lock, since parks are read concurrently and a replayed preamble may
+    /// race its original. `Err(())` when stale; `Ok(previous)` otherwise,
+    /// for [`TcpRelayState::give_back_stamp`] should the park be refused.
+    fn take_stamp(
+        &self,
+        rk: RoutingHash,
+        ts: u64,
+        now: Instant,
+    ) -> Result<Option<(u64, Instant)>, ()> {
         let mut st = self.stamps.lock().unwrap();
         if now.duration_since(st.pruned) >= PARK_TS_PRUNE_EVERY {
             st.last
                 .retain(|_, (_, at)| now.duration_since(*at) < PARK_TS_TTL);
             st.pruned = now;
         }
-        match st.last.get(rk) {
-            Some((last, at)) => ts > *last || now.duration_since(*at) >= PARK_TS_TTL,
-            None => true,
+        let previous = st.last.get(&rk).copied();
+        if let Some((last, at)) = previous
+            && ts <= last
+            && now.duration_since(at) < PARK_TS_TTL
+        {
+            return Err(());
         }
+        st.last.insert(rk, (ts, now));
+        Ok(previous)
     }
 
-    /// Note `ts` as the last accepted park timestamp for `rk`.
-    fn accept_stamp(&self, rk: RoutingHash, ts: u64, now: Instant) {
-        self.stamps.lock().unwrap().last.insert(rk, (ts, now));
+    /// A refused park gives its timestamp back (unless a later park has
+    /// taken another since): a refusal must not make the share's own next
+    /// park look stale.
+    fn give_back_stamp(&self, rk: RoutingHash, ts: u64, previous: Option<(u64, Instant)>) {
+        let mut st = self.stamps.lock().unwrap();
+        if st.last.get(&rk).is_some_and(|(t, _)| *t == ts) {
+            match previous {
+                Some(p) => {
+                    st.last.insert(rk, p);
+                }
+                None => {
+                    st.last.remove(&rk);
+                }
+            }
+        }
     }
 
     /// Number of routing hashes with at least one parked connection (for tests).
@@ -184,13 +210,13 @@ async fn handle_conn(mut conn: TcpStream, source: SocketAddr, state: Arc<TcpRela
             let now = Instant::now();
             // Replay guard: without it, anyone who saw one park preamble (it
             // is cleartext) could park connections for that share at will.
-            if !state.is_fresh(&rk, reg.timestamp_millis, now) {
+            let Ok(previous) = state.take_stamp(rk, reg.timestamp_millis, now) else {
                 debug!(
                     "tcp: rejecting stale/replayed park for rh {} from {source}",
                     hex(&rk[..4])
                 );
                 return;
-            }
+            };
             let ctx = RegistrationCtx {
                 cert_hash: reg.cert_hash,
                 share_id: reg.share_id,
@@ -199,6 +225,7 @@ async fn handle_conn(mut conn: TcpStream, source: SocketAddr, state: Arc<TcpRela
                 carrier: Carrier::Tcp,
             };
             if !state.authorizer.authorize(&ctx, &token, SystemTime::now()) {
+                state.give_back_stamp(rk, reg.timestamp_millis, previous);
                 debug!(
                     "tcp: refusing unauthorized park for rh {} (device {}) from {source}",
                     hex(&rk[..4]),
@@ -206,7 +233,6 @@ async fn handle_conn(mut conn: TcpStream, source: SocketAddr, state: Arc<TcpRela
                 );
                 return;
             }
-            state.accept_stamp(rk, reg.timestamp_millis, now);
             debug!("tcp park rh {} from {source}", hex(&rk[..4]));
             // Park the connection; it lives in the queue until a client pops it.
             state.park(rk, conn);
@@ -410,16 +436,40 @@ mod tests {
     }
 
     #[test]
-    fn park_stamps_are_pruned_after_the_registration_timeout() {
+    fn park_stamps_are_taken_once_and_pruned_after_the_registration_timeout() {
         let state = TcpRelayState::new();
         let t0 = Instant::now();
-        state.accept_stamp([1; 20], 100, t0);
-        assert!(!state.is_fresh(&[1; 20], 100, t0));
-        assert!(state.is_fresh(&[1; 20], 101, t0));
+        assert_eq!(state.take_stamp([1; 20], 100, t0), Ok(None));
+        assert_eq!(state.take_stamp([1; 20], 100, t0), Err(()), "a replay");
+        assert_eq!(state.take_stamp([1; 20], 99, t0), Err(()), "older");
+        let prev = state.take_stamp([1; 20], 101, t0).unwrap();
+        assert_eq!(prev.map(|p| p.0), Some(100));
+        // A refused 101 gives the stamp back to 100...
+        state.give_back_stamp([1; 20], 101, prev);
+        assert_eq!(state.take_stamp([1; 20], 100, t0), Err(()));
+        assert!(state.take_stamp([1; 20], 101, t0).is_ok());
+        // ...but never over a later one taken meanwhile.
+        state.give_back_stamp([1; 20], 50, None);
+        assert_eq!(state.take_stamp([1; 20], 101, t0), Err(()));
         // Past the TTL the old stamp no longer counts, and a later park
         // (of any routing hash) prunes it.
         let late = t0 + PARK_TS_TTL + Duration::from_secs(1);
-        assert!(state.is_fresh(&[2; 20], 1, late));
-        assert_eq!(state.stamp_count(), 0);
+        assert!(state.take_stamp([2; 20], 1, late).is_ok());
+        assert_eq!(state.stamp_count(), 1, "only the new one");
+    }
+
+    #[test]
+    fn concurrent_replays_of_one_preamble_park_once() {
+        let state = TcpRelayState::new();
+        let t0 = Instant::now();
+        let taken: usize = std::thread::scope(|s| {
+            (0..8)
+                .map(|_| s.spawn(|| state.take_stamp([3; 20], 500, t0).is_ok()))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| usize::from(h.join().unwrap()))
+                .sum()
+        });
+        assert_eq!(taken, 1);
     }
 }

@@ -3604,6 +3604,52 @@ pub(crate) fn bind_local_udp(
     Ok(std)
 }
 
+/// Fail at once when the kernel has no route to `peer` for a socket set up
+/// like [`bind_local_udp`]'s (same family, same protector).
+///
+/// quinn-udp logs a send error and drops the datagram as if it were lost,
+/// so a QUIC dial to an unroutable address (a v6 relay on a network without
+/// IPv6: the kernel answers every Initial with ENETUNREACH) would wait out
+/// the whole handshake timeout before the next relay is tried. A UDP
+/// `connect()` is the kernel's route lookup with no packet sent. It runs on
+/// a throwaway socket so the dial's own stays unconnected: quinn sends with
+/// an explicit destination, which the BSDs refuse on a connected socket.
+/// Only a "no route" answer fails the dial; anything else lets it go ahead.
+pub(crate) fn check_udp_route(protector: &SocketProtector, peer: SocketAddr) -> Result<(), Fault> {
+    use std::io::ErrorKind::{AddrNotAvailable, HostUnreachable, NetworkDown, NetworkUnreachable};
+    let wildcard: SocketAddr = if peer.is_ipv6() {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let probe = match std::net::UdpSocket::bind(wildcard) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("route check to {peer} skipped: bind {wildcard}: {e}");
+            return Ok(());
+        }
+    };
+    apply_protector_to_std(protector, &probe);
+    match probe.connect(peer) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                NetworkUnreachable | HostUnreachable | NetworkDown | AddrNotAvailable
+            ) =>
+        {
+            Err(Fault::new(
+                Reason::NoRoute,
+                format!("no route to {peer}: {e}"),
+            ))
+        }
+        Err(e) => {
+            debug!("route check to {peer} inconclusive: {e}");
+            Ok(())
+        }
+    }
+}
+
 /// Length of the per-session hole-punch markers.
 const PUNCH_MARKER_LEN: usize = 16;
 

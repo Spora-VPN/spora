@@ -33,7 +33,7 @@ use crate::identity::{CertHash, RelayProtocol, RoutingHash, SECRET_LEN};
 use crate::record::{Carrier, Fault, PathKind, Recorder, StepKind};
 use crate::signal::SignalChannel;
 use crate::transport::IpTransport;
-use crate::{SocketProtector, Timings, bind_local_udp};
+use crate::{SocketProtector, Timings, bind_local_udp, check_udp_route};
 
 /// Tunnel MTU reported for a stream carrier. A byte stream has no per-packet
 /// datagram limit (framing + TCP handle any size), but the inner netstack still
@@ -144,7 +144,11 @@ async fn quic_dial(ctx: DialCtx<'_>, rk_dcid: bool) -> Result<PeerSession, Fault
         PathKind::DirectAdvertised
     };
     let bind = ctx.rec.step(StepKind::SocketBind).via(ctx.target);
-    let std_socket = match bind_local_udp(ctx.protector, ctx.target) {
+    // quinn would take an unroutable target's send errors for loss and wait
+    // out the handshake timeout; the route check fails such a dial at once.
+    let std_socket = match bind_local_udp(ctx.protector, ctx.target)
+        .and_then(|s| check_udp_route(ctx.protector, ctx.target).map(|()| s))
+    {
         Ok(s) => {
             match s.local_addr() {
                 Ok(a) => bind.local(a).ok(),

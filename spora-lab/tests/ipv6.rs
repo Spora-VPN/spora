@@ -9,7 +9,7 @@
 //! exercises a single flow table serving both families.
 
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV4};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use spora_core::TunnelEvent;
 use spora_core::identity::Token;
@@ -27,6 +27,7 @@ fn main() {
             firewalled_v6_direct_upgrade,
             inner_v6_through_v4_tunnel,
             mixed_family_relay_forwarding,
+            v6_relay_without_v6_route,
         ],
         &["ip6tables"],
     );
@@ -456,6 +457,49 @@ fn mixed_family_relay_forwarding() -> Result<(), String> {
     if stats.received != 20 {
         return fail(format!(
             "udp echo lost packets across the mixed-family relay: {stats:?}"
+        ));
+    }
+
+    client.stop();
+    sharer.stop();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 6. v6_relay_without_v6_route
+//
+// A client on a network with no IPv6 (a phone on v4-only Wi-Fi: link-local
+// only, no v6 route) given a share whose relays include a v6 one. The client
+// tries v6 first; the kernel knows at once there is no route
+// (ENETUNREACH), so the dial must move on to the v4 relay at once instead of
+// waiting out a timeout (`relay_dial_timeout`, 8 s): quinn takes send errors
+// for loss, so nothing but the dialer's own route check notices.
+
+fn v6_relay_without_v6_route() -> Result<(), String> {
+    let topo = dual_topology(NatKind::Open, NatKind::Open)?;
+    let wan = services::start_wan_dual(&topo.wan, relay::State::default)?;
+
+    let mut opts = LabPeerOpts::new(wan.relay_addr6()?, wan.stun_server())
+        .with_relays([wan.relay_addr6()?, wan.relay_addr()]);
+    opts.enable_direct_upgrade = false;
+    let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
+
+    // The client's network loses IPv6: no route, no global address.
+    topo.client.run("ip -6 route del default")?;
+    topo.client.run("ip -6 addr flush dev wan0 scope global")?;
+
+    let started = Instant::now();
+    let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
+    let took = started.elapsed();
+    let relay_peer = wait_relay_session(&mut sharer, &mut client)?;
+    if !relay_peer.is_ipv4() {
+        return fail(format!(
+            "client should have fallen back to the v4 relay, got {relay_peer}"
+        ));
+    }
+    if took > Duration::from_secs(5) {
+        return fail(format!(
+            "connect took {took:?}: the unroutable v6 relay was not skipped at once"
         ));
     }
 

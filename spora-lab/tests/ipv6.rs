@@ -16,7 +16,9 @@ use spora_core::identity::Token;
 use spora_lab::peers::{self, LabPeerOpts};
 use spora_lab::services;
 use spora_lab::topology::{Topology, TopologySpec};
-use spora_lab::{ECHO_TCP_PORT, ECHO_UDP_PORT, NatKind, WAN_SERVICES_IP, WAN_SERVICES_IP6};
+use spora_lab::{
+    ECHO_TCP_PORT, ECHO_UDP_PORT, NatKind, RELAY_PORT, WAN_SERVICES_IP, WAN_SERVICES_IP6,
+};
 
 fn main() {
     let ok = spora_lab::harness::lab_main_with_tools(
@@ -30,6 +32,8 @@ fn main() {
             v6_relay_without_v6_route,
             relay_listed_by_both_addresses,
             v4_only_sharer_on_a_dual_stack_relay,
+            sharer_v4_path_down_v6_client_gets_through,
+            sharer_v6_path_down_client_fails_over_to_v4,
         ],
         &["ip6tables"],
     );
@@ -76,6 +80,39 @@ fn wait_relay_session(
         TunnelEvent::RelaySessionEstablished { peer } => Ok(peer),
         _ => unreachable!("predicate matched RelaySessionEstablished"),
     }
+}
+
+/// Like [`wait_relay_session`], but also the sharer's side: the relay as
+/// each end saw it, `(client's, sharer's)` — so which family each leg ran
+/// over. The sharer's dual-stack socket reports a v4 relay v4-mapped; it is
+/// canonicalized here.
+fn wait_relay_legs(
+    sharer: &mut peers::SharerHandle,
+    client: &mut peers::ClientHandle,
+) -> Result<(SocketAddr, SocketAddr), String> {
+    let established = |e: &TunnelEvent| matches!(e, TunnelEvent::RelaySessionEstablished { .. });
+    let peer = |e| match e {
+        TunnelEvent::RelaySessionEstablished { peer } => peer,
+        _ => unreachable!("predicate matched RelaySessionEstablished"),
+    };
+    let client_leg = peer(client.wait_event(established, Duration::from_secs(15))?);
+    let sharer_leg = peer(sharer.wait_event(established, Duration::from_secs(15))?);
+    let sharer_leg = SocketAddr::new(sharer_leg.ip().to_canonical(), sharer_leg.port());
+    Ok((client_leg, sharer_leg))
+}
+
+/// Drop, on `ns`, everything arriving from the relay in one family: that
+/// side's path from the relay is dead while its REGISTERs still go out.
+fn drop_from_relay(ns: &spora_lab::netns::Netns, v6: bool) -> Result<(), String> {
+    let (tool, relay) = if v6 {
+        ("ip6tables", WAN_SERVICES_IP6)
+    } else {
+        ("iptables", WAN_SERVICES_IP)
+    };
+    ns.run(&format!(
+        "{tool} -A INPUT -s {relay} -p udp --sport {RELAY_PORT} -j DROP"
+    ))
+    .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -515,11 +552,9 @@ fn v6_relay_without_v6_route() -> Result<(), String> {
 //
 // The shape Spora's relays have in a share: ONE dual-stack relay process,
 // listed by its v6 and its v4 address. A dual-stack sharer registers through
-// both, and the relay keeps one binding per share, so the later REGISTER of
-// each round (v4, listed second) overwrites the earlier: the sharer's leg of
-// a session runs over v4 even when the client came in over v6. The direct
-// upgrade must not care — the sharer punches in the family the client
-// signals — so a v6 client still ends up on a v6 direct path.
+// both and the relay keeps a binding per family, so a v6 client's session
+// runs over v6 on the sharer's leg too; the direct upgrade then goes v6 as
+// well (the sharer punches in the family the client signals).
 
 fn relay_listed_by_both_addresses() -> Result<(), String> {
     let topo = dual_topology(NatKind::Open, NatKind::Open)?;
@@ -528,11 +563,13 @@ fn relay_listed_by_both_addresses() -> Result<(), String> {
     let opts = LabPeerOpts::new(wan.relay_addr6()?, wan.stun_server6()?)
         .with_relays([wan.relay_addr6()?, wan.relay_addr()]);
     let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
+    // Let a full round (v6, then v4 FAMILY_GAP later) land first.
+    std::thread::sleep(relay_client::FAMILY_GAP * 2);
     let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
-    let client_leg = wait_relay_session(&mut sharer, &mut client)?;
-    if !client_leg.is_ipv6() {
+    let (client_leg, sharer_leg) = wait_relay_legs(&mut sharer, &mut client)?;
+    if !client_leg.is_ipv6() || !sharer_leg.is_ipv6() {
         return fail(format!(
-            "client should dial the v6 address first, got {client_leg}"
+            "a v6 client should run over v6 on both legs: client {client_leg}, sharer {sharer_leg}"
         ));
     }
 
@@ -589,6 +626,74 @@ fn v4_only_sharer_on_a_dual_stack_relay() -> Result<(), String> {
     let stats = client.udp_echo(svc(ECHO_UDP_PORT), 20, 200, Duration::from_secs(30))?;
     if stats.received != 20 {
         return fail(format!("udp echo lost packets: {stats:?}"));
+    }
+
+    client.stop();
+    sharer.stop();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 9. sharer_v4_path_down_v6_client_gets_through
+//
+// A dual-stack sharer whose path from the relay is dead over v4 (a lapsed
+// NAT mapping looks like this) while its REGISTERs still go out. With one
+// binding per share the relay would send every client down the v4 path,
+// whichever relay address it dialled; with one per family a v6 client goes
+// down the sharer's v6 path and gets through.
+
+fn sharer_v4_path_down_v6_client_gets_through() -> Result<(), String> {
+    let topo = dual_topology(NatKind::Open, NatKind::Open)?;
+    let wan = services::start_wan_dual(&topo.wan, relay::State::default)?;
+    drop_from_relay(&topo.sharer, false)?;
+
+    let mut opts = LabPeerOpts::new(wan.relay_addr6()?, wan.stun_server())
+        .with_relays([wan.relay_addr6()?, wan.relay_addr()]);
+    opts.enable_direct_upgrade = false;
+    opts.timings.relay_dial_timeout = Duration::from_secs(2);
+    let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
+    std::thread::sleep(relay_client::FAMILY_GAP * 2);
+    let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
+    let (client_leg, sharer_leg) = wait_relay_legs(&mut sharer, &mut client)?;
+    if !client_leg.is_ipv6() || !sharer_leg.is_ipv6() {
+        return fail(format!(
+            "expected v6 on both legs: client {client_leg}, sharer {sharer_leg}"
+        ));
+    }
+    let stats = client.udp_echo(svc(ECHO_UDP_PORT), 20, 200, Duration::from_secs(30))?;
+    if stats.received != 20 {
+        return fail(format!("udp echo lost packets: {stats:?}"));
+    }
+
+    client.stop();
+    sharer.stop();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 10. sharer_v6_path_down_client_fails_over_to_v4
+//
+// The other way round: the sharer's path from the relay is dead over v6. The
+// client's v6 dial goes down it and times out; its next dial, to the relay's
+// v4 address, goes down the sharer's v4 path and gets through.
+
+fn sharer_v6_path_down_client_fails_over_to_v4() -> Result<(), String> {
+    let topo = dual_topology(NatKind::Open, NatKind::Open)?;
+    let wan = services::start_wan_dual(&topo.wan, relay::State::default)?;
+    drop_from_relay(&topo.sharer, true)?;
+
+    let mut opts = LabPeerOpts::new(wan.relay_addr6()?, wan.stun_server())
+        .with_relays([wan.relay_addr6()?, wan.relay_addr()]);
+    opts.enable_direct_upgrade = false;
+    opts.timings.relay_dial_timeout = Duration::from_secs(2);
+    let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
+    std::thread::sleep(relay_client::FAMILY_GAP * 2);
+    let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
+    let (client_leg, sharer_leg) = wait_relay_legs(&mut sharer, &mut client)?;
+    if !client_leg.is_ipv4() || !sharer_leg.is_ipv4() {
+        return fail(format!(
+            "expected v4 on both legs: client {client_leg}, sharer {sharer_leg}"
+        ));
     }
 
     client.stop();

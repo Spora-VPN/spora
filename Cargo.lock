@@ -1804,6 +1804,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "rustls-webpki",
+ "socket2 0.5.10",
  "tokio",
 ]
 

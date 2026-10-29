@@ -8,7 +8,8 @@
 //!     share_id)[..20]`, verifies the signature, enforces a strictly-
 //!     increasing timestamp per routing hash (replay guard), asks its
 //!     [`authz::Authorizer`] about the token, and stores
-//!     `routing_hash -> A's UDP addr`. It holds no secret — it only verifies.
+//!     `routing_hash -> A's UDP addr`, one per address family (see
+//!     [`Registration`]). It holds no secret — it only verifies.
 //!   - B (client) sends a QUIC Initial with DCID = the routing hash. The
 //!     relay reads the DCID out of the long header, looks up A's addr,
 //!     installs a bidirectional flow `(B_addr <-> A_addr)`, and forwards.
@@ -57,15 +58,119 @@ pub const NZ_MSG1_MIN: usize = ROUTING_HASH_LEN + 4 + 48;
 /// frees the slot quickly. See the one-at-a-time logic in `handle_packet`.
 pub const REVERSE_ACTIVITY_GRACE: Duration = Duration::from_secs(20);
 
-/// One share's registration: where its sharer is, when it last refreshed,
+/// One share's registration: where its sharer is in each address family,
 /// the last signed timestamp accepted (the replay guard), and which device it
 /// is (for the session log).
+///
+/// A dual-stack sharer registers with a relay listed by both its addresses
+/// through both, and each family keeps its own binding: a client is sent to
+/// the sharer in the client's own family, so a client that fails over from
+/// one family to the other reaches the sharer by its other path too (a
+/// sharer whose v4 mapping lapsed is still reachable over v6, and the other
+/// way round). A family the sharer has only one binding in serves clients of
+/// both. The replay guard stays ONE per registration, across families: the
+/// signature does not cover the family, so a guard per family would let a
+/// REGISTER captured on one path be replayed from an address of the other
+/// and take that family's binding. The sharer spaces its families apart in
+/// each round so that they arrive in the order it signed them.
 #[derive(Clone, Copy)]
 struct Registration {
-    addr: SocketAddr,
-    seen: Instant,
+    v4: Option<Binding>,
+    v6: Option<Binding>,
     last_ts: u64,
     cert_hash: CertHash,
+}
+
+/// Where a share's sharer is in one address family.
+#[derive(Clone, Copy)]
+struct Binding {
+    addr: SocketAddr,
+    seen: Instant,
+    /// REGISTERs accepted from the other family since this binding's last
+    /// one. A sharer refreshes both families every round, so this stays at
+    /// most 1 while both are alive; past that, this family missed a round (a
+    /// lost packet, or the sharer lost this family) and its clients go to
+    /// the other binding, which it is still refreshing.
+    others_since: u32,
+}
+
+/// Whether `addr` is an IPv4 peer. A dual-stack socket reports v4 peers
+/// v4-mapped; they are v4 here.
+fn is_v4(addr: &SocketAddr) -> bool {
+    addr.ip().to_canonical().is_ipv4()
+}
+
+impl Registration {
+    fn new(cert_hash: CertHash) -> Registration {
+        Registration {
+            v4: None,
+            v6: None,
+            last_ts: 0,
+            cert_hash,
+        }
+    }
+
+    /// An accepted REGISTER from `src`.
+    fn refresh(&mut self, src: SocketAddr, ts: u64, now: Instant) {
+        let v4 = is_v4(&src);
+        let (own, other) = if v4 {
+            (&mut self.v4, &mut self.v6)
+        } else {
+            (&mut self.v6, &mut self.v4)
+        };
+        let moved = own.is_some_and(|b| b.addr != src);
+        *own = Some(Binding {
+            addr: src,
+            seen: now,
+            others_since: 0,
+        });
+        if let Some(b) = other {
+            b.others_since = b.others_since.saturating_add(1);
+            // A v6 binding that moved means the sharer moved: a listener
+            // rolled to a new port after accepting a session, or a new
+            // network (v6 is rarely translated, so its address is the
+            // sharer's own). The v4 binding then still names the old one
+            // until its REGISTER follows, FAMILY_GAP later — a listener
+            // that takes no new clients — so it is behind until then. A v4
+            // binding that moved says nothing of the sharer: a NAT may hand
+            // it a new port at any time.
+            if moved && !v4 {
+                b.others_since = b.others_since.max(2);
+            }
+        }
+        self.last_ts = ts;
+    }
+
+    /// Forget bindings not refreshed within `timeout`. False when none is
+    /// left.
+    fn expire(&mut self, now: Instant, timeout: Duration) -> bool {
+        for b in [&mut self.v4, &mut self.v6] {
+            if b.is_some_and(|b| now.duration_since(b.seen) >= timeout) {
+                *b = None;
+            }
+        }
+        self.v4.is_some() || self.v6.is_some()
+    }
+
+    /// Where to send a client arriving from `client`: the sharer in the
+    /// client's family while that binding is current, else the other one.
+    fn route(&self, client: &SocketAddr) -> Option<SocketAddr> {
+        let (own, other) = if is_v4(client) {
+            (self.v4, self.v6)
+        } else {
+            (self.v6, self.v4)
+        };
+        match (own, other) {
+            (Some(own), Some(other)) if own.others_since > 1 => Some(other.addr),
+            (Some(own), _) => Some(own.addr),
+            (None, other) => other.map(|b| b.addr),
+        }
+    }
+
+    /// Whether `addr` is one of the sharer's own addresses.
+    fn is_sharer(&self, addr: &SocketAddr) -> bool {
+        [self.v4, self.v6].iter().flatten().any(|b| b.addr == *addr)
+    }
 }
 
 /// A forwarding-table entry. Stored under both endpoints of a flow.
@@ -238,40 +343,41 @@ impl State {
             }
         }
         if let Some(key @ (rk, _)) = matched
-            && let Some(Registration {
-                addr: sharer_addr,
-                seen: reg_ts,
-                cert_hash,
-                ..
-            }) = self.registrations.get(&key).copied()
+            && let Some(reg) = self.registrations.get_mut(&key)
         {
+            // Sweep only runs when packets arrive, so a quiet relay can
+            // still hold a binding well past its timeout. Treat an expired
+            // one as absent (and drop it now) — otherwise we'd forward to a
+            // dead sharer and, worse, install a flow keyed to its address
+            // that blocks its one-flow slot until the flow itself times out.
+            if !reg.expire(now, self.registration_timeout) {
+                self.registrations.remove(&key);
+                debug!(
+                    "ignoring expired registration rh {} for client {}",
+                    hex(&rk[..4]),
+                    src
+                );
+                return Action::Drop;
+            }
+            let reg = *reg;
+            let cert_hash = reg.cert_hash;
+            let Some(sharer_addr) = reg.route(&src) else {
+                return Action::Drop;
+            };
             // Refuse a self-referential or non-relayable flow *before* the
             // one-at-a-time check, so a spoofed packet can neither bootstrap
             // a self-sustaining loop nor occupy the sharer's flow slot.
             // flows.insert(src, ...) and flows.insert(sharer_addr, ...)
             // collapse to flows[X] = (X) when src == sharer_addr, which
             // would make the relay forward every packet from X back to X
-            // forever from a single (spoofed) packet.
-            if src == sharer_addr || !is_relayable(&src) {
+            // forever from a single (spoofed) packet; a source that is the
+            // sharer's binding in the other family would loop the relay
+            // between the sharer's own two addresses.
+            if reg.is_sharer(&src) || !is_relayable(&src) {
                 debug!(
                     "refusing self-referential/non-relayable flow for {} (rh {})",
                     src,
                     hex(&rk[..4])
-                );
-                return Action::Drop;
-            }
-            // Sweep only runs when packets arrive, so a quiet relay can
-            // still hold a registration well past its timeout. Treat an
-            // expired one as absent (and drop it now) — otherwise we'd
-            // forward to a dead sharer and, worse, install a flow keyed
-            // to its address that blocks its one-flow slot until the
-            // flow itself times out.
-            if now.duration_since(reg_ts) >= self.registration_timeout {
-                self.registrations.remove(&key);
-                debug!(
-                    "ignoring expired registration rh {} for client {}",
-                    hex(&rk[..4]),
-                    src
                 );
                 return Action::Drop;
             }
@@ -417,16 +523,13 @@ impl State {
                     );
                     return;
                 }
-                let is_new = !self.registrations.contains_key(&key);
-                self.registrations.insert(
-                    key,
-                    Registration {
-                        addr: src,
-                        seen: now,
-                        last_ts: reg.timestamp_millis,
-                        cert_hash: reg.cert_hash,
-                    },
-                );
+                let entry = self
+                    .registrations
+                    .entry(key)
+                    .or_insert_with(|| Registration::new(reg.cert_hash));
+                let fam = if is_v4(&src) { entry.v4 } else { entry.v6 };
+                let is_new = fam.is_none();
+                entry.refresh(src, reg.timestamp_millis, now);
                 if is_new {
                     info!("REGISTER {kind:?} rh {} from {}", hex(&rk[..4]), src);
                 } else {
@@ -448,7 +551,7 @@ impl State {
         let registration_timeout = self.registration_timeout;
         let flow_timeout = self.flow_timeout;
         self.registrations
-            .retain(|_, r| now.duration_since(r.seen) < registration_timeout);
+            .retain(|_, r| r.expire(now, registration_timeout));
         // Close the session log entry for each expired flow before dropping it.
         // The shared `SessionState` makes the close idempotent, so the flow's
         // two entries (which may expire in different sweeps) emit exactly one
@@ -616,6 +719,159 @@ mod tests {
         let pkt = short_header();
         assert_eq!(s.handle_packet(a_addr, &pkt, now), Action::Forward(b_addr));
         assert_eq!(s.handle_packet(b_addr, &pkt, now), Action::Forward(a_addr));
+    }
+
+    // A dual-stack socket's view of a sharer and clients: v4 peers v4-mapped.
+    const SHARER6: &str = "[2001:db8::a]:1111";
+    const SHARER4: &str = "[::ffff:203.0.113.14]:1111";
+    const CLIENT6: &str = "[2001:db8::b]:2222";
+    const CLIENT4: &str = "[::ffff:198.51.100.7]:3333";
+
+    #[test]
+    fn each_client_reaches_the_sharer_in_its_own_family() {
+        let mut s = State::default();
+        let now = Instant::now();
+        let mut a = registrar();
+        s.handle_packet(addr(SHARER6), &a.next_register_packet(), now);
+        s.handle_packet(addr(SHARER4), &a.next_register_packet(), now);
+        assert_eq!(s.registration_count(), 1, "one registration, two bindings");
+        let initial = initial_with_dcid(&a.routing_key());
+        assert_eq!(
+            s.handle_packet(addr(CLIENT6), &initial, now),
+            Action::Forward(addr(SHARER6))
+        );
+        assert_eq!(
+            s.handle_packet(addr(CLIENT4), &initial, now),
+            Action::Forward(addr(SHARER4))
+        );
+    }
+
+    #[test]
+    fn a_sharer_in_one_family_serves_clients_of_both() {
+        let mut s = State::default();
+        let now = Instant::now();
+        let mut a = registrar();
+        s.handle_packet(addr(SHARER4), &a.next_register_packet(), now);
+        let initial = initial_with_dcid(&a.routing_key());
+        assert_eq!(
+            s.handle_packet(addr(CLIENT6), &initial, now),
+            Action::Forward(addr(SHARER4))
+        );
+    }
+
+    #[test]
+    fn a_family_that_misses_a_round_hands_its_clients_to_the_other() {
+        let mut s = State::default();
+        let now = Instant::now();
+        let mut a = registrar();
+        let initial = initial_with_dcid(&a.routing_key());
+        // A round through both, then one through v4 alone.
+        s.handle_packet(addr(SHARER6), &a.next_register_packet(), now);
+        s.handle_packet(addr(SHARER4), &a.next_register_packet(), now);
+        s.handle_packet(addr(SHARER4), &a.next_register_packet(), now);
+        assert_eq!(
+            s.handle_packet(addr(CLIENT6), &initial, now),
+            Action::Forward(addr(SHARER4))
+        );
+        // v6 back: its clients go to it again.
+        let mut s2 = State::default();
+        let mut b = registrar();
+        let initial = initial_with_dcid(&b.routing_key());
+        s2.handle_packet(addr(SHARER6), &b.next_register_packet(), now);
+        s2.handle_packet(addr(SHARER4), &b.next_register_packet(), now);
+        s2.handle_packet(addr(SHARER4), &b.next_register_packet(), now);
+        s2.handle_packet(addr(SHARER6), &b.next_register_packet(), now);
+        assert_eq!(
+            s2.handle_packet(addr(CLIENT6), &initial, now),
+            Action::Forward(addr(SHARER6))
+        );
+    }
+
+    #[test]
+    fn a_sharer_that_moved_is_looked_for_where_it_went() {
+        let mut s = State::default();
+        let now = Instant::now();
+        let mut a = registrar();
+        let initial = initial_with_dcid(&a.routing_key());
+        s.handle_packet(addr(SHARER6), &a.next_register_packet(), now);
+        s.handle_packet(addr(SHARER4), &a.next_register_packet(), now);
+        // The listener rolled: v6 from the new port, v4 not yet.
+        let new6 = addr("[2001:db8::a]:1112");
+        s.handle_packet(new6, &a.next_register_packet(), now);
+        assert_eq!(
+            s.handle_packet(addr(CLIENT4), &initial, now),
+            Action::Forward(new6),
+            "a v4 client must not be sent to the old listener"
+        );
+        // A NAT moving the v4 binding leaves v6 where it is.
+        let mut s = State::default();
+        let mut b = registrar();
+        let initial = initial_with_dcid(&b.routing_key());
+        s.handle_packet(addr(SHARER6), &b.next_register_packet(), now);
+        s.handle_packet(addr(SHARER4), &b.next_register_packet(), now);
+        s.handle_packet(addr(SHARER6), &b.next_register_packet(), now);
+        s.handle_packet(
+            addr("[::ffff:203.0.113.14]:4444"),
+            &b.next_register_packet(),
+            now,
+        );
+        assert_eq!(
+            s.handle_packet(addr(CLIENT6), &initial, now),
+            Action::Forward(addr(SHARER6))
+        );
+    }
+
+    #[test]
+    fn a_register_replayed_from_the_other_family_is_refused() {
+        let mut s = State::default();
+        let now = Instant::now();
+        let mut a = registrar();
+        let pkt = a.next_register_packet();
+        s.handle_packet(addr(SHARER4), &pkt, now);
+        // Captured on the v4 path, replayed from a v6 address of the
+        // attacker's: one guard across families refuses it.
+        s.handle_packet(addr("[2001:db8::66]:6666"), &pkt, now);
+        let initial = initial_with_dcid(&a.routing_key());
+        assert_eq!(
+            s.handle_packet(addr(CLIENT6), &initial, now),
+            Action::Forward(addr(SHARER4))
+        );
+    }
+
+    #[test]
+    fn an_expired_binding_hands_its_clients_to_the_other() {
+        let mut s = State::with_timeouts(Duration::from_secs(10), FLOW_TIMEOUT, SWEEP_INTERVAL);
+        let t0 = Instant::now();
+        let mut a = registrar();
+        s.handle_packet(addr(SHARER4), &a.next_register_packet(), t0);
+        s.handle_packet(
+            addr(SHARER6),
+            &a.next_register_packet(),
+            t0 + Duration::from_secs(5),
+        );
+        let initial = initial_with_dcid(&a.routing_key());
+        assert_eq!(
+            s.handle_packet(addr(CLIENT4), &initial, t0 + Duration::from_secs(12)),
+            Action::Forward(addr(SHARER6))
+        );
+        s.sweep(t0 + Duration::from_secs(16));
+        assert_eq!(s.registration_count(), 0, "both bindings expired");
+    }
+
+    #[test]
+    fn a_client_at_the_sharers_other_address_is_refused() {
+        let mut s = State::default();
+        let now = Instant::now();
+        let mut a = registrar();
+        // v4 fell behind, so a v4 client would go to the v6 binding: from
+        // the sharer's own v4 address that would loop the relay between the
+        // sharer's two addresses.
+        s.handle_packet(addr(SHARER4), &a.next_register_packet(), now);
+        s.handle_packet(addr(SHARER6), &a.next_register_packet(), now);
+        s.handle_packet(addr(SHARER6), &a.next_register_packet(), now);
+        let initial = initial_with_dcid(&a.routing_key());
+        assert_eq!(s.handle_packet(addr(SHARER4), &initial, now), Action::Drop);
+        assert_eq!(s.flow_count(), 0);
     }
 
     #[test]

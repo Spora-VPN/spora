@@ -47,6 +47,9 @@ pub struct RegisterTarget {
 /// this host can send to is no one share's business); the repeats in
 /// between are debug lines.
 ///
+/// Each round goes to the IPv6 targets first and, [`FAMILY_GAP`] later, to
+/// the IPv4 ones.
+///
 /// `socket` should be shared (e.g. via `Arc<UdpSocket>`) with quinn's server
 /// endpoint so a single NAT mapping is used for both registration and
 /// incoming peer connections.
@@ -59,6 +62,9 @@ pub async fn register_loop(
     credentials: Credentials,
 ) {
     let mut changed = credentials.subscribe();
+    let (v4, v6): (Vec<RegisterTarget>, Vec<RegisterTarget>) = targets
+        .into_iter()
+        .partition(|t| t.addr.ip().to_canonical().is_ipv4());
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -76,7 +82,10 @@ pub async fn register_loop(
                 }
             }
         }
-        for target in &targets {
+        for (i, target) in v6.iter().chain(&v4).enumerate() {
+            if i == v6.len() && i > 0 {
+                tokio::time::sleep(FAMILY_GAP).await;
+            }
             // A fresh packet per relay: each carries a strictly-increasing
             // timestamp, so the relays never see a "replayed" (equal-ts) copy.
             // The signer is SHARED across a share's successive registrar
@@ -98,6 +107,14 @@ pub async fn register_loop(
 
 /// What a send failed with: enough to tell one failure from another.
 type SendError = (std::io::ErrorKind, Option<i32>);
+
+/// Between a round's IPv6 and IPv4 REGISTERs. A relay listed by both its
+/// addresses keeps a binding per family under one replay guard (strictly
+/// increasing timestamps, whatever the family), so a REGISTER that arrives
+/// after a later-signed one of the other family is refused. Sent
+/// back to back, the v4 one overtakes the v6 one whenever the v6 path to the
+/// relay is the slower; the gap keeps them in signing order.
+pub const FAMILY_GAP: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The error each address's last REGISTER send failed with, process-wide.
 static SEND_FAILURES: std::sync::LazyLock<
@@ -194,6 +211,61 @@ mod tests {
         assert_eq!(recv_token(&spora).await, b"tok-2");
         assert_eq!(recv_token(&open).await, b"");
         assert_eq!(recv_token(&fixed).await, b"bearer");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_round_reaches_v6_first_and_v4_a_gap_later() {
+        // The sharer's socket is dual-stack, as `bind_share_udp` makes it.
+        let dual = || -> std::io::Result<tokio::net::UdpSocket> {
+            let s = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?;
+            s.set_only_v6(false)?;
+            s.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())?;
+            s.set_nonblocking(true)?;
+            tokio::net::UdpSocket::from_std(s.into())
+        };
+        let (Ok(relay6), Ok(sock)) = (tokio::net::UdpSocket::bind("[::1]:0").await, dual()) else {
+            eprintln!("no IPv6 loopback here; skipping");
+            return;
+        };
+        let relay4 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let targets = [&relay4, &relay6]
+            .map(|s| RegisterTarget {
+                addr: s.local_addr().unwrap(),
+                credential: Credential::None,
+            })
+            .to_vec();
+        let task = tokio::spawn(register_loop(
+            Arc::new(sock),
+            RegisterKind::Quic,
+            targets,
+            Duration::from_secs(3600),
+            signer(),
+            Credentials::new(None),
+        ));
+        let ts = |buf: &[u8]| {
+            let Classified::Control { body, .. } = classify(buf) else {
+                panic!("not a control packet")
+            };
+            verify_register(RegisterKind::Quic, body)
+                .unwrap()
+                .0
+                .timestamp_millis
+        };
+        let mut buf = [0u8; 2048];
+        let wait = Duration::from_secs(2);
+        let n = tokio::time::timeout(wait, relay6.recv(&mut buf))
+            .await
+            .expect("v6 REGISTER")
+            .unwrap();
+        let (at6, ts6) = (std::time::Instant::now(), ts(&buf[..n]));
+        let n = tokio::time::timeout(wait, relay4.recv(&mut buf))
+            .await
+            .expect("v4 REGISTER")
+            .unwrap();
+        let (gap, ts4) = (at6.elapsed(), ts(&buf[..n]));
+        assert!(ts4 > ts6, "v4 signed after v6");
+        assert!(gap >= FAMILY_GAP - Duration::from_millis(50), "{gap:?}");
         task.abort();
     }
 }

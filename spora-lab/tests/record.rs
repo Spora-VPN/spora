@@ -18,6 +18,9 @@
 //! - `a_redial_resolves_the_relays_again`: a reconnect re-derives the relay
 //!   list rather than reusing the addresses resolved at startup — the record
 //!   is what makes that observable.
+//! - `a_redial_tries_a_silent_relay_last`: a relay that timed out while the
+//!   next one worked is tried after it on the redial, instead of costing the
+//!   timeout again.
 //!
 //! Records are written from the peers' own (namespaced) threads into a
 //! per-scenario temp directory; /tmp is shared with the suite process, so the
@@ -42,6 +45,7 @@ fn main() {
             a_relay_that_never_answers_is_recorded_as_such,
             a_direct_upgrade_is_recorded,
             a_redial_resolves_the_relays_again,
+            a_redial_tries_a_silent_relay_last,
         ],
     );
     std::process::exit(if ok { 0 } else { 1 });
@@ -486,6 +490,111 @@ fn a_redial_resolves_the_relays_again() -> Result<(), String> {
         .any(|s| s.cycle.is_some_and(|c| c >= 1));
     if !dialled_again {
         return Err("no relay_dial step in a redial cycle".into());
+    }
+
+    client.stop();
+    sharer.stop();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 5. a redial tries a silent relay last
+
+/// A share whose first relay never answers: down, blocked, or one the sharer
+/// cannot reach (it holds no registration and drops the Initial; from the
+/// client all three are silence). The first dial waits out that relay's
+/// timeout before the second works; a redial in the same run must go to the
+/// second straight away. The record says which relays each cycle dialled, in
+/// order, so this needs no timing.
+fn a_redial_tries_a_silent_relay_last() -> Result<(), String> {
+    let topo = Topology::build(&TopologySpec::new(
+        NatKind::PortRestricted,
+        NatKind::PortRestricted,
+    ))?;
+    let wan = services::start_wan(&topo.wan, || {
+        relay::State::with_timeouts(
+            Duration::from_secs(6),
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+    })?;
+    let timings = spora_core::Timings {
+        register_interval: Duration::from_secs(1),
+        quic_idle_timeout: Duration::from_secs(3),
+        quic_keep_alive: Duration::from_secs(1),
+        reconnect_delay: Duration::from_millis(500),
+        relay_dial_timeout: Duration::from_secs(2),
+        ..Default::default()
+    };
+    // Nothing listens there: silence, as from a relay without the sharer.
+    let mut silent = wan.relay_addr();
+    silent.set_port(silent.port().wrapping_add(1));
+
+    let client_dir = fresh_dir("silent-relay", "client")?;
+    let opts = || {
+        let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server())
+            .with_relays([silent, wan.relay_addr()]);
+        opts.timings = timings.clone();
+        opts.enable_direct_upgrade = false;
+        opts
+    };
+    let sharer = peers::start_sharer(&topo.sharer, &opts())?;
+    let mut client_opts = opts();
+    client_opts.record = Some(record_config(&client_dir));
+    let mut client = peers::start_client(&topo.client, sharer.url().clone(), &client_opts)?;
+    client.set_keepalive(1);
+    client.wait_event(
+        |e| matches!(e, TunnelEvent::RelaySessionEstablished { .. }),
+        SESSION_TIMEOUT,
+    )?;
+
+    // A fresh relay: the path is dead and the client starts a new cycle.
+    wan.restart_relay()?;
+    client.discard_events();
+    client
+        .wait_event(
+            |e| matches!(e, TunnelEvent::Reconnected),
+            Duration::from_secs(30),
+        )
+        .map_err(|e| format!("client never reconnected after the relay restart: {e}"))?;
+
+    let redialled = |s: &spora_core::record::Step| {
+        s.kind == StepKind::RelayDial
+            && s.outcome == StepOutcome::Ok
+            && s.cycle.is_some_and(|c| c >= 1)
+    };
+    let rec = wait_for_record(&client_dir, "showing a successful redial", |r| {
+        r.steps.iter().any(redialled)
+    })?;
+    let dials = |cycle: u32| -> Vec<(String, StepOutcome)> {
+        rec.steps_of(StepKind::RelayDial)
+            .filter(|s| s.cycle.unwrap_or(0) == cycle)
+            .map(|s| (s.via.clone().unwrap_or_default(), s.outcome))
+            .collect()
+    };
+    let (silent, working) = (silent.to_string(), wan.relay_addr().to_string());
+    // The setup is what it claims: the first dial went through the silent
+    // relay first and the second one worked.
+    let first = dials(0);
+    if first
+        != [
+            (silent.clone(), StepOutcome::Failed),
+            (working.clone(), StepOutcome::Ok),
+        ]
+    {
+        return Err(format!("unexpected first dial: {first:?}"));
+    }
+    let cycle = rec
+        .steps
+        .iter()
+        .find(|s| redialled(s))
+        .and_then(|s| s.cycle)
+        .expect("the record was picked for its successful redial");
+    let again = dials(cycle);
+    if again.first().map(|(via, _)| via) != Some(&working) {
+        return Err(format!(
+            "redial cycle {cycle} did not start with the relay that worked: {again:?}"
+        ));
     }
 
     client.stop();

@@ -28,6 +28,8 @@ fn main() {
             inner_v6_through_v4_tunnel,
             mixed_family_relay_forwarding,
             v6_relay_without_v6_route,
+            relay_listed_by_both_addresses,
+            v4_only_sharer_on_a_dual_stack_relay,
         ],
         &["ip6tables"],
     );
@@ -501,6 +503,92 @@ fn v6_relay_without_v6_route() -> Result<(), String> {
         return fail(format!(
             "connect took {took:?}: the unroutable v6 relay was not skipped at once"
         ));
+    }
+
+    client.stop();
+    sharer.stop();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 7. relay_listed_by_both_addresses
+//
+// The shape Spora's relays have in a share: ONE dual-stack relay process,
+// listed by its v6 and its v4 address. A dual-stack sharer registers through
+// both, and the relay keeps one binding per share, so the later REGISTER of
+// each round (v4, listed second) overwrites the earlier: the sharer's leg of
+// a session runs over v4 even when the client came in over v6. The direct
+// upgrade must not care — the sharer punches in the family the client
+// signals — so a v6 client still ends up on a v6 direct path.
+
+fn relay_listed_by_both_addresses() -> Result<(), String> {
+    let topo = dual_topology(NatKind::Open, NatKind::Open)?;
+    let wan = services::start_wan_dual(&topo.wan, relay::State::default)?;
+
+    let opts = LabPeerOpts::new(wan.relay_addr6()?, wan.stun_server6()?)
+        .with_relays([wan.relay_addr6()?, wan.relay_addr()]);
+    let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
+    let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
+    let client_leg = wait_relay_session(&mut sharer, &mut client)?;
+    if !client_leg.is_ipv6() {
+        return fail(format!(
+            "client should dial the v6 address first, got {client_leg}"
+        ));
+    }
+
+    let upgraded = client.wait_event(
+        |e| matches!(e, TunnelEvent::DirectUpgradeSucceeded { .. }),
+        Duration::from_secs(30),
+    )?;
+    let TunnelEvent::DirectUpgradeSucceeded { local, peer } = upgraded else {
+        unreachable!("predicate matched DirectUpgradeSucceeded");
+    };
+    if !local.is_ipv6() || !peer.is_ipv6() {
+        return fail(format!(
+            "direct path should be v6 on both ends: {local} -> {peer}"
+        ));
+    }
+
+    client.stop();
+    sharer.stop();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 8. v4_only_sharer_on_a_dual_stack_relay
+//
+// A sharer without IPv6 on a share that lists the relay by both addresses:
+// its v6 REGISTERs fail at the socket, its v4 ones land, and since the relay
+// files a registration under the share and not under the family it came in
+// on, a client arriving at the v6 address still finds it.
+
+fn v4_only_sharer_on_a_dual_stack_relay() -> Result<(), String> {
+    let topo = dual_topology(NatKind::Open, NatKind::Open)?;
+    let wan = services::start_wan_dual(&topo.wan, relay::State::default)?;
+    topo.sharer.run("ip -6 route del default")?;
+    topo.sharer.run("ip -6 addr flush dev wan0 scope global")?;
+
+    let mut opts = LabPeerOpts::new(wan.relay_addr6()?, wan.stun_server())
+        .with_relays([wan.relay_addr6()?, wan.relay_addr()]);
+    opts.enable_direct_upgrade = false;
+    let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
+    let started = Instant::now();
+    let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
+    let took = started.elapsed();
+    let client_leg = wait_relay_session(&mut sharer, &mut client)?;
+    if !client_leg.is_ipv6() {
+        return fail(format!(
+            "client should be in through the v6 address, got {client_leg}"
+        ));
+    }
+    if took > Duration::from_secs(5) {
+        return fail(format!(
+            "connect took {took:?}: the v6 address made it wait"
+        ));
+    }
+    let stats = client.udp_echo(svc(ECHO_UDP_PORT), 20, 200, Duration::from_secs(30))?;
+    if stats.received != 20 {
+        return fail(format!("udp echo lost packets: {stats:?}"));
     }
 
     client.stop();

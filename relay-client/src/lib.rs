@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use log::warn;
+use log::{debug, info, warn};
 
 pub mod credential;
 pub mod protocol;
@@ -40,7 +40,12 @@ pub struct RegisterTarget {
 /// A per-relay send error is logged and skipped, never fatal — on a
 /// dual-stack socket a host without a route to one family (e.g. a v4-only
 /// host and a v6 relay) keeps registering with the relays it CAN reach, so a
-/// matching-family client still finds it.
+/// matching-family client still finds it. Such an error repeats every
+/// interval for as long as the share runs, and again from every listener
+/// the share rolls to, so it is a warning when an address starts failing (or
+/// fails differently) and once more when it works again, per process (what
+/// this host can send to is no one share's business); the repeats in
+/// between are debug lines.
 ///
 /// `socket` should be shared (e.g. via `Arc<UdpSocket>`) with quinn's server
 /// endpoint so a single NAT mapping is used for both registration and
@@ -85,8 +90,37 @@ pub async fn register_loop(
                 .lock()
                 .expect("register signer")
                 .register_packet(kind, &token);
-            if let Err(e) = socket.send_to(&pkt, target.addr).await {
-                warn!("register_loop: send_to {} failed: {}", target.addr, e);
+            let sent = socket.send_to(&pkt, target.addr).await;
+            note_send(target.addr, sent.err());
+        }
+    }
+}
+
+/// What a send failed with: enough to tell one failure from another.
+type SendError = (std::io::ErrorKind, Option<i32>);
+
+/// The error each address's last REGISTER send failed with, process-wide.
+static SEND_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<SocketAddr, SendError>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Log a REGISTER send's outcome: a warning when sending to `addr` starts
+/// failing or fails differently, a note when it works again, debug lines for
+/// the repeats.
+fn note_send(addr: SocketAddr, error: Option<std::io::Error>) {
+    let mut failures = SEND_FAILURES.lock().unwrap_or_else(|e| e.into_inner());
+    match error {
+        None => {
+            if failures.remove(&addr).is_some() {
+                info!("register_loop: sending to {addr} works again");
+            }
+        }
+        Some(e) => {
+            let what = (e.kind(), e.raw_os_error());
+            if failures.insert(addr, what) == Some(what) {
+                debug!("register_loop: send_to {addr} failed: {e}");
+            } else {
+                warn!("register_loop: send_to {addr} failed: {e} (logged again when it changes)");
             }
         }
     }

@@ -16,7 +16,7 @@ pub mod tun_util;
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1915,6 +1915,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     // dying under the reconnect layer, or the caller stopping — takes it out
     // and records its `session_end`, once.
     let live_session: SessionSlot = Arc::new(std::sync::Mutex::new(None));
+    let silent_relays = Arc::new(std::sync::Mutex::new(SilentRelays::default()));
 
     let initial = match dial_relays(
         &relay_addrs,
@@ -1925,6 +1926,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         keepalive_waker.clone(),
         &rec.for_cycle(0),
         &live_session,
+        &silent_relays,
     )
     .await
     {
@@ -1964,6 +1966,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         let cycle = cycles.fetch_add(1, Ordering::Relaxed) + 1;
         let rec = dialer_rec.for_cycle(cycle as u32);
         let session = dialer_session.clone();
+        let silent = silent_relays.clone();
         Box::pin(async move {
             emit(&config.event_hook, TunnelEvent::Reconnecting);
             rec.mark(StepKind::Reconnect).ok();
@@ -1974,7 +1977,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
             // (and any per-thread resolver state) belongs to this thread.
             let relays = resolve_for_dial(&token.relays, &known, &rec);
             let result = dial_relays(
-                &relays, &token, &config, cancel, knob, waker, &rec, &session,
+                &relays, &token, &config, cancel, knob, waker, &rec, &session, &silent,
             )
             .await;
             if result.is_ok() {
@@ -2096,6 +2099,9 @@ fn resolve_for_dial(
 /// dead/censored relay — or one the sharer never registered with (a family
 /// mismatch looks identical: the Initial is silently dropped) — fails over to
 /// the next instead of stalling. Returns the last error if all fail.
+///
+/// `silent` is the run's memory of endpoints that timed out while a later
+/// one worked: they are tried last, and this pass's outcome updates it.
 #[allow(clippy::too_many_arguments)]
 async fn dial_relays(
     relay_addrs: &[(SocketAddr, RelayProtocol)],
@@ -2106,9 +2112,22 @@ async fn dial_relays(
     keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
     rec: &Recorder,
     session: &SessionSlot,
+    silent: &std::sync::Mutex<SilentRelays>,
 ) -> Result<IpTransport, Fault> {
+    let source = |a: SocketAddr| route_source(&config.protector, a);
+    let ordered = silent
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .order(relay_addrs, source);
+    if ordered.as_slice() != relay_addrs {
+        info!(
+            "dialing relays {:?}: the ones that went silent earlier in this run last",
+            ordered.iter().map(|(a, _)| *a).collect::<Vec<_>>()
+        );
+    }
+    let mut timed_out: Vec<SocketAddr> = Vec::new();
     let mut last_err: Option<Fault> = None;
-    for &(relay_addr, protocol) in relay_addrs {
+    for (relay_addr, protocol) in ordered {
         // One step per endpoint tried, so a record shows every relay that was
         // attempted and how each one refused — not just the last one, which
         // is all the returned error can carry.
@@ -2131,11 +2150,18 @@ async fn dial_relays(
         match tokio::time::timeout(config.timings.relay_dial_timeout, attempt).await {
             Ok(Ok(transport)) => {
                 step.ok();
+                silent
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .learn(relay_addr, &timed_out, source);
                 return Ok(transport);
             }
             Ok(Err(e)) => {
                 warn!("relay {} dial failed: {}", relay_addr, e);
                 step.fail_with(&e);
+                if is_silence(e.reason) {
+                    timed_out.push(relay_addr);
+                }
                 last_err = Some(e);
             }
             Err(_) => {
@@ -2151,6 +2177,7 @@ async fn dial_relays(
                     ),
                 );
                 step.fail_with(&f);
+                timed_out.push(relay_addr);
                 last_err = Some(f);
             }
         }
@@ -3531,10 +3558,6 @@ fn resolve_register_targets(
     Ok(out)
 }
 
-/// Bind the sharer's UDP socket. When the relay set spans IPv6 (or is mixed),
-/// bind `::` dual-stack (IPV6_V6ONLY off) so one socket reaches relays of both
-/// families and receives Initials forwarded by any of them; a pure-v4 relay
-/// set keeps a plain `0.0.0.0` socket. Applies the FD protector.
 /// UDP socket buffer size for nz sockets. The nz carrier has no tunnel pacer, so
 /// an unpaced inner-TCP burst (a full congestion window at once) can overrun the
 /// OS default receive buffer (~200 KB) and drop — which collapses the inner
@@ -3555,30 +3578,75 @@ where
     let _ = sock.set_send_buffer_size(NZ_SOCK_BUF);
 }
 
+/// Bind the sharer's UDP socket. When the relay set spans IPv6 (or is mixed),
+/// bind `::` dual-stack (IPV6_V6ONLY off) so one socket reaches relays of both
+/// families and receives Initials forwarded by any of them; a pure-v4 relay
+/// set keeps a plain `0.0.0.0` socket, and so does a host with no IPv6 at all
+/// (a kernel booted with `ipv6.disable=1`): its v6 relays are out of reach
+/// either way, and the v4 ones still serve. Applies the FD protector.
 fn bind_share_udp(
     protector: &SocketProtector,
     want_v6: bool,
     port: u16,
 ) -> Result<std::net::UdpSocket, String> {
+    bind_share_udp_using(protector, want_v6, port, bind_dual_stack)
+}
+
+fn bind_share_udp_using(
+    protector: &SocketProtector,
+    want_v6: bool,
+    port: u16,
+    dual_stack: impl FnOnce(u16) -> Result<std::net::UdpSocket, (String, std::io::Error)>,
+) -> Result<std::net::UdpSocket, String> {
     // `port` is 0 (ephemeral) for a relay-only sharer, or the advertised port a
     // `Direct` (relay-less) sharer must bind so clients can dial it.
-    let std = if want_v6 {
-        let sock = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)
-            .map_err(|e| format!("create v6 socket: {}", e))?;
-        sock.set_only_v6(false)
-            .map_err(|e| format!("set_only_v6(false): {}", e))?;
-        sock.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())
-            .map_err(|e| format!("bind [::]:{}: {}", port, e))?;
-        std::net::UdpSocket::from(sock)
+    let dual = if want_v6 {
+        Some(dual_stack(port))
     } else {
-        std::net::UdpSocket::bind(("0.0.0.0", port))
-            .map_err(|e| format!("bind 0.0.0.0:{}: {}", port, e))?
+        None
+    };
+    let std = match dual {
+        Some(Ok(sock)) => sock,
+        Some(Err((what, e))) if !is_family_unsupported(&e) => {
+            return Err(format!("{what}: {e}"));
+        }
+        Some(Err((_, e))) => {
+            static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !NOTED.swap(true, Ordering::Relaxed) {
+                info!("no IPv6 on this host ({e}): serving over IPv4 only");
+            }
+            std::net::UdpSocket::bind(("0.0.0.0", port))
+                .map_err(|e| format!("bind 0.0.0.0:{}: {}", port, e))?
+        }
+        None => std::net::UdpSocket::bind(("0.0.0.0", port))
+            .map_err(|e| format!("bind 0.0.0.0:{}: {}", port, e))?,
     };
     std.set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking: {}", e))?;
     tune_udp_buffers(&std);
     apply_protector_to_std(protector, &std);
     Ok(std)
+}
+
+/// A `[::]:port` socket with IPV6_V6ONLY off; the error names the call that
+/// failed.
+fn bind_dual_stack(port: u16) -> Result<std::net::UdpSocket, (String, std::io::Error)> {
+    let sock = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)
+        .map_err(|e| ("create v6 socket".to_string(), e))?;
+    sock.set_only_v6(false)
+        .map_err(|e| ("set_only_v6(false)".to_string(), e))?;
+    sock.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())
+        .map_err(|e| (format!("bind [::]:{port}"), e))?;
+    Ok(std::net::UdpSocket::from(sock))
+}
+
+/// The host has no such address family (no IPv6 stack at all).
+fn is_family_unsupported(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    let code = libc::EAFNOSUPPORT;
+    #[cfg(windows)]
+    let code = 10047; // WSAEAFNOSUPPORT
+    e.raw_os_error() == Some(code)
 }
 
 /// Bind an ephemeral UDP wildcard socket in `peer`'s address family (so
@@ -3616,6 +3684,30 @@ pub(crate) fn bind_local_udp(
 /// an explicit destination, which the BSDs refuse on a connected socket.
 /// Only a "no route" answer fails the dial; anything else lets it go ahead.
 pub(crate) fn check_udp_route(protector: &SocketProtector, peer: SocketAddr) -> Result<(), Fault> {
+    match probe_udp_route(protector, peer) {
+        RouteProbe::NoRoute(e) => Err(Fault::new(
+            Reason::NoRoute,
+            format!("no route to {peer}: {e}"),
+        )),
+        RouteProbe::Source(_) | RouteProbe::Unknown => Ok(()),
+    }
+}
+
+/// What the kernel answered for a route to a peer (see [`probe_udp_route`]).
+enum RouteProbe {
+    /// No route: sends there fail.
+    NoRoute(std::io::Error),
+    /// A route, leaving from this local address.
+    Source(IpAddr),
+    /// The probe could not tell.
+    Unknown,
+}
+
+/// Ask the kernel for its route to `peer` from a socket set up like
+/// [`bind_local_udp`]'s (same family, same protector), without sending
+/// anything: a UDP `connect()` is the route lookup, and the address the
+/// socket is then bound to is the source that route leaves from.
+fn probe_udp_route(protector: &SocketProtector, peer: SocketAddr) -> RouteProbe {
     use std::io::ErrorKind::{AddrNotAvailable, HostUnreachable, NetworkDown, NetworkUnreachable};
     let wildcard: SocketAddr = if peer.is_ipv6() {
         (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
@@ -3625,29 +3717,95 @@ pub(crate) fn check_udp_route(protector: &SocketProtector, peer: SocketAddr) -> 
     let probe = match std::net::UdpSocket::bind(wildcard) {
         Ok(s) => s,
         Err(e) => {
-            debug!("route check to {peer} skipped: bind {wildcard}: {e}");
-            return Ok(());
+            debug!("route probe to {peer} skipped: bind {wildcard}: {e}");
+            return RouteProbe::Unknown;
         }
     };
     apply_protector_to_std(protector, &probe);
     match probe.connect(peer) {
-        Ok(()) => Ok(()),
+        Ok(()) => match probe.local_addr() {
+            Ok(local) if !local.ip().is_unspecified() => RouteProbe::Source(local.ip()),
+            _ => RouteProbe::Unknown,
+        },
         Err(e)
             if matches!(
                 e.kind(),
                 NetworkUnreachable | HostUnreachable | NetworkDown | AddrNotAvailable
             ) =>
         {
-            Err(Fault::new(
-                Reason::NoRoute,
-                format!("no route to {peer}: {e}"),
-            ))
+            RouteProbe::NoRoute(e)
         }
         Err(e) => {
-            debug!("route check to {peer} inconclusive: {e}");
-            Ok(())
+            debug!("route probe to {peer} inconclusive: {e}");
+            RouteProbe::Unknown
         }
     }
+}
+
+/// The local address this host would send to `peer` from, if it can tell
+/// (`None` with no route too). Identifies the network underneath well
+/// enough for [`SilentRelays`]: moving networks changes it.
+fn route_source(protector: &SocketProtector, peer: SocketAddr) -> Option<IpAddr> {
+    match probe_udp_route(protector, peer) {
+        RouteProbe::Source(ip) => Some(ip),
+        RouteProbe::NoRoute(_) | RouteProbe::Unknown => None,
+    }
+}
+
+/// Relay endpoints that went silent during one client run, so a redial
+/// tries them after the others instead of waiting out each one's timeout
+/// again.
+///
+/// An endpoint is silent when its dial timed out (the relay was down or
+/// blocked, or held no registration of the sharer's: the sharer cannot reach
+/// it) while a later endpoint of the same pass brought a session up. A pass
+/// where nothing answered says nothing about any one endpoint (the network
+/// was down), so it changes nothing here. Each entry keeps the local address
+/// the host sent from at the time: once the host sends from another (it
+/// moved networks: a v6 relay that timed out on Wi-Fi with broken IPv6 may
+/// be the best one on cellular), or the endpoint brings a session up, it is
+/// back in its configured place.
+#[derive(Default)]
+struct SilentRelays(Vec<(SocketAddr, Option<IpAddr>)>);
+
+impl SilentRelays {
+    /// `addrs` in dial order: the endpoints not known to be silent in their
+    /// order, then the silent ones in theirs. `source` names the address the
+    /// host sends to an endpoint from now; an entry whose address changed is
+    /// forgotten.
+    fn order(
+        &mut self,
+        addrs: &[(SocketAddr, RelayProtocol)],
+        source: impl Fn(SocketAddr) -> Option<IpAddr>,
+    ) -> Vec<(SocketAddr, RelayProtocol)> {
+        self.0
+            .retain(|(addr, then)| !addrs.iter().any(|(a, _)| a == addr) || source(*addr) == *then);
+        let silent = |a: &SocketAddr| self.0.iter().any(|(s, _)| s == a);
+        let (mut first, last): (Vec<_>, Vec<_>) = addrs.iter().partition(|(a, _)| !silent(a));
+        first.extend(last);
+        first
+    }
+
+    /// A pass that brought a session up through `winner` after `silent`
+    /// timed out.
+    fn learn(
+        &mut self,
+        winner: SocketAddr,
+        silent: &[SocketAddr],
+        source: impl Fn(SocketAddr) -> Option<IpAddr>,
+    ) {
+        self.0.retain(|(a, _)| *a != winner && !silent.contains(a));
+        self.0.extend(silent.iter().map(|&a| (a, source(a))));
+    }
+}
+
+/// Whether a failed dial waited out a timeout (nothing, or not enough, came
+/// back) rather than being ended by an answer.
+fn is_silence(reason: Reason) -> bool {
+    matches!(
+        reason,
+        Reason::ConnectTimeout | Reason::HandshakeTimeout | Reason::NoResponse
+    )
 }
 
 /// Length of the per-session hole-punch markers.
@@ -3980,6 +4138,114 @@ pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), Strin
 mod tests {
     use super::*;
     use crate::e2e::{E2eSession, accept_one};
+
+    fn quic(addr: &str) -> (SocketAddr, RelayProtocol) {
+        (addr.parse().unwrap(), RelayProtocol::UdpQuic)
+    }
+
+    fn addrs_of(order: &[(SocketAddr, RelayProtocol)]) -> Vec<String> {
+        order.iter().map(|(a, _)| a.to_string()).collect()
+    }
+
+    #[test]
+    fn silent_relays_go_last_in_their_own_order() {
+        let list = [
+            quic("[2001:db8::1]:443"),
+            quic("[2001:db8::2]:443"),
+            quic("192.0.2.1:443"),
+            quic("192.0.2.2:443"),
+        ];
+        let here = |_: SocketAddr| Some("10.0.0.5".parse().unwrap());
+        let mut silent = SilentRelays::default();
+        assert_eq!(
+            silent.order(&list, here),
+            list.to_vec(),
+            "nothing known yet"
+        );
+
+        // The first three timed out before the fourth came up.
+        silent.learn(list[3].0, &[list[0].0, list[1].0, list[2].0], here);
+        assert_eq!(
+            addrs_of(&silent.order(&list, here)),
+            [
+                "192.0.2.2:443",
+                "[2001:db8::1]:443",
+                "[2001:db8::2]:443",
+                "192.0.2.1:443"
+            ]
+        );
+
+        // A later pass came up through a silent one: it is back in place.
+        silent.learn(list[0].0, &[], here);
+        assert_eq!(
+            addrs_of(&silent.order(&list, here)),
+            [
+                "[2001:db8::1]:443",
+                "192.0.2.2:443",
+                "[2001:db8::2]:443",
+                "192.0.2.1:443"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_share_on_a_host_without_ipv6_serves_ipv4() {
+        #[cfg(unix)]
+        let no_family = std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT);
+        #[cfg(windows)]
+        let no_family = std::io::Error::from_raw_os_error(10047);
+        let socket = bind_share_udp_using(&None, true, 0, |_| {
+            Err(("create v6 socket".into(), no_family))
+        })
+        .expect("falls back to IPv4");
+        let local = socket.local_addr().unwrap();
+        assert!(local.is_ipv4() && local.ip().is_unspecified(), "{local}");
+
+        // Any other failure is still the share's error, not a silent fallback.
+        let in_use = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let err = bind_share_udp_using(&None, true, 4000, |_| {
+            Err(("bind [::]:4000".into(), in_use))
+        })
+        .expect_err("a port in use is not a missing family");
+        assert!(err.starts_with("bind [::]:4000: "), "{err}");
+    }
+
+    #[test]
+    fn a_new_network_forgets_what_went_silent_on_the_old_one() {
+        let list = [quic("[2001:db8::1]:443"), quic("192.0.2.1:443")];
+        let wifi = |a: SocketAddr| -> Option<IpAddr> {
+            Some(
+                if a.is_ipv6() {
+                    "2001:db8:1::5"
+                } else {
+                    "192.168.1.5"
+                }
+                .parse()
+                .unwrap(),
+            )
+        };
+        let cellular = |a: SocketAddr| -> Option<IpAddr> {
+            Some(
+                if a.is_ipv6() {
+                    "2001:db8:2::7"
+                } else {
+                    "100.64.3.7"
+                }
+                .parse()
+                .unwrap(),
+            )
+        };
+        let mut silent = SilentRelays::default();
+        silent.learn(list[1].0, &[list[0].0], wifi);
+        assert_eq!(
+            addrs_of(&silent.order(&list, wifi)),
+            ["192.0.2.1:443", "[2001:db8::1]:443"]
+        );
+        // Sending from another address: the v6 relay gets its place back,
+        // and stays there when the host is back on the first network.
+        assert_eq!(silent.order(&list, cellular), list.to_vec());
+        assert_eq!(silent.order(&list, wifi), list.to_vec());
+    }
 
     async fn answer_one_stun(socket: UdpSocket) {
         let mut request = [0u8; 256];

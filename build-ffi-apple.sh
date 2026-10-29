@@ -23,6 +23,12 @@ for arg in "$@"; do
   esac
 done
 
+# The oldest macOS the client supports (spora-mac's project.yml
+# deploymentTarget). rustc and the C that cc builds (ring, sqlite) target it
+# instead of the SDK's own version, so the library loads wherever the app
+# does; without it the C objects require the build machine's macOS.
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+
 OUT="${SPORA_MAC_OUT:-../spora-mac/rust-out}"
 MAC_TARGETS=("aarch64-apple-darwin" "x86_64-apple-darwin")
 LIB="libspora_ffi.a"

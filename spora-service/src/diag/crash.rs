@@ -18,7 +18,7 @@
 use std::cell::Cell;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, TryLockError};
 use std::time::{Duration, SystemTime};
 
 use log::Level;
@@ -46,31 +46,70 @@ struct CrashConfig {
     max_age: Duration,
 }
 
-/// The directory of the first log that started: crash files go next to it,
-/// where the bundle and the uploader look.
-static USABLE: OnceLock<CrashConfig> = OnceLock::new();
-/// The first directory [`super::init`] was given, when no log could start
-/// there: a crash is still captured somewhere until one does.
-static FALLBACK: OnceLock<CrashConfig> = OnceLock::new();
-
-/// Where crash files go: `cfg.dir` when its log started (`usable`), and
-/// otherwise only until a log starts somewhere.
-pub(super) fn configure(cfg: &DiagConfig, usable: bool) {
-    let c = CrashConfig {
-        dir: cfg.dir.clone(),
-        platform: head(&cfg.platform, MAX_TARGET_BYTES).to_string(),
-        keep: cfg.crash_keep,
-        max_age: cfg.crash_max_age,
-    };
-    let _ = if usable {
-        USABLE.set(c)
-    } else {
-        FALLBACK.set(c)
-    };
+/// Where crash files go.
+struct Dirs {
+    /// The running log's directory: next to it, where the bundle and the
+    /// uploader look.
+    log: Option<Arc<CrashConfig>>,
+    /// With no log running, the directory one was asked for: a crash is
+    /// still captured somewhere until one starts.
+    fallback: Option<Arc<CrashConfig>>,
 }
 
-fn config() -> Option<&'static CrashConfig> {
-    USABLE.get().or_else(|| FALLBACK.get())
+static DIRS: Mutex<Dirs> = Mutex::new(Dirs {
+    log: None,
+    fallback: None,
+});
+
+impl CrashConfig {
+    fn of(cfg: &DiagConfig) -> Arc<CrashConfig> {
+        Arc::new(CrashConfig {
+            dir: cfg.dir.clone(),
+            platform: head(&cfg.platform, MAX_TARGET_BYTES).to_string(),
+            keep: cfg.crash_keep,
+            max_age: cfg.crash_max_age,
+        })
+    }
+}
+
+/// [`super::init`]: `cfg.dir` holds crash files from now on when its log
+/// started (`usable`); otherwise, if no directory was tried before, until a
+/// log starts somewhere.
+pub(super) fn configure(cfg: &DiagConfig, usable: bool) {
+    let mut d = DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    if usable {
+        d.log = Some(CrashConfig::of(cfg));
+    } else if d.fallback.is_none() {
+        d.fallback = Some(CrashConfig::of(cfg));
+    }
+}
+
+/// [`super::switch_file`]: crash files follow the log to `cfg.dir` (there
+/// too when its log could not start), or go nowhere (`None`).
+pub(super) fn follow(cfg: Option<&DiagConfig>, usable: bool) {
+    let c = cfg.map(CrashConfig::of);
+    let mut d = DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    if usable {
+        (d.log, d.fallback) = (c, None);
+    } else {
+        (d.log, d.fallback) = (None, c);
+    }
+}
+
+fn config() -> Option<Arc<CrashConfig>> {
+    let d = DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    d.log.clone().or_else(|| d.fallback.clone())
+}
+
+/// [`config`] for the panic hook, which must never wait: `None` while a
+/// switch holds the lock.
+fn try_config() -> Option<Arc<CrashConfig>> {
+    let d = match DIRS.try_lock() {
+        Ok(d) => d,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => return None,
+    };
+    d.log.clone().or_else(|| d.fallback.clone())
 }
 
 #[derive(Serialize)]
@@ -98,8 +137,8 @@ pub(crate) struct CrashMeta<'a> {
 /// the platform caught — e.g. Kotlin's default uncaught-exception handler,
 /// with `source` = `"kotlin"`. The log's queued lines go to disk first: the
 /// process is usually about to end. The file is cut at [`MAX_CRASH_FILE`].
-/// Needs the directory from [`super::init`]; before that it fails with
-/// `NotFound`.
+/// Needs a directory from [`super::init`] or [`super::switch_file`];
+/// without one it fails with `NotFound`.
 pub fn write_crash(source: &str, text: &str) -> io::Result<PathBuf> {
     let Some(cfg) = config() else {
         return Err(io::Error::new(
@@ -125,8 +164,8 @@ pub fn write_crash(source: &str, text: &str) -> io::Result<PathBuf> {
 /// Install a panic hook that writes a crash file (message, location, thread,
 /// open run, build, backtrace) and queues an `E` line in the log, then hands
 /// over to whichever hook was installed before. Idempotent. Independent of
-/// the `log` logger: it writes the file itself, into the directory
-/// [`super::init`] was given (with none yet, only the previous hook runs).
+/// the `log` logger: it writes the file itself, into the log's directory
+/// (with none, only the previous hook runs).
 /// A panic on the main thread, which ends the process, is also reported to
 /// the recorder ([`spora_core::record::note_process_panic`]), so the records
 /// its teardown closes end as `crashed`.
@@ -203,7 +242,10 @@ fn on_panic(info: &std::panic::PanicHookInfo<'_>) {
     let run = RUNS.try_current();
     let repeat = repeat_of(&SEEN, &location);
 
-    if let Some(f) = LOGGER.file.get() {
+    // Never waits: a switch holding the lock costs this panic its `E` line.
+    if let Ok(sink) = LOGGER.file.try_read()
+        && let Some(f) = sink.as_ref()
+    {
         let site = info.location().map(|l| (l.file(), l.line()));
         let note = match repeat {
             Some(n) if n > 0 => format!(" (repeat {n}; no new crash file)"),
@@ -221,7 +263,7 @@ fn on_panic(info: &std::panic::PanicHookInfo<'_>) {
     }
     if repeat.is_none()
         && !is_lost_stdio(msg)
-        && let Some(cfg) = config()
+        && let Some(cfg) = try_config()
     {
         let bt = std::backtrace::Backtrace::force_capture();
         let text =

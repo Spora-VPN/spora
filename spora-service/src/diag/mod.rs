@@ -24,6 +24,11 @@
 //! other live process is writing; crash files ([`write_crash`],
 //! [`install_panic_hook`]) live in the same directory with their own caps.
 //!
+//! A process that serves one device at a time and changes devices (the
+//! Windows service, which serves one Windows user at a time, each with a
+//! device of their own) moves the file with [`switch_file`]: each device's
+//! log, crash files included, holds only what happened while it was served.
+//!
 //! Some lines never reach the file: per-flow lines
 //! ([`spora_core::FLOW_LOG_TARGET`]: the connection log is the only per-flow
 //! record and it never leaves the machine) and periodic statistics
@@ -46,7 +51,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
@@ -193,26 +198,30 @@ pub fn file_level(target: &str) -> LevelFilter {
 /// The process logger: the file sink plus the secondary, each fed only what
 /// its own filter wants. There is one per process ([`init`]).
 pub struct Logger {
-    file: OnceLock<FileSink>,
+    /// Read on every line; written only by [`init`] and [`switch_file`],
+    /// so after a switch no line reaches the old file.
+    file: RwLock<Option<FileSink>>,
     secondary: OnceLock<Secondary>,
     installed: AtomicBool,
     init_lock: Mutex<()>,
 }
 
 static LOGGER: Logger = Logger {
-    file: OnceLock::new(),
+    file: RwLock::new(None),
     secondary: OnceLock::new(),
     installed: AtomicBool::new(false),
     init_lock: Mutex::new(()),
 };
 
-/// Install the composite as the process logger. Idempotent: each part is
-/// set by the first call that supplies it and kept from then on, so a later
-/// call can add the file to a logger first installed without one (and is a
-/// no-op otherwise). Never fails: a directory that cannot be used leaves the
-/// file out and says so through the secondary; a foreign logger already
-/// installed leaves `log` records with it ([`Logger::is_installed`] is then
-/// false) while [`log_line`] and crash capture still use the file.
+/// Install the composite as the process logger. Idempotent: the secondary
+/// is set by the first call that supplies one and kept from then on; the
+/// file by a call that supplies one while none is running, so a later call
+/// can add the file to a logger first installed without one (and is a
+/// no-op otherwise; [`switch_file`] moves a running one). Never fails: a
+/// directory that cannot be used leaves the file out and says so through
+/// the secondary; a foreign logger already installed leaves `log` records
+/// with it ([`Logger::is_installed`] is then false) while [`log_line`] and
+/// crash capture still use the file.
 pub fn init(file: Option<DiagConfig>, secondary: Option<Secondary>) -> &'static Logger {
     let l = &LOGGER;
     let _g = l.init_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -223,15 +232,15 @@ pub fn init(file: Option<DiagConfig>, secondary: Option<Secondary>) -> &'static 
     }
     let mut failed: Option<(PathBuf, io::Error)> = None;
     if let Some(cfg) = file
-        && l.file.get().is_none()
+        && !l.has_file()
     {
-        // Crash files follow the log: the first directory that holds one,
-        // else (so a crash is still captured) the first one tried.
+        // Crash files follow the log: the directory that holds one, else
+        // (so a crash is still captured) the first one tried.
         let crash_cfg = cfg.clone();
         match FileSink::start(cfg, &RUNS) {
             Ok(sink) => {
                 crash::configure(&crash_cfg, true);
-                let _ = l.file.set(sink);
+                *l.file.write().unwrap_or_else(|e| e.into_inner()) = Some(sink);
             }
             Err(e) => {
                 crash::configure(&crash_cfg, false);
@@ -258,6 +267,19 @@ pub fn init(file: Option<DiagConfig>, secondary: Option<Secondary>) -> &'static 
     l
 }
 
+/// Move the log file to `file`'s directory, or stop keeping one (`None`),
+/// for a process that changes the device it serves: what was queued for
+/// the old file is written there first (waiting up to `timeout`), and no
+/// line logged after the switch reaches it. Crash files follow the log. The
+/// new file starts as [`init`]'s would (header, sweep); a switch to the
+/// directory already in use changes nothing. `true` when a file is now
+/// kept in `file`'s directory; `false` for `None`, and when that directory
+/// cannot be used (no file then, said through the secondary, while crash
+/// files still go there).
+pub fn switch_file(file: Option<DiagConfig>, timeout: Duration) -> bool {
+    LOGGER.switch_file(file, timeout)
+}
+
 /// The composite, whether or not [`init`] has run.
 pub fn logger() -> &'static Logger {
     &LOGGER
@@ -269,18 +291,77 @@ impl Logger {
         self.installed.load(Ordering::SeqCst)
     }
 
-    /// The log directory, once a file sink is running.
-    pub fn dir(&self) -> Option<&Path> {
-        self.file.get().map(|f| f.dir.as_path())
+    /// The log directory, while a file sink is running.
+    pub fn dir(&self) -> Option<PathBuf> {
+        self.sink().as_ref().map(|f| f.dir.clone())
     }
 
     /// Wait (up to `timeout`) until every line queued so far is on disk.
     pub fn flush_file(&self, timeout: Duration) -> bool {
-        self.file.get().is_none_or(|f| f.flush(timeout))
+        self.sink().as_ref().is_none_or(|f| f.flush(timeout))
+    }
+
+    /// [`switch_file`] on this logger.
+    pub fn switch_file(&self, file: Option<DiagConfig>, timeout: Duration) -> bool {
+        let _g = self.init_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cfg) = &file
+            && self.dir().as_deref() == Some(cfg.dir.as_path())
+        {
+            return true;
+        }
+        // The new file starts before the swap, so no line falls between
+        // the two; the old one is drained after it, out of the way.
+        let mut failed: Option<(PathBuf, io::Error)> = None;
+        let new = match file {
+            None => {
+                crash::follow(None, false);
+                None
+            }
+            Some(cfg) => {
+                let crash_cfg = cfg.clone();
+                match FileSink::start(cfg, &RUNS) {
+                    Ok(sink) => {
+                        crash::follow(Some(&crash_cfg), true);
+                        Some(sink)
+                    }
+                    Err(e) => {
+                        crash::follow(Some(&crash_cfg), false);
+                        failed = Some((crash_cfg.dir, e));
+                        None
+                    }
+                }
+            }
+        };
+        let kept = new.is_some();
+        let old = std::mem::replace(
+            &mut *self.file.write().unwrap_or_else(|e| e.into_inner()),
+            new,
+        );
+        if self.installed.load(Ordering::SeqCst) {
+            log::set_max_level(self.max_level());
+        }
+        if let Some(old) = old {
+            old.stop(timeout);
+        }
+        if let Some((dir, e)) = failed {
+            log::warn!(
+                "diag: cannot write a log in {} ({e}); not keeping one",
+                dir.display()
+            );
+        }
+        kept
+    }
+
+    fn sink(&self) -> std::sync::RwLockReadGuard<'_, Option<FileSink>> {
+        self.file.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn has_file(&self) -> bool {
+        self.sink().is_some()
     }
 
     fn max_level(&self) -> LevelFilter {
-        let file = if self.file.get().is_some() {
+        let file = if self.has_file() {
             LevelFilter::Debug
         } else {
             LevelFilter::Off
@@ -310,7 +391,7 @@ impl Log for Logger {
         if withheld(m) {
             return false;
         }
-        (self.file.get().is_some() && m.level() <= file_level(m.target()))
+        (m.level() <= file_level(m.target()) && self.has_file())
             || self.secondary.get().is_some_and(|s| s.logger.enabled(m))
     }
 
@@ -318,8 +399,8 @@ impl Log for Logger {
         if withheld(r.metadata()) {
             return;
         }
-        if let Some(f) = self.file.get()
-            && r.level() <= file_level(r.target())
+        if r.level() <= file_level(r.target())
+            && let Some(f) = self.sink().as_ref()
         {
             let site = r.module_path().zip(r.line());
             f.submit(
@@ -354,7 +435,7 @@ pub fn log_line(level: Level, tag: &str, msg: &str) {
     if level > file_level("app") {
         return;
     }
-    if let Some(f) = LOGGER.file.get() {
+    if let Some(f) = LOGGER.sink().as_ref() {
         f.submit(
             level,
             "app",
@@ -371,9 +452,9 @@ pub fn flush(timeout: Duration) -> bool {
     LOGGER.flush_file(timeout)
 }
 
-/// The log directory, once [`init`] has one running.
+/// The log directory, while [`init`] (or [`switch_file`]) has one running.
 pub fn log_dir() -> Option<PathBuf> {
-    LOGGER.dir().map(Path::to_path_buf)
+    LOGGER.dir()
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +688,7 @@ pub(crate) struct FileSink {
     dropped: Arc<AtomicU64>,
     limiter: Arc<Limiter>,
     dir: PathBuf,
+    writer: std::thread::JoinHandle<()>,
 }
 
 enum Msg {
@@ -671,7 +753,7 @@ impl FileSink {
         let dropped = Arc::new(AtomicU64::new(0));
         let counter = dropped.clone();
         let budgets = limiter.clone();
-        std::thread::Builder::new()
+        let writer = std::thread::Builder::new()
             .name("spora-diag".into())
             .spawn(move || writer.run(rx, counter, budgets))?;
         Ok(FileSink {
@@ -679,7 +761,23 @@ impl FileSink {
             dropped,
             limiter,
             dir,
+            writer,
         })
+    }
+
+    /// Write out what is queued (up to `timeout`), close the file and end
+    /// the writer thread, waiting for it unless the time ran out. Whether
+    /// everything queued reached the file.
+    pub(crate) fn stop(self, timeout: Duration) -> bool {
+        let flushed = self.flush(timeout);
+        let FileSink { tx, writer, .. } = self;
+        // The writer drains what is left and ends once the queue has no
+        // sender.
+        drop(tx);
+        if flushed {
+            let _ = writer.join();
+        }
+        flushed
     }
 
     /// Queue one line. `site` is the call site (module, line) when known:

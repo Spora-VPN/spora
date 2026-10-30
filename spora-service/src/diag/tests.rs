@@ -791,7 +791,7 @@ fn global_logger_end_to_end() {
         Some(Secondary::new(Box::new(Fwd(captured)), LevelFilter::Info)),
     );
     assert!(l.is_installed());
-    assert_eq!(l.dir(), Some(dir.as_path()));
+    assert_eq!(l.dir(), Some(dir.clone()));
     assert_eq!(log::max_level(), LevelFilter::Debug);
     // Idempotent: a second init changes nothing.
     let again = init(Some(DiagConfig::in_dir(tmp.path().join("other"))), None);
@@ -928,4 +928,72 @@ fn global_logger_end_to_end() {
     assert!(!rust.contains(SECRET));
     assert!(rust.ends_with('\n'));
     assert!(crashes.iter().any(|c| c.name.ends_with("-kotlin.txt")));
+
+    // The file moves (another device served): what was queued goes to the
+    // old file, nothing after the switch does; the new directory gets a
+    // file of its own and the crash files.
+    let wait = Duration::from_secs(5);
+    let moved = tmp.path().join("moved");
+    log::info!(target: "spora_test", "before the switch");
+    assert!(switch_file(
+        Some(DiagConfig::in_dir(&moved).with_platform("windows")),
+        wait
+    ));
+    assert!(
+        switch_file(Some(DiagConfig::in_dir(&moved)), wait),
+        "the directory in use: nothing changes"
+    );
+    assert_eq!(log_dir(), Some(moved.clone()));
+    log::info!(target: "spora_test", "after the switch");
+    let k = write_crash("kotlin", "after the switch").unwrap();
+    assert!(k.starts_with(&moved));
+    assert!(flush(wait));
+    let old: String = log_files(&dir)
+        .iter()
+        .map(|f| std::fs::read_to_string(f).unwrap())
+        .collect();
+    assert!(old.contains("before the switch"));
+    assert!(!old.contains("after the switch"));
+    let files = log_files(&moved);
+    assert_eq!(files.len(), 1);
+    let ls = lines(&files[0]);
+    assert_eq!(ls[0]["msg"], "log opened");
+    assert_eq!(ls[0]["platform"], "windows");
+    assert!(ls.iter().any(|l| l["msg"] == "after the switch"));
+    assert!(!ls.iter().any(|l| l["msg"] == "before the switch"));
+
+    // No file (no device served): lines reach the secondary only, and a
+    // crash has no home.
+    assert!(!switch_file(None, wait));
+    assert_eq!(log_dir(), None);
+    assert_eq!(log::max_level(), LevelFilter::Info);
+    log::info!(target: "while_none_t", "while none");
+    assert!(write_crash("kotlin", "nowhere").is_err());
+    assert!(captured.0.lock().unwrap().iter().any(|m| m == "while none"));
+
+    // A directory no log can start in: still no file.
+    assert!(!switch_file(
+        Some(DiagConfig::in_dir(blocker.join("diag"))),
+        wait
+    ));
+    assert_eq!(log_dir(), None);
+
+    // And a file again, from either call.
+    let back = tmp.path().join("back");
+    let l = init(Some(DiagConfig::in_dir(&back)), None);
+    assert_eq!(l.dir(), Some(back.clone()));
+    assert_eq!(log::max_level(), LevelFilter::Debug);
+    log::info!(target: "spora_test", "back again");
+    assert!(flush(wait));
+    let back_files = log_files(&back);
+    assert_eq!(back_files.len(), 1);
+    assert!(
+        lines(&back_files[0])
+            .iter()
+            .any(|l| l["msg"] == "back again")
+    );
+    for f in log_files(&dir).iter().chain(&files) {
+        assert!(!std::fs::read_to_string(f).unwrap().contains("while none"));
+        assert!(!std::fs::read_to_string(f).unwrap().contains("back again"));
+    }
 }

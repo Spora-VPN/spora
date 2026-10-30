@@ -418,7 +418,12 @@ Key facts:
 
 - **Diagnostic log** (`spora_service::diag`): `diag::init(file, secondary)`
   installs a composite `log` logger — the file plus the platform's own logger
-  (env_logger / android_logger / oslog), each with its own filter. The file's
+  (env_logger / android_logger / oslog), each with its own filter.
+  `diag::switch_file(file, timeout)` moves the file (crash files follow) to
+  another directory, or stops keeping one, for a process that changes the
+  device it serves (the Windows service: one Windows user at a time, each
+  with their own device): what was queued drains into the old file and no
+  line after the switch reaches it. The file's
   filter is fixed (`file_level`): `spora_core::flow` and `spora_core::stats`
   never (see "Conventions"); `spora*`/`relay*`/`app` at Debug; quinn,
   smoltcp, rustls, ureq… at Warn; else Info. `diag::WITHHELD_TARGETS`

@@ -1100,6 +1100,15 @@ fn retention_sweep(db: &mut Connection, retention: Duration) -> Result<Swept, ru
 /// connection log or that a newer format wrote. Blocking (SQLite I/O, at
 /// most a few seconds' wait for a busy database).
 pub fn sweep_dir(dir: &Path, fallback_retention: Duration) -> Result<Option<Swept>, String> {
+    // SQLITE_OPEN_NOFOLLOW refuses a path with a symlink anywhere in it, and
+    // ordinary paths have them (Android's filesDir is under /data/user/0, a
+    // symlink to /data/data): the directory is resolved first, so that only
+    // the database file itself is held to it.
+    let dir = match std::fs::canonicalize(dir) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {}", dir.display(), e)),
+    };
     let path = dir.join(DB_FILE);
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1930,6 +1939,34 @@ mod tests {
         );
         sweep_dir(dir.path(), days(30)).unwrap();
         assert_eq!(destinations(dir.path()), ["held.example", "recent.example"]);
+    }
+
+    /// A log whose path runs through a symlinked directory is swept like any
+    /// other: only the database file itself may not be a symlink. Android's
+    /// `filesDir` is `/data/user/0/<app>`, and `/data/user/0` is a symlink to
+    /// `/data/data`; macOS's temporary and `/var` paths are symlinks too.
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_reaches_a_log_through_a_symlinked_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        let share = real.join("share");
+        stopped_log(&share, days(30));
+        insert_flow(&share, 1, "expired.example", 40 * DAY_MS);
+        insert_flow(&share, 2, "recent.example", 10 * DAY_MS);
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let swept = sweep_dir(&link.join("share"), days(90)).unwrap().unwrap();
+        assert_eq!(swept.flows, 1, "{swept:?}");
+        assert_eq!(destinations(&share), ["recent.example"]);
+
+        insert_flow(&share, 3, "expired.example", 40 * DAY_MS);
+        let [found] = &sweep_root(&link, None, days(90)).unwrap()[..] else {
+            panic!("one log under the root");
+        };
+        assert_eq!(found.result.as_ref().map(|s| s.flows), Ok(1), "{found:?}");
+        assert_eq!(destinations(&share), ["recent.example"]);
     }
 
     #[test]

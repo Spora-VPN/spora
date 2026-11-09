@@ -5,7 +5,8 @@ diagnostic record of each connection (what was attempted, what failed,
 and why), a diagnostic log, and crash reports, if any. Telemetry is one
 switch: whether these also go to Spora, in the background. They show
 where and how networks block Spora, and help fix problems. It is off
-unless you turn it on.
+unless you turn it on, or your account requires it (for example for a
+promotion you signed up for; see [Turning it off](#turning-it-off)).
 
 ```bash
 spora telemetry on

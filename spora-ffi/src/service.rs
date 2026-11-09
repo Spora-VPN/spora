@@ -72,7 +72,10 @@ fn platform_secondary() -> Option<Secondary> {
             .with_max_level(LevelFilter::Trace)
             .with_filter(filter),
     );
-    Some(Secondary::new(Box::new(logger), LevelFilter::Debug))
+    Some(Secondary::new(
+        Box::new(PlatformLog::new(logger)),
+        LevelFilter::Debug,
+    ))
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -84,7 +87,64 @@ fn platform_secondary() -> Option<Secondary> {
         .category_level_filter("quinn_proto", LevelFilter::Warn)
         .category_level_filter("quinn_udp", LevelFilter::Warn)
         .category_level_filter("smoltcp", LevelFilter::Warn);
-    Some(Secondary::new(Box::new(logger), LevelFilter::Debug))
+    Some(Secondary::new(
+        Box::new(PlatformLog::new(logger)),
+        LevelFilter::Debug,
+    ))
+}
+
+/// Whether the platform's own log (logcat, unified logging) is kept from a
+/// line on `target`. A release build keeps every line on
+/// `spora_core::FLOW_LOG_TARGET` from it: those name a client flow's source
+/// or destination, the sites a share's clients visit, and only the
+/// connection log may keep that, on the sharer's device. The platform log
+/// is not that: other tools on the device read it, and bug reports carry
+/// it. The diagnostic file never takes them either (spora-service's
+/// `file_level`). A debug build lets them through, for development.
+#[cfg(any(test, target_os = "android", target_os = "macos", target_os = "ios"))]
+fn withheld_from_platform(target: &str, release: bool) -> bool {
+    let flow = spora_core::FLOW_LOG_TARGET;
+    release
+        && target
+            .strip_prefix(flow)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+}
+
+/// The platform's logger behind [`withheld_from_platform`]. A filter of its
+/// own rather than an entry in each logger's filter: oslog matches a
+/// category exactly where android_logger matches a prefix, and this one is
+/// the same on every platform, tests included.
+#[cfg(any(test, target_os = "android", target_os = "macos", target_os = "ios"))]
+struct PlatformLog<L> {
+    inner: L,
+    release: bool,
+}
+
+#[cfg(any(test, target_os = "android", target_os = "macos", target_os = "ios"))]
+impl<L: log::Log> PlatformLog<L> {
+    fn new(inner: L) -> Self {
+        Self {
+            inner,
+            release: !cfg!(debug_assertions),
+        }
+    }
+}
+
+#[cfg(any(test, target_os = "android", target_os = "macos", target_os = "ios"))]
+impl<L: log::Log> log::Log for PlatformLog<L> {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        !withheld_from_platform(m.target(), self.release) && self.inner.enabled(m)
+    }
+
+    fn log(&self, r: &log::Record) {
+        if !withheld_from_platform(r.target(), self.release) {
+            self.inner.log(r);
+        }
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
+    }
 }
 
 #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "ios")))]
@@ -550,6 +610,68 @@ mod tests {
         p.to_string_lossy().into_owned()
     }
 
+    /// A logger that keeps the targets of what it was given.
+    #[derive(Default)]
+    struct Seen(std::sync::Mutex<Vec<String>>);
+
+    impl log::Log for Seen {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, r: &log::Record) {
+            self.0.lock().unwrap().push(r.target().to_owned());
+        }
+        fn flush(&self) {}
+    }
+
+    /// A release build gives the platform's log no flow line, whatever the
+    /// platform logger's own filter would let through; a debug build does.
+    #[test]
+    fn flow_lines_reach_the_platform_log_only_in_debug_builds() {
+        let flow = spora_core::FLOW_LOG_TARGET;
+        let targets = [
+            flow,
+            "spora_core::flow::netstack",
+            "spora_core::flowing",
+            "spora_core::server",
+            spora_core::STATS_LOG_TARGET,
+            "app",
+        ];
+        for release in [true, false] {
+            let platform = PlatformLog {
+                inner: Seen::default(),
+                release,
+            };
+            for target in targets {
+                let m = log::Metadata::builder()
+                    .target(target)
+                    .level(log::Level::Warn)
+                    .build();
+                let enabled = log::Log::enabled(&platform, &m);
+                log::Log::log(
+                    &platform,
+                    &log::Record::builder()
+                        .metadata(m)
+                        .args(format_args!("203.0.113.9:443"))
+                        .build(),
+                );
+                let flow_line = target == flow || target.starts_with("spora_core::flow::");
+                assert_eq!(enabled, !(release && flow_line), "{target} {release}");
+            }
+            let seen = platform.inner.0.into_inner().unwrap();
+            let expected: Vec<&str> = targets
+                .into_iter()
+                .filter(|t| !release || !(*t == flow || t.starts_with("spora_core::flow::")))
+                .collect();
+            assert_eq!(seen, expected, "release {release}");
+        }
+        // What the app gets: this build's own setting.
+        assert_eq!(
+            PlatformLog::new(Seen::default()).release,
+            !cfg!(debug_assertions)
+        );
+    }
+
     fn status_off() -> TelemetryStatus {
         TelemetryStatus {
             upload_enabled: false,
@@ -745,10 +867,10 @@ mod tests {
             Err(crate::ShareError::InvalidShare(_))
         ));
         let started =
-            crate::start_share(blob.clone(), None, None, None, false, None, vec![]).unwrap();
+            crate::start_share(blob.clone(), None, None, None, false, None, vec![], false).unwrap();
         assert_eq!(started.url, url, "the URL is the share's");
         assert!(matches!(
-            crate::start_share(blob.clone(), None, None, None, false, None, vec![]),
+            crate::start_share(blob.clone(), None, None, None, false, None, vec![], false),
             Err(crate::ShareError::AlreadyRunning)
         ));
         crate::stop_share(started.handle).unwrap();
@@ -761,7 +883,7 @@ mod tests {
         .unwrap()
         .to_blob();
         assert!(matches!(
-            crate::start_share(foreign, None, None, None, false, None, vec![]),
+            crate::start_share(foreign, None, None, None, false, None, vec![], false),
             Err(crate::ShareError::IdentityMismatch)
         ));
         let status = telemetry_status();

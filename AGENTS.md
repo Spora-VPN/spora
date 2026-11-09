@@ -640,7 +640,12 @@ Composition (client side): `QuicPeerTransport → UpgradableTransport → KeepAl
   the only per-flow record and it never leaves the machine — and **periodic
   per-connection statistics and per-probe lines** with `target:
   spora_core::STATS_LOG_TARGET` (`spora_core::stats`; e.g. QUIC path stats:
-  `RUST_LOG=spora_core::stats=debug`). `spora-core/tests/flow_log_target.rs`
+  `RUST_LOG=spora_core::stats=debug`). A RELEASE build of the FFI keeps the
+  flow lines from logcat and unified logging as well (other tools on the
+  device read those, and bug reports carry them): `PlatformLog` wraps the
+  platform logger in `spora-ffi/src/service.rs`, a prefix match the same
+  on every platform (oslog's own category filter matches exactly); debug
+  builds let them through for development. `spora-core/tests/flow_log_target.rs`
   guards the flow lines. The vendored netstack follows the same rule: it logs
   through `tracing`'s `log` bridge, which carries an event's `target:` over,
   and every line of its that names a flow's address (malformed-packet errors

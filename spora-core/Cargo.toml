@@ -33,7 +33,9 @@ subtle = "2"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+# fallible_uint: u64 counters bind as INTEGER and fail above i64::MAX, as
+# rusqlite 0.32 did by default.
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 lru = "0.18"
 
 # DNS forwarder: system resolver discovery via GetAdaptersAddresses

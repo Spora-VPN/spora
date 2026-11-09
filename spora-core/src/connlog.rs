@@ -21,6 +21,13 @@
 //! of records that cannot be distinguished from absence of traffic would
 //! quietly destroy the log's exculpatory value). The same thinking drives the
 //! `share_start`/`share_stop` and `clock_jump` marks.
+//!
+//! Retention: the writer sweeps its own log (records older than
+//! [`ConnLogConfig::retention`], unless a hold pins them) and records that
+//! retention in the log. A share that is replaced or deleted leaves its log
+//! behind on purpose; [`sweep_dir`] and [`sweep_root`] (or a running share,
+//! with [`ConnLogConfig::sweep_siblings`]) go on sweeping it by the retention
+//! it recorded. Nothing here deletes a log's file or directory.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -47,8 +54,23 @@ const CHANNEL_CAPACITY: usize = 16 * 1024;
 /// (suspend/resume, NTP step, manual clock change).
 const CLOCK_JUMP_THRESHOLD_MS: i64 = 2_000;
 
+/// [`ConnLogConfig::retention`]'s default: 90 days.
+pub const DEFAULT_RETENTION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
 /// How often the retention sweep runs (also runs once at startup).
 const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// How long a connection waits for another one's write to the same database
+/// (a running share's writer and a sweep, possibly in another process)
+/// before it gives up with "database is locked".
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The database file in a log's directory.
+const DB_FILE: &str = "connlog.sqlite";
+
+/// The `meta` key under which a log keeps the retention its share last ran
+/// with, in milliseconds, so the log is swept by it after the share stops.
+const META_RETENTION_MS: &str = "retention_ms";
 
 /// Resolves the egress (post-NAT) source address for a flow the core cannot
 /// observe directly — e.g. the CLI's `--os-routing` mode looks the flow up in
@@ -84,13 +106,20 @@ pub struct ConnLogConfig {
     pub flow_record_burst: u32,
     /// See [`EgressLookup`].
     pub egress_lookup: Option<EgressLookup>,
+    /// Also sweep the logs of the other shares under `dir`'s parent, by
+    /// retention, whenever this share sweeps its own (see [`sweep_root`]).
+    /// For a platform that keeps one directory per share under a root of
+    /// their own (`<root>/<share>/`): a share that was replaced or deleted
+    /// leaves its log there, and nothing else would ever sweep it. Leave it
+    /// off for a `dir` whose parent holds anything else. Default false.
+    pub sweep_siblings: bool,
 }
 
 impl ConnLogConfig {
     pub fn in_dir(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
-            retention: Duration::from_secs(90 * 24 * 60 * 60),
+            retention: DEFAULT_RETENTION,
             log_destinations: true,
             log_blocked: true,
             flush_interval: Duration::from_secs(1),
@@ -99,6 +128,7 @@ impl ConnLogConfig {
             max_flow_records_per_sec: 25,
             flow_record_burst: 250,
             egress_lookup: None,
+            sweep_siblings: false,
         }
     }
 }
@@ -253,8 +283,8 @@ impl ConnLog {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&cfg.dir, std::fs::Permissions::from_mode(0o700));
         }
-        let path = cfg.dir.join("connlog.sqlite");
-        let db = open_db(&path, identity)?;
+        let path = cfg.dir.join(DB_FILE);
+        let db = open_db(&path, identity, cfg.retention)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -565,9 +595,17 @@ impl Throttle {
 
 // ---------- Writer thread ----------
 
-fn open_db(path: &Path, identity: &ShareIdentity) -> Result<Connection, String> {
+fn open_db(
+    path: &Path,
+    identity: &ShareIdentity,
+    retention: Duration,
+) -> Result<Connection, String> {
     let db =
         Connection::open(path).map_err(|e| format!("connlog: open {}: {}", path.display(), e))?;
+    // A sweep (another share's, another process's) may be writing: wait for
+    // it rather than fail a batch and mark the log degraded.
+    db.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|e| format!("connlog: busy timeout: {}", e))?;
     // auto_vacuum must be set before the first table is created to take
     // effect; on an existing database the pragma is a no-op (kept FULL/INCR
     // from creation time).
@@ -608,8 +646,12 @@ fn open_db(path: &Path, identity: &ShareIdentity) -> Result<Connection, String> 
     )
     .map_err(|e| format!("connlog: meta: {}", e))?;
     db.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES ('software_version', ?1)",
-        rusqlite::params![version],
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('software_version', ?1), (?2, ?3)",
+        rusqlite::params![
+            version,
+            META_RETENTION_MS,
+            retention.as_millis().to_string()
+        ],
     )
     .map_err(|e| format!("connlog: meta: {}", e))?;
     db.execute(
@@ -680,6 +722,10 @@ struct WriterState {
     last_sweep: Option<Instant>,
     /// Set after a write failure; cleared (with a log_gap mark) on recovery.
     degraded_since_ms: Option<i64>,
+    /// The sweep of the other shares' logs ([`ConnLogConfig::sweep_siblings`]),
+    /// on a thread of its own: their databases (another process may be
+    /// writing one) must never hold this share's writes up.
+    sibling_sweep: Option<std::thread::JoinHandle<()>>,
 }
 
 fn writer_loop(
@@ -695,6 +741,7 @@ fn writer_loop(
         dropped_seen: 0,
         last_sweep: None,
         degraded_since_ms: None,
+        sibling_sweep: None,
     };
     let mut batch: Vec<Ev> = Vec::new();
 
@@ -821,6 +868,22 @@ fn housekeeping(
             warn!("connlog: retention sweep failed: {}", e);
         }
         let _ = db.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        // The previous round still running (a sibling stuck behind a busy
+        // database) skips this one.
+        if cfg.sweep_siblings && state.sibling_sweep.as_ref().is_none_or(|t| t.is_finished()) {
+            let dir = cfg.dir.clone();
+            let fallback = cfg.retention;
+            state.sibling_sweep = std::thread::Builder::new()
+                .name("spora-connlog-sweep".into())
+                .spawn(move || sweep_siblings(&dir, fallback))
+                .map_err(|e| {
+                    warn!(
+                        "connlog: cannot start the sweep of other shares' logs: {}",
+                        e
+                    )
+                })
+                .ok();
+        }
     }
 }
 
@@ -958,21 +1021,39 @@ fn flush_batch(
     tx.commit()
 }
 
+/// What a retention sweep deleted, in rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Swept {
+    pub flows: usize,
+    /// Sessions, with their addresses.
+    pub sessions: usize,
+    pub marks: usize,
+}
+
+impl Swept {
+    pub fn records(&self) -> usize {
+        self.flows + self.sessions + self.marks
+    }
+}
+
 /// Delete expired records, skipping anything overlapping a hold range.
-fn retention_sweep(db: &mut Connection, retention: Duration) -> Result<(), rusqlite::Error> {
-    let cutoff = now_ms() - retention.as_millis() as i64;
-    let tx = db.transaction()?;
+fn retention_sweep(db: &mut Connection, retention: Duration) -> Result<Swept, rusqlite::Error> {
+    let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
+    let cutoff = now_ms().saturating_sub(retention_ms);
+    // IMMEDIATE: take the write lock up front, so a writer elsewhere makes
+    // this wait (busy timeout) instead of failing it halfway.
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     // A flow with last_ms NULL is still open (or was lost to a crash): its
     // age is judged by first_ms, but it is never deleted while its session
     // is younger than the cutoff.
-    tx.execute(
+    let flows = tx.execute(
         "DELETE FROM flows WHERE COALESCE(last_ms, first_ms) < ?1
            AND NOT EXISTS (SELECT 1 FROM holds h
                            WHERE flows.first_ms <= h.to_ms
                              AND COALESCE(flows.last_ms, flows.first_ms) >= h.from_ms)",
         rusqlite::params![cutoff],
     )?;
-    tx.execute(
+    let sessions = tx.execute(
         "DELETE FROM sessions WHERE COALESCE(end_ms, start_ms) < ?1
            AND NOT EXISTS (SELECT 1 FROM flows f WHERE f.session_id = sessions.id)
            AND NOT EXISTS (SELECT 1 FROM holds h
@@ -985,30 +1066,171 @@ fn retention_sweep(db: &mut Connection, retention: Duration) -> Result<(), rusql
          WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id = session_addrs.session_id)",
         [],
     )?;
-    tx.execute(
+    let marks = tx.execute(
         "DELETE FROM marks WHERE ts_ms < ?1
            AND NOT EXISTS (SELECT 1 FROM holds h WHERE marks.ts_ms BETWEEN h.from_ms AND h.to_ms)",
         rusqlite::params![cutoff],
     )?;
     tx.commit()?;
     let _ = db.execute_batch("PRAGMA incremental_vacuum;");
-    Ok(())
+    Ok(Swept {
+        flows,
+        sessions,
+        marks,
+    })
+}
+
+// ---------- Sweeping the logs of shares that are not running ----------
+//
+// A share's own writer sweeps its log while it runs. A share that is
+// replaced (new relays, a new URL) or deleted leaves its log behind on
+// purpose — it is the sharer's record of what that share was used for — but
+// nothing would ever sweep it again, so it would outlive its retention.
+
+/// Sweep the connection log in `dir` by retention, as its share's writer
+/// would: records older than the retention its share last ran with
+/// (recorded in the log), or `fallback_retention` for a log that does not
+/// say (written before it was recorded), are deleted unless a hold pins
+/// them. Returns `Ok(None)` when `dir` holds no log: it never creates one,
+/// nor deletes a file or a directory.
+///
+/// Safe while a share writes the log, here or in another process: the
+/// database is in WAL mode and both sides wait for each other's writes. A
+/// symlinked database is refused, and so is a database that is not a
+/// connection log or that a newer format wrote. Blocking (SQLite I/O, at
+/// most a few seconds' wait for a busy database).
+pub fn sweep_dir(dir: &Path, fallback_retention: Duration) -> Result<Option<Swept>, String> {
+    let path = dir.join(DB_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {}", path.display(), e)),
+        Ok(m) if !m.file_type().is_file() => {
+            return Err(format!("{}: not a regular file", path.display()));
+        }
+        Ok(_) => {}
+    }
+    use rusqlite::OpenFlags;
+    // No CREATE: a database that vanished meanwhile is not made anew.
+    let mut db = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|e| format!("open {}: {}", path.display(), e))?;
+    db.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|e| format!("{}: busy timeout: {}", path.display(), e))?;
+    let meta = |key: &str| -> Result<Option<String>, rusqlite::Error> {
+        match db.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0)) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    };
+    let not_a_log = |why: String| format!("{}: not a connection log ({})", path.display(), why);
+    let version = meta("format_version")
+        .map_err(|e| not_a_log(e.to_string()))?
+        .ok_or_else(|| not_a_log("no format version".into()))?;
+    match version.parse::<i64>() {
+        Ok(v) if v <= FORMAT_VERSION => {}
+        Ok(v) => {
+            return Err(format!(
+                "{}: format {} is newer than this version reads ({})",
+                path.display(),
+                v,
+                FORMAT_VERSION
+            ));
+        }
+        Err(_) => return Err(not_a_log(format!("format version {:?}", version))),
+    }
+    let retention = meta(META_RETENTION_MS)
+        .map_err(|e| format!("{}: {}", path.display(), e))?
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(fallback_retention);
+    retention_sweep(&mut db, retention)
+        .map(Some)
+        .map_err(|e| format!("{}: sweep: {}", path.display(), e))
+}
+
+/// One log [`sweep_root`] found, and how its sweep went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweptLog {
+    pub dir: PathBuf,
+    pub result: Result<Swept, String>,
+}
+
+/// [`sweep_dir`] for every share's log under `root`, the directory a
+/// platform keeps one log directory per share in, except the directory
+/// named `skip` (a running share's own, which its writer sweeps). Only real
+/// directories are looked at (a symlink is passed over), and those without
+/// a log are passed over silently. A log that cannot be swept does not stop
+/// the others: each comes back with its own result.
+pub fn sweep_root(
+    root: &Path,
+    skip: Option<&std::ffi::OsStr>,
+    fallback_retention: Duration,
+) -> Result<Vec<SweptLog>, String> {
+    let entries = std::fs::read_dir(root).map_err(|e| format!("{}: {}", root.display(), e))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {}", root.display(), e))?;
+        if skip.is_some_and(|s| s == entry.file_name()) {
+            continue;
+        }
+        // DirEntry::file_type does not follow a symlink.
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let dir = entry.path();
+        if let Some(result) = sweep_dir(&dir, fallback_retention).transpose() {
+            out.push(SweptLog { dir, result });
+        }
+    }
+    Ok(out)
+}
+
+/// [`ConnLogConfig::sweep_siblings`]: the other logs under `own`'s parent.
+fn sweep_siblings(own: &Path, fallback_retention: Duration) {
+    let Some(root) = own.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return;
+    };
+    match sweep_root(root, own.file_name(), fallback_retention) {
+        Err(e) => warn!("connlog: cannot sweep the other shares' logs: {}", e),
+        Ok(logs) => {
+            for log in logs {
+                match log.result {
+                    Ok(s) if s.records() > 0 => info!(
+                        "connlog: swept {} expired records from {}",
+                        s.records(),
+                        log.dir.display()
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!("connlog: cannot sweep another share's log: {}", e),
+                }
+            }
+        }
+    }
 }
 
 // ---------- Read side (used by the CLI's `spora log` and by tests) ----------
 
 /// Open a connlog database read-only.
 pub fn open_readonly(dir: &Path) -> Result<Connection, String> {
-    let path = dir.join("connlog.sqlite");
+    let path = dir.join(DB_FILE);
     Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("open {}: {}", path.display(), e))
 }
 
-/// Open a connlog database read-write (hold management).
+/// Open a connlog database read-write (hold management). Its writes wait
+/// for a running share's writer, or a sweep, to finish theirs.
 pub fn open_readwrite(dir: &Path) -> Result<Connection, String> {
-    let path = dir.join("connlog.sqlite");
-    Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|e| format!("open {}: {}", path.display(), e))
+    let path = dir.join(DB_FILE);
+    let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| format!("open {}: {}", path.display(), e))?;
+    db.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|e| format!("{}: busy timeout: {}", path.display(), e))?;
+    Ok(db)
 }
 
 #[derive(Debug, Clone)]
@@ -1586,5 +1808,273 @@ mod tests {
         let (from, to, count) = summary.expect("summary of the finished window");
         assert_eq!(count, 2);
         assert!(from <= to);
+    }
+
+    const DAY_MS: i64 = 24 * 3600 * 1000;
+
+    fn days(n: u64) -> Duration {
+        Duration::from_secs(n * 24 * 3600)
+    }
+
+    fn share_stopped(db: &Connection) -> bool {
+        db.query_row(
+            "SELECT COUNT(*) FROM marks WHERE kind='share_stop'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            >= 1
+    }
+
+    /// The log of a share that ran (with `retention`) and stopped.
+    fn stopped_log(dir: &Path, retention: Duration) {
+        let mut cfg = test_cfg(dir);
+        cfg.retention = retention;
+        drop(ConnLog::open(cfg, &ShareIdentity::generate(), None).unwrap());
+        wait_for(dir, share_stopped);
+    }
+
+    /// A flow `age_ms` old, to `dst`, in a session of its own.
+    fn insert_flow(dir: &Path, id: i64, dst: &str, age_ms: i64) {
+        let at = now_ms() - age_ms;
+        let db = open_readwrite(dir).unwrap();
+        db.execute(
+            "INSERT INTO sessions(id, start_ms, end_ms, relay_addr) VALUES (?1, ?2, ?2, 'r')",
+            rusqlite::params![id, at],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO flows(id, session_id, proto, src_ip, src_port, dst_ip, dst_port, first_ms, last_ms)
+             VALUES (?1, ?1, 6, 's', 1, ?2, 443, ?3, ?3)",
+            rusqlite::params![id, dst, at],
+        )
+        .unwrap();
+    }
+
+    fn destinations(dir: &Path) -> Vec<String> {
+        let db = open_readonly(dir).unwrap();
+        let mut stmt = db.prepare("SELECT dst_ip FROM flows ORDER BY id").unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_sweep_never_makes_a_log() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        assert_eq!(sweep_dir(&missing, days(90)), Ok(None));
+        assert!(!missing.exists());
+        let empty = root.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(sweep_dir(&empty, days(90)), Ok(None));
+        assert!(files_in(&empty).is_empty());
+        assert!(sweep_root(&root.path().join("no-root"), None, days(90)).is_err());
+        assert_eq!(sweep_root(root.path(), None, days(90)), Ok(vec![]));
+        assert!(files_in(&empty).is_empty());
+    }
+
+    /// A stopped share's log is swept by the retention that share ran with,
+    /// which the log records; holds pin what they cover.
+    #[test]
+    fn a_stopped_log_is_swept_by_its_own_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        stopped_log(dir.path(), days(30));
+        let recorded: String = open_readonly(dir.path())
+            .unwrap()
+            .query_row("SELECT value FROM meta WHERE key='retention_ms'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded, (30 * DAY_MS).to_string());
+        insert_flow(dir.path(), 1, "held.example", 200 * DAY_MS);
+        insert_flow(dir.path(), 2, "expired.example", 40 * DAY_MS);
+        insert_flow(dir.path(), 3, "recent.example", 10 * DAY_MS);
+        let held = now_ms() - 200 * DAY_MS;
+        add_hold(
+            &open_readwrite(dir.path()).unwrap(),
+            held - 10,
+            held + 10,
+            None,
+        )
+        .unwrap();
+
+        // A 90-day fallback would keep the 40-day-old flow: the log's own
+        // 30 days decide.
+        let swept = sweep_dir(dir.path(), days(90)).unwrap().unwrap();
+        assert_eq!((swept.flows, swept.sessions), (1, 1), "{swept:?}");
+        assert_eq!(destinations(dir.path()), ["held.example", "recent.example"]);
+        assert_eq!(sweep_dir(dir.path(), days(90)), Ok(Some(Swept::default())));
+
+        // A log that does not say (written before logs recorded it) is swept
+        // by the fallback.
+        open_readwrite(dir.path())
+            .unwrap()
+            .execute("DELETE FROM meta WHERE key='retention_ms'", [])
+            .unwrap();
+        insert_flow(dir.path(), 4, "expired.example", 40 * DAY_MS);
+        sweep_dir(dir.path(), days(90)).unwrap();
+        assert_eq!(
+            destinations(dir.path()),
+            ["held.example", "recent.example", "expired.example"]
+        );
+        sweep_dir(dir.path(), days(30)).unwrap();
+        assert_eq!(destinations(dir.path()), ["held.example", "recent.example"]);
+    }
+
+    #[test]
+    fn a_sweep_touches_only_connection_logs_it_can_read() {
+        let root = tempfile::tempdir().unwrap();
+        // Another SQLite database.
+        let other = root.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        {
+            let db = Connection::open(other.join(DB_FILE)).unwrap();
+            db.execute_batch("CREATE TABLE flows(x); INSERT INTO flows VALUES (1);")
+                .unwrap();
+        }
+        let e = sweep_dir(&other, days(0)).unwrap_err();
+        assert!(e.contains("not a connection log"), "{e}");
+        let kept: i64 = Connection::open(other.join(DB_FILE))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1);
+
+        // A log in a format newer than this version reads.
+        let newer = root.path().join("newer");
+        stopped_log(&newer, days(30));
+        insert_flow(&newer, 1, "expired.example", 40 * DAY_MS);
+        open_readwrite(&newer)
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value=?1 WHERE key='format_version'",
+                [(FORMAT_VERSION + 1).to_string()],
+            )
+            .unwrap();
+        let e = sweep_dir(&newer, days(30)).unwrap_err();
+        assert!(e.contains("newer"), "{e}");
+        assert_eq!(destinations(&newer), ["expired.example"]);
+
+        // A symlinked database.
+        #[cfg(unix)]
+        {
+            let linked = root.path().join("linked");
+            std::fs::create_dir(&linked).unwrap();
+            std::os::unix::fs::symlink(newer.join(DB_FILE), linked.join(DB_FILE)).unwrap();
+            let e = sweep_dir(&linked, days(30)).unwrap_err();
+            assert!(e.contains("not a regular file"), "{e}");
+        }
+    }
+
+    /// A sweep waits for a write in progress (a running share's writer,
+    /// another process) instead of failing.
+    #[test]
+    fn a_sweep_waits_for_a_busy_log() {
+        let dir = tempfile::tempdir().unwrap();
+        stopped_log(dir.path(), days(30));
+        insert_flow(dir.path(), 1, "expired.example", 40 * DAY_MS);
+        let writer = open_readwrite(dir.path()).unwrap();
+        writer
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO marks(ts_ms, kind) VALUES (1, 'busy');")
+            .unwrap();
+        let commit = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            writer.execute_batch("COMMIT;").unwrap();
+        });
+        let swept = sweep_dir(dir.path(), days(30)).unwrap().unwrap();
+        commit.join().unwrap();
+        assert_eq!(swept.flows, 1);
+        // The busy writer's ancient mark was committed before the sweep ran.
+        assert_eq!(swept.marks, 1);
+    }
+
+    /// A running share's writer waits for a sweep's write instead of
+    /// marking its log degraded.
+    #[test]
+    fn a_writer_waits_for_a_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let degraded = Arc::new(AtomicBool::new(false));
+        let seen = degraded.clone();
+        let hook: crate::EventHook = Some(Arc::new(move |ev| {
+            if matches!(ev, crate::TunnelEvent::ConnLogDegraded { .. }) {
+                seen.store(true, Ordering::SeqCst);
+            }
+        }));
+        let log = ConnLog::open(test_cfg(dir.path()), &ShareIdentity::generate(), hook).unwrap();
+        wait_for(dir.path(), |db| {
+            db.query_row("SELECT COUNT(*) FROM marks", [], |r| r.get::<_, i64>(0))
+                .unwrap_or(0)
+                >= 1
+        });
+        let sweeper = open_readwrite(dir.path()).unwrap();
+        sweeper.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let session = log.session(addr([203, 0, 113, 1], 443));
+        session.end("ended");
+        std::thread::sleep(Duration::from_millis(300));
+        sweeper.execute_batch("COMMIT;").unwrap();
+        wait_for(dir.path(), |db| {
+            query_sessions(db, None).is_ok_and(|s| s.len() == 1)
+        });
+        drop((session, log));
+        wait_for(dir.path(), share_stopped);
+        assert!(!degraded.load(Ordering::SeqCst));
+    }
+
+    /// `sweep_siblings`: a running share sweeps the logs of the other shares
+    /// under its log's parent, and nothing else there.
+    #[test]
+    fn a_share_sweeps_its_stopped_siblings() {
+        let root = tempfile::tempdir().unwrap();
+        let stopped = root.path().join("stopped");
+        stopped_log(&stopped, days(30));
+        insert_flow(&stopped, 1, "held.example", 200 * DAY_MS);
+        insert_flow(&stopped, 2, "expired.example", 40 * DAY_MS);
+        insert_flow(&stopped, 3, "recent.example", 10 * DAY_MS);
+        let held = now_ms() - 200 * DAY_MS;
+        add_hold(
+            &open_readwrite(&stopped).unwrap(),
+            held - 10,
+            held + 10,
+            None,
+        )
+        .unwrap();
+        let empty = root.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        std::fs::write(root.path().join("notes.txt"), "kept").unwrap();
+        // A log elsewhere, linked into the root: not one of its shares'.
+        let elsewhere = tempfile::tempdir().unwrap();
+        stopped_log(elsewhere.path(), days(30));
+        insert_flow(elsewhere.path(), 1, "expired.example", 40 * DAY_MS);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(elsewhere.path(), root.path().join("linked")).unwrap();
+
+        let mut cfg = test_cfg(&root.path().join("running"));
+        cfg.sweep_siblings = true;
+        let log = ConnLog::open(cfg, &ShareIdentity::generate(), None).unwrap();
+        wait_for(&stopped, |db| {
+            db.query_row(
+                "SELECT COUNT(*) FROM flows WHERE dst_ip='expired.example'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .is_ok_and(|n| n == 0)
+        });
+        drop(log);
+        wait_for(&root.path().join("running"), share_stopped);
+        assert_eq!(destinations(&stopped), ["held.example", "recent.example"]);
+        assert!(stopped.is_dir());
+        assert!(files_in(&empty).is_empty());
+        assert_eq!(destinations(elsewhere.path()), ["expired.example"]);
     }
 }

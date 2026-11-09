@@ -26,7 +26,10 @@ Notes:
 - The connection log is SQLite; read it with `spora log`, not by hand, and
   note that deleting the share does not delete the log. It is your
   record of what your connection was used for, and it outlives the URL on
-  purpose.
+  purpose. Its records still expire: every `spora share` also sweeps the
+  logs of earlier shares in `connlog/` by the retention each was kept
+  with (a log moved elsewhere with `--conn-log-dir` is swept only while
+  its own share runs).
 - Records are plain JSON Lines, one file per run; `--record-dir` moves
   them and `--no-record` disables them.
 - The diagnostic log holds what `share` and `use` log, as JSON Lines, at

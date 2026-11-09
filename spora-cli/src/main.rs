@@ -873,12 +873,14 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
             let connlog_dir = if no_conn_log {
                 None
             } else {
-                let dir =
-                    conn_log_dir.unwrap_or_else(|| default_connlog_dir(&share.routing_hash()));
-                let mut cl = spora_core::connlog::ConnLogConfig::in_dir(&dir);
-                cl.retention =
-                    std::time::Duration::from_secs(u64::from(conn_log_retention_days) * 86_400);
-                cl.log_destinations = !conn_log_sessions_only;
+                #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+                let mut cl = conn_log_config(
+                    conn_log_dir,
+                    &share.routing_hash(),
+                    conn_log_retention_days,
+                    conn_log_sessions_only,
+                );
+                let dir = cl.dir.clone();
                 #[cfg(target_os = "linux")]
                 if os_routing {
                     cl.egress_lookup = Some(os_route::conntrack_egress_lookup());
@@ -1963,6 +1965,26 @@ fn default_connlog_dir(routing_hash: &RoutingHash) -> PathBuf {
 
 fn connlog_base_dir() -> PathBuf {
     state_dir().join("connlog")
+}
+
+/// A share's connection log: in `dir` (`--conn-log-dir`), else in the
+/// share's own directory under [`connlog_base_dir`]. A log there also sweeps
+/// the logs beside it, those of the shares this state ran before (replaced
+/// by `--fresh` or other relays), by the retention each was kept with:
+/// nothing else would, and the logs stay on purpose. A directory elsewhere
+/// sweeps only its own log, whatever else its parent holds.
+fn conn_log_config(
+    dir: Option<PathBuf>,
+    routing_hash: &RoutingHash,
+    retention_days: u32,
+    sessions_only: bool,
+) -> spora_core::connlog::ConnLogConfig {
+    let dir = dir.unwrap_or_else(|| default_connlog_dir(routing_hash));
+    let mut cl = spora_core::connlog::ConnLogConfig::in_dir(&dir);
+    cl.retention = std::time::Duration::from_secs(u64::from(retention_days) * 86_400);
+    cl.log_destinations = !sessions_only;
+    cl.sweep_siblings = dir.parent() == Some(connlog_base_dir().as_path());
+    cl
 }
 
 /// Where the CLI keeps what it learns about its runs: `spora` in the state
@@ -3938,6 +3960,23 @@ mod state_dir_tests {
         assert_eq!(config.state_dir, service_dir());
         assert_eq!(config.record_dirs, [default_record_dir()]);
         assert_eq!(config.log_dir, Some(default_diag_dir()));
+    }
+
+    /// A share's log in the state directory sweeps the other shares' logs
+    /// there; one in a directory of the user's choosing sweeps only its own.
+    #[test]
+    fn only_a_log_in_the_state_directory_sweeps_its_siblings() {
+        let hash: RoutingHash = [7; 20];
+        let own = conn_log_config(None, &hash, 30, true);
+        assert_eq!(own.dir, default_connlog_dir(&hash));
+        assert!(own.sweep_siblings);
+        assert_eq!(own.retention, std::time::Duration::from_secs(30 * 86_400));
+        assert!(!own.log_destinations);
+        let beside = conn_log_config(Some(connlog_base_dir().join("mine")), &hash, 90, false);
+        assert!(beside.sweep_siblings);
+        let elsewhere = conn_log_config(Some(PathBuf::from("/srv/evidence/log")), &hash, 90, false);
+        assert!(!elsewhere.sweep_siblings);
+        assert!(elsewhere.log_destinations);
     }
 
     /// A user's own run that finds nothing in its own state says where runs

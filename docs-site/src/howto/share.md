@@ -65,7 +65,10 @@ The log lives at `~/.local/state/spora/connlog/<routing-key>/` (in root's
 home for a share run with sudo, such as `--os-routing` below: read that
 one with `sudo spora log`), keeps 90
 days by default (`--conn-log-retention-days`), and never leaves your
-machine. `spora log hold` pins a time range against retention if you have
+machine. A new share (after `--fresh`, or with other relays) gets a log of
+its own beside the old one, which stays; every `spora share` keeps
+sweeping the old logs there by the retention each was kept with.
+`spora log hold` pins a time range against retention if you have
 been asked to preserve records. `--no-conn-log` disables logging entirely,
 which also means you will have no record of what clients did with your IP.
 `--conn-log-sessions-only` records who was connected and when, without

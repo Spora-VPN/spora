@@ -417,14 +417,19 @@ pub fn share_relays(share_blob: Vec<u8>) -> Result<Vec<RelayEntry>, ShareError> 
 /// days). `conn_log_sessions_only = true` records who was connected and
 /// when, but no per-flow destination records. Fails if `conn_log_dir` is
 /// set but not writable — a default-on liability log must not silently
-/// degrade at startup.
+/// degrade at startup. `conn_log_sweep_siblings = true` also sweeps the
+/// other shares' logs under `conn_log_dir`'s parent by retention, at the
+/// start and every few hours while this share runs (see
+/// [`sweep_conn_logs`]); pass it only when that parent holds nothing but
+/// one directory per share (`filesDir/connlog`).
 ///
 /// `record_dir` turns on the connection record (spora-core's `record`, the
 /// diagnostic account of this run) in that directory — one directory for
 /// every share and connect, not backed up (Android:
 /// `noBackupFilesDir/records`). `None` keeps no record. `stun_servers`
 /// empty uses the built-in list.
-#[uniffi::export(default(record_dir = None, stun_servers = []))]
+#[uniffi::export(default(record_dir = None, stun_servers = [], conn_log_sweep_siblings = false))]
+#[allow(clippy::too_many_arguments)]
 pub fn start_share(
     share_blob: Vec<u8>,
     protector: Option<Box<dyn SocketProtectorCallback>>,
@@ -433,6 +438,7 @@ pub fn start_share(
     conn_log_sessions_only: bool,
     record_dir: Option<String>,
     stun_servers: Vec<String>,
+    conn_log_sweep_siblings: bool,
 ) -> Result<ShareResult, ShareError> {
     let svc = service()?;
     let share = parse_share(&share_blob)?;
@@ -456,9 +462,10 @@ pub fn start_share(
     let conn_log = conn_log_dir.map(|dir| {
         let mut cfg = spora_core::connlog::ConnLogConfig::in_dir(dir);
         if let Some(days) = conn_log_retention_days {
-            cfg.retention = std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60);
+            cfg.retention = retention_days(days);
         }
         cfg.log_destinations = !conn_log_sessions_only;
+        cfg.sweep_siblings = conn_log_sweep_siblings;
         cfg
     });
     // Android has no resolv.conf, so `System` finds nothing and the public
@@ -504,6 +511,48 @@ pub fn start_share(
     );
 
     Ok(ShareResult { handle: id, url })
+}
+
+fn retention_days(days: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60)
+}
+
+/// Sweeps the connection logs under `conn_log_root` (the directory the app
+/// keeps one log directory per share in, `filesDir/connlog`) by retention:
+/// what each share's own writer would delete if it were running, so the log
+/// of a share that was replaced or deleted does not outlive its retention.
+/// Each log keeps the retention its share last ran with;
+/// `conn_log_retention_days` is for a log that does not say (one written
+/// before this version), `None` = the core default (90 days). Held ranges
+/// stay. Never deletes a log's file or directory, never creates one, and is
+/// safe beside running shares. Blocking (SQLite I/O): call it off the main
+/// thread, for instance at app start, so logs are swept while no share
+/// runs. Returns how many records it deleted; a log that cannot be swept is
+/// logged and passed over.
+#[uniffi::export(default(conn_log_retention_days = None))]
+pub fn sweep_conn_logs(conn_log_root: String, conn_log_retention_days: Option<u32>) -> u64 {
+    let fallback =
+        conn_log_retention_days.map_or(spora_core::connlog::DEFAULT_RETENTION, retention_days);
+    let root = std::path::Path::new(&conn_log_root);
+    if !root.exists() {
+        // No share has logged anything yet.
+        return 0;
+    }
+    let logs = match spora_core::connlog::sweep_root(root, None, fallback) {
+        Ok(logs) => logs,
+        Err(e) => {
+            log::warn!("sweep_conn_logs: {e}");
+            return 0;
+        }
+    };
+    let mut deleted = 0;
+    for log in logs {
+        match log.result {
+            Ok(s) => deleted += s.records() as u64,
+            Err(e) => log::warn!("sweep_conn_logs: {e}"),
+        }
+    }
+    deleted
 }
 
 /// The tunnel's synthetic resolver address (spora-core's `dns::PROXY_ADDR`,
@@ -842,6 +891,51 @@ mod tests {
 
     fn snapshot(record: &Recorder) -> Record {
         record.snapshot().unwrap()
+    }
+
+    /// The logs of shares that no longer run are swept by retention; a root
+    /// that does not exist yet is not made.
+    #[test]
+    fn sweep_conn_logs_sweeps_every_share_under_the_root() {
+        use spora_core::connlog::{self, ConnLog, ConnLogConfig};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("connlog");
+        assert_eq!(sweep_conn_logs(root.to_string_lossy().into(), None), 0);
+        assert!(!root.exists());
+
+        let dir = root.join("0123456789abcdef");
+        let mut cfg = ConnLogConfig::in_dir(&dir);
+        cfg.flush_interval = Duration::from_millis(20);
+        let identity = spora_core::identity::ShareIdentity::generate();
+        drop(ConnLog::open(cfg, &identity, None).unwrap());
+        let stopped = Instant::now() + Duration::from_secs(5);
+        while !connlog::query_marks(&connlog::open_readonly(&dir).unwrap(), None, None)
+            .unwrap()
+            .iter()
+            .any(|m| m.kind == "share_stop")
+        {
+            assert!(Instant::now() < stopped, "the log never stopped");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A 200-day-old session; the default retention is 90 days.
+        let old = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 200 * 24 * 3600 * 1000;
+        connlog::open_readwrite(&dir)
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO sessions(id, start_ms, end_ms, relay_addr) VALUES (1, {old}, {old}, 'r');"
+            ))
+            .unwrap();
+        assert_eq!(sweep_conn_logs(root.to_string_lossy().into(), None), 1);
+        assert!(dir.join("connlog.sqlite").is_file());
+        assert!(
+            connlog::query_sessions(&connlog::open_readonly(&dir).unwrap(), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn tunnel(knob: u64) -> TunnelSession {

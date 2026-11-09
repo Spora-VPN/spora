@@ -2,7 +2,8 @@
 //! signal, mid-dial, on a local failure) and what they send as they stop,
 //! that a closed stdout does not kill them, that no log output carries the
 //! upload token, what `telemetry off` and unreadable directories make of
-//! their errors, and where a run with sudo keeps its state. Nothing here
+//! their errors, where a run with sudo keeps its state, and that a share
+//! sweeps the connection logs of earlier shares. Nothing here
 //! leaves the machine: the API is a fake on loopback, the relay a closed
 //! local port (or the share a direct endpoint on loopback), and every run
 //! that writes gets a scratch state and config directory of its own.
@@ -1282,5 +1283,98 @@ fn a_relayless_share_behind_a_nat_says_so_off_the_event_stream() {
             && l.contains("now reaches the internet from 203.0.113.8")),
         "{stderr:?}"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A `spora share` on `--relay NOWHERE`, until it says it is ready.
+fn ready_share(home: &Path, args: &[&str]) -> Child {
+    let mut child = spora(home, &format!("http://{NOWHERE}"))
+        .args(["share", "--relay", NOWHERE, "--no-record"])
+        .args(args)
+        .spawn()
+        .expect("spawn spora share");
+    let out = lines(child.stdout.take().unwrap());
+    let err = lines(child.stderr.take().unwrap());
+    let ready = Instant::now() + Duration::from_secs(30);
+    let mut printed = Vec::new();
+    while !printed.iter().any(|l: &String| l.contains("Press Ctrl+C")) {
+        let left = ready.saturating_duration_since(Instant::now());
+        match out.recv_timeout(left) {
+            Ok(line) => printed.push(line),
+            Err(_) => panic!(
+                "share never got ready; stdout: {printed:?}; stderr: {:?}",
+                err.try_iter().collect::<Vec<_>>()
+            ),
+        }
+    }
+    child
+}
+
+/// The destinations in a connection log, oldest flow first.
+fn logged_destinations(dir: &Path) -> Vec<String> {
+    use spora_core::connlog;
+    let db = connlog::open_readonly(dir).unwrap();
+    let mut flows = connlog::query_flows(&db, &connlog::FlowQuery::default()).unwrap();
+    flows.sort_by_key(|f| f.first_ms);
+    flows.into_iter().map(|f| f.dst).collect()
+}
+
+/// A share keeps sweeping the connection log of a share it replaced (a new
+/// share file here; `--fresh` or other relays alike) by retention: what has
+/// expired goes, what a hold pins or is recent stays, and so does the log.
+#[test]
+fn a_share_sweeps_the_logs_of_earlier_shares() {
+    use spora_core::connlog;
+    let home = scratch("connlog-sweep");
+    let earlier_share = home.join("earlier.bin");
+    let mut earlier = ready_share(&home, &["--share-file", earlier_share.to_str().unwrap()]);
+    interrupt(&earlier);
+    assert!(wait(&mut earlier, Duration::from_secs(30)).success());
+    let root = home.join("state").join("spora").join("connlog");
+    let logs: Vec<PathBuf> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    let old_log = &logs[0];
+
+    // Its sessions, as if it had served for months (90 days' retention).
+    let day: i64 = 24 * 3600 * 1000;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let db = connlog::open_readwrite(old_log).unwrap();
+    for (id, age, dst) in [
+        (1, 200, "192.0.2.1"),
+        (2, 120, "192.0.2.2"),
+        (3, 10, "192.0.2.3"),
+    ] {
+        let at = now - age * day;
+        db.execute_batch(&format!(
+            "INSERT INTO sessions(id, start_ms, end_ms, relay_addr) VALUES ({id}, {at}, {at}, 'r');
+             INSERT INTO flows(id, session_id, proto, src_ip, src_port, dst_ip, dst_port, first_ms, last_ms)
+                 VALUES ({id}, {id}, 6, '10.0.85.1', 40000, '{dst}', 443, {at}, {at});"
+        ))
+        .unwrap();
+    }
+    let held = now - 200 * day;
+    connlog::add_hold(&db, held - 1000, held + 1000, Some("preservation request")).unwrap();
+    drop(db);
+
+    let mut share = ready_share(&home, &[]);
+    let swept = Instant::now() + Duration::from_secs(20);
+    while logged_destinations(old_log).contains(&"192.0.2.2".to_string()) {
+        assert!(
+            Instant::now() < swept,
+            "the earlier share's log was never swept"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    interrupt(&share);
+    assert!(wait(&mut share, Duration::from_secs(30)).success());
+    assert_eq!(logged_destinations(old_log), ["192.0.2.1", "192.0.2.3"]);
+    let logs = std::fs::read_dir(&root).unwrap().count();
+    assert_eq!(logs, 2, "both shares' logs stay");
     std::fs::remove_dir_all(&home).ok();
 }

@@ -38,31 +38,14 @@ impl Netns {
         &self.name
     }
 
-    fn path(&self) -> String {
+    pub(crate) fn path(&self) -> String {
         format!("/run/netns/{}", self.name)
     }
 
     /// A `Command` that will execute inside this namespace (setns in the
     /// child between fork and exec — no `ip netns exec` indirection).
     pub fn command(&self, program: &str) -> Command {
-        let mut cmd = Command::new(program);
-        // Pre-build the CString: allocating after fork in a threaded process
-        // can deadlock on the allocator lock.
-        let path = CString::new(self.path()).unwrap();
-        unsafe {
-            cmd.pre_exec(move || {
-                let fd = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::setns(fd, libc::CLONE_NEWNET) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                libc::close(fd);
-                Ok(())
-            });
-        }
-        cmd
+        command_at(&self.path(), program)
     }
 
     /// Run a whitespace-splittable command line inside the namespace,
@@ -183,6 +166,29 @@ impl Drop for HostHandle {
     }
 }
 
+/// [`Netns::command`] for the namespace mounted at `ns_path`, for holders that
+/// must not own a `Netns` (dropping one deletes the namespace).
+pub(crate) fn command_at(ns_path: &str, program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    // Pre-build the CString: allocating after fork in a threaded process
+    // can deadlock on the allocator lock.
+    let path = CString::new(ns_path).unwrap();
+    unsafe {
+        cmd.pre_exec(move || {
+            let fd = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setns(fd, libc::CLONE_NEWNET) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(fd);
+            Ok(())
+        });
+    }
+    cmd
+}
+
 /// setns(CLONE_NEWNET) the current thread into the namespace at `path`.
 fn enter_by_path(path: &str) -> Result<(), String> {
     let cpath = CString::new(path).unwrap();
@@ -206,7 +212,7 @@ fn enter_by_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_checked(cmd: &mut Command) -> Result<String, String> {
+pub(crate) fn run_checked(cmd: &mut Command) -> Result<String, String> {
     let out = cmd.output().map_err(|e| format!("spawn: {e}"))?;
     if !out.status.success() {
         return Err(format!(

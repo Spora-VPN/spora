@@ -113,3 +113,7 @@ carry tunnel traffic. Its `carrier` is `quic`, `tcp_tls`, or `nz`; its `path`
 is `relay`, `direct_advertised`, or `direct_punched`. The event appears for the
 initial path and again after an acknowledged punched-path swap, so automation
 and status UIs do not have to infer the active protocol from log prose.
+
+## License
+
+[GPL-3.0](LICENSE), with an additional permission for combining Spora with Wintun on Windows: see [NOTICE](NOTICE).

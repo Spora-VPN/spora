@@ -1843,8 +1843,9 @@ mod tests {
         wait_for(dir, share_stopped);
     }
 
-    /// A flow `age_ms` old, to `dst`, in a session of its own.
-    fn insert_flow(dir: &Path, id: i64, dst: &str, age_ms: i64) {
+    /// A flow `age_ms` old, to `dst`, in a session of its own. Returns its
+    /// timestamp, for a hold that must cover exactly that flow.
+    fn insert_flow(dir: &Path, id: i64, dst: &str, age_ms: i64) -> i64 {
         let at = now_ms() - age_ms;
         let db = open_readwrite(dir).unwrap();
         db.execute(
@@ -1858,6 +1859,7 @@ mod tests {
             rusqlite::params![id, dst, at],
         )
         .unwrap();
+        at
     }
 
     fn destinations(dir: &Path) -> Vec<String> {
@@ -1906,10 +1908,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(recorded, (30 * DAY_MS).to_string());
-        insert_flow(dir.path(), 1, "held.example", 200 * DAY_MS);
+        let held = insert_flow(dir.path(), 1, "held.example", 200 * DAY_MS);
         insert_flow(dir.path(), 2, "expired.example", 40 * DAY_MS);
         insert_flow(dir.path(), 3, "recent.example", 10 * DAY_MS);
-        let held = now_ms() - 200 * DAY_MS;
         add_hold(
             &open_readwrite(dir.path()).unwrap(),
             held - 10,
@@ -2075,10 +2076,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let stopped = root.path().join("stopped");
         stopped_log(&stopped, days(30));
-        insert_flow(&stopped, 1, "held.example", 200 * DAY_MS);
+        let held = insert_flow(&stopped, 1, "held.example", 200 * DAY_MS);
         insert_flow(&stopped, 2, "expired.example", 40 * DAY_MS);
         insert_flow(&stopped, 3, "recent.example", 10 * DAY_MS);
-        let held = now_ms() - 200 * DAY_MS;
         add_hold(
             &open_readwrite(&stopped).unwrap(),
             held - 10,

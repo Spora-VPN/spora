@@ -17,7 +17,9 @@ clap = { version = "4.5.52", features = ["derive"] }
 tokio = "1.48.0"
 env_logger = "0.11.8"
 futures-util = "0.3.31"
-humantime = "2"
+# RFC 3339 times in `spora log`/`spora report`, all UTC: no time zone data,
+# the same build env_logger already pulls in.
+jiff = { version = "0.2.16", default-features = false, features = ["std"] }
 log = "0.4.29"
 serde_json = "1"
 url = "2.5.7"

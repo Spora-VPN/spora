@@ -1893,9 +1893,13 @@ fn proto_name(p: u8) -> &'static str {
     }
 }
 
+/// RFC 3339 in UTC, whole seconds; a time before 1970 prints as the epoch,
+/// one past jiff's range (year 9999) as its raw millisecond count.
 fn fmt_ms(ms: i64) -> String {
-    let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms.max(0) as u64);
-    humantime::format_rfc3339_seconds(t).to_string()
+    match jiff::Timestamp::from_millisecond(ms.max(0)) {
+        Ok(t) => t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        Err(_) => ms.to_string(),
+    }
 }
 
 /// Accepts RFC3339, a bare date (midnight UTC), or unix seconds/milliseconds.
@@ -1909,18 +1913,15 @@ fn parse_time(s: &str) -> Result<i64, String> {
     } else {
         s.to_string()
     };
-    humantime::parse_rfc3339(&attempt)
+    attempt
+        .parse::<jiff::Timestamp>()
         .map_err(|e| {
             format!(
                 "'{}' is not a recognized time ({}); use RFC3339, YYYY-MM-DD, or unix seconds",
                 s, e
             )
         })
-        .map(|t| {
-            t.duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0)
-        })
+        .map(|t| t.as_millisecond().max(0))
 }
 
 /// The connection-log directory for `spora <cmd>`: `dir`, or the one of the
@@ -3142,9 +3143,11 @@ fn report_record_dirs(extra: Vec<PathBuf>) -> Result<Vec<PathBuf>, Plain> {
 
 /// `20261019T120000Z`: sorts by time, and is a valid file name everywhere.
 fn file_stamp(t: std::time::SystemTime) -> String {
-    humantime::format_rfc3339_seconds(t)
+    // Out of range only past year 9999; the epoch then still names a file.
+    jiff::Timestamp::try_from(t)
+        .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+        .strftime("%Y%m%dT%H%M%SZ")
         .to_string()
-        .replace(['-', ':'], "")
 }
 
 fn fmt_bytes(n: u64) -> String {
@@ -4583,6 +4586,26 @@ mod diagnostics_tests {
     fn report_names_sort_by_time_and_are_portable() {
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_792_411_838_512);
         assert_eq!(file_stamp(t), "20261019T121038Z");
+    }
+
+    #[test]
+    fn log_times_print_and_parse_in_utc() {
+        assert_eq!(fmt_ms(1_792_411_838_512), "2026-10-19T12:10:38Z");
+        assert_eq!(fmt_ms(-5), "1970-01-01T00:00:00Z");
+        assert_eq!(fmt_ms(i64::MAX), i64::MAX.to_string());
+        assert_eq!(parse_time("2026-10-19T12:10:38Z"), Ok(1_792_411_838_000));
+        assert_eq!(
+            parse_time("2026-10-19T12:10:38.512Z"),
+            Ok(1_792_411_838_512)
+        );
+        assert_eq!(
+            parse_time("2026-10-19T14:10:38+02:00"),
+            Ok(1_792_411_838_000)
+        );
+        assert_eq!(parse_time("2026-10-19"), Ok(1_792_368_000_000));
+        assert_eq!(parse_time("1792411838"), Ok(1_792_411_838_000));
+        assert_eq!(parse_time("1792411838512"), Ok(1_792_411_838_512));
+        assert!(parse_time("yesterday").is_err());
     }
 
     #[test]

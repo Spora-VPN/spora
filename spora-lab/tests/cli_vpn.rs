@@ -63,21 +63,24 @@ fn svc_ip() -> Ipv4Addr {
     WAN_SERVICES_IP.parse().expect("WAN_SERVICES_IP parses")
 }
 
-/// `target/debug/spora-cli`, next to this test executable's `deps/` dir.
+/// `target/debug/spora-cli`: the nearest directory above this test executable
+/// that holds a `spora-cli` file. Cargo has kept test executables in
+/// `target/debug/deps/` and, since 1.100, in
+/// `target/debug/build/spora-lab/<hash>/out/`; walking up finds the binary
+/// from either. Only a file counts: `target/debug/build/spora-cli/` is the
+/// CLI package's own build directory.
 fn cli_binary() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let debug_dir = exe
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("test executable has no target dir")?;
-    let bin = debug_dir.join("spora-cli");
-    if !bin.is_file() {
-        return Err(format!(
-            "{} not found: build it first (`cargo build -p spora-cli`)",
-            bin.display()
-        ));
-    }
-    Ok(bin)
+    exe.ancestors()
+        .skip(1)
+        .map(|dir| dir.join("spora-cli"))
+        .find(|bin| bin.is_file())
+        .ok_or_else(|| {
+            format!(
+                "no spora-cli in any directory above {}: build it first (`cargo build -p spora-cli`)",
+                exe.display()
+            )
+        })
 }
 
 fn scratch_dir(tag: &str) -> Result<PathBuf, String> {

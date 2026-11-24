@@ -5,6 +5,8 @@
 //!
 //! Everything here is best-effort: a source tree with no git, or no git
 //! binary, builds fine and simply records no commit.
+//!
+//! It also holds a release to its version: see `check_release_version`.
 
 use std::process::Command;
 
@@ -21,7 +23,14 @@ fn main() {
         return;
     }
 
-    for path in ["../.git/HEAD", "../.git/index"] {
+    // The tag paths are for `check_release_version`: tagging a commit changes
+    // neither `HEAD` nor the index, and the next build must see the tag.
+    for path in [
+        "../.git/HEAD",
+        "../.git/index",
+        "../.git/packed-refs",
+        "../.git/refs/tags",
+    ] {
         if std::path::Path::new(path).exists() {
             println!("cargo:rerun-if-changed={path}");
         }
@@ -48,6 +57,51 @@ fn main() {
         .map(|out| !out.is_empty())
         .unwrap_or(false);
     println!("cargo:rustc-env=SPORA_BUILD_DIRTY={}", u8::from(dirty));
+
+    // A tree with uncommitted changes is not the tagged release, and is
+    // what the next version's first edit to Cargo.toml looks like.
+    if !dirty {
+        check_release_version();
+    }
+}
+
+/// The version lives in one place, `[workspace.package]` in the workspace's
+/// Cargo.toml, and a release is published under a tag, `v<version>`. Nothing
+/// else keeps the two from drifting apart (the binaries of v0.3.3 called
+/// themselves 0.1.0), so the build of a commit tagged `v1.2.3` fails unless
+/// the version is 1.2.3.
+///
+/// Only a tagged commit is checked: between releases the version is that of
+/// the last one, or already the next one's. A build that cannot ask git, or
+/// sees no tags (a shallow clone), is not checked here, which is why the
+/// release workflow also compares what its binaries report with its tag.
+fn check_release_version() {
+    // Tags of a repository this workspace is merely unpacked inside are
+    // someone else's versions.
+    if git(&["rev-parse", "--show-prefix"]).as_deref() != Some("spora-core/") {
+        return;
+    }
+    let Some(tags) = git(&["tag", "--points-at", "HEAD", "--list", "v[0-9]*"]) else {
+        return;
+    };
+    let version = env("CARGO_PKG_VERSION");
+    let tags: Vec<&str> = tags.lines().filter(|tag| !tag.is_empty()).collect();
+    if tags.is_empty()
+        || tags
+            .iter()
+            .any(|tag| tag.strip_prefix('v') == Some(&version))
+    {
+        return;
+    }
+    let tags = tags.join(", ");
+    // `cargo::error` fails the build with these lines alone; a non-zero exit
+    // would bury them under this script's whole output.
+    println!("cargo::error=this commit is tagged {tags}, but Cargo.toml says version {version}");
+    println!(
+        "cargo::error=a release's tag and its version must agree: set `version` under \
+         `[workspace.package]` in the workspace's Cargo.toml to the release's, commit it \
+         together with Cargo.lock, and tag that commit instead"
+    );
 }
 
 fn env(key: &str) -> String {

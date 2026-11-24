@@ -13,6 +13,12 @@ name: release
 #   spora-ffi-<tag>-android.zip                      jniLibs (4 ABIs) + Kotlin bindings
 #   SHA256SUMS
 #
+# The tag must be `v` + the version in Cargo.toml (`[workspace.package]`):
+# change it there, commit Cargo.lock with it, and tag that commit. spora-core's
+# build script fails the build of a tagged commit that says another version,
+# and the jobs that build the CLI and the relay fail if a binary reports
+# anything but the tag.
+#
 # The quickstart's installers (docs-site/src/install.sh and install.ps1) find
 # the CLI archive by these names in SHA256SUMS, and a published release is
 # what `releases/latest` hands them: rename an archive and they change too.
@@ -87,6 +93,23 @@ jobs:
             || { echo "::error::spora-cli --help smoke test failed"; exit 1; }
           ./target/${{ matrix.target }}/release/relay --help >/dev/null \
             || { echo "::error::relay --help smoke test failed"; exit 1; }
+          # a release reports its tag (the version in Cargo.toml)
+          if [[ "$GITHUB_REF_NAME" == v[0-9]* ]]; then
+            version=$(./target/${{ matrix.target }}/release/spora-cli --version)
+            [ "$version" = "spora ${GITHUB_REF_NAME#v}" ] \
+              || { echo "::error::tag $GITHUB_REF_NAME built '$version'"; exit 1; }
+            # its first line, `relay 1.2.3 (<target>)`; no pipe into head,
+            # which can close before the relay has printed the rest
+            version=$(./target/${{ matrix.target }}/release/relay build-info)
+            version=${version%%$'\n'*}
+            [ "${version% (*}" = "relay ${GITHUB_REF_NAME#v}" ] \
+              || { echo "::error::tag $GITHUB_REF_NAME built '$version'"; exit 1; }
+            # and is built from exactly its commit: a version changed
+            # without Cargo.lock has cargo rewrite the lock file here
+            build=$(./target/${{ matrix.target }}/release/spora-cli build-info)
+            [[ "$build" != *+uncommitted* ]] \
+              || { echo "::error::the build changed tracked files: $build"; git status --short; exit 1; }
+          fi
 
       - name: Stage tarballs
         run: |
@@ -159,6 +182,12 @@ jobs:
           # native smoke test, on the stripped+re-signed copy that ships
           ./stage/spora --help | grep -qi share \
             || { echo "::error::spora --help smoke test failed"; exit 1; }
+          # a release reports its tag (the version in Cargo.toml)
+          if [[ "$GITHUB_REF_NAME" == v[0-9]* ]]; then
+            version=$(./stage/spora --version)
+            [ "$version" = "spora ${GITHUB_REF_NAME#v}" ] \
+              || { echo "::error::tag $GITHUB_REF_NAME built '$version'"; exit 1; }
+          fi
 
       - name: Stage tarball
         run: tar -C stage -czf "dist/spora-${{ github.ref_name }}-macos-${{ matrix.arch }}.tar.gz" spora
@@ -232,6 +261,14 @@ jobs:
           if (-not ($out | Select-String -Quiet -SimpleMatch "share")) {
             Write-Host "::error::spora-cli --help does not mention share"
             exit 1
+          }
+          # a release reports its tag (the version in Cargo.toml)
+          if ($env:GITHUB_REF_NAME -cmatch '^v[0-9]') {
+            $version = & $exe --version
+            if ($version -cne "spora $($env:GITHUB_REF_NAME.Substring(1))") {
+              Write-Host "::error::tag $env:GITHUB_REF_NAME built '$version'"
+              exit 1
+            }
           }
 
       - name: Fetch wintun

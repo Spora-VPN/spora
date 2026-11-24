@@ -630,6 +630,21 @@ Composition (client side): `QuicPeerTransport → UpgradableTransport → KeepAl
 - `spora-core/build.rs` stamps the git commit + a dirty flag into the binary
   (overridable with `SPORA_BUILD_COMMIT`/`SPORA_BUILD_DIRTY` for release
   pipelines); every connection record names the build that produced it.
+- **One version, in `[workspace.package]` of the workspace's `Cargo.toml`**
+  (every crate says `version.workspace = true`), and a release is tagged
+  `v<that version>`. It is what `spora --version`, `relay build-info` and
+  `build_info().version` (records, bug reports, the CLI's `app_version`)
+  report. To release: change it there, commit `Cargo.lock` with it (any
+  cargo command rewrites it), and tag that commit. `spora-core/build.rs`
+  fails the build of a clean tree whose commit carries a `v<digit>…` tag
+  naming another version (the binaries of v0.3.3 called themselves 0.1.0).
+  Commits without such a tag are not checked, and neither are builds that
+  cannot ask git or see no tags (a shallow clone, a build given
+  `SPORA_BUILD_COMMIT`), so the release workflow also fails a `v*` tag whose
+  CLI or relay reports anything else, or whose build left the tree changed
+  (a `Cargo.lock` the bump forgot). Crates outside the workspace that depend
+  on these by path (spora-win, the managed relay) record the version in
+  their own lock files, which change with it at their next pin bump.
 - Logging via `log` crate, behind spora-service's composite logger (the
   diagnostic log file + env_logger / android_logger / oslog as the
   secondary) in the CLI and the FFI. The file keeps `spora*` targets at Debug

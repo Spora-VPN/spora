@@ -9,6 +9,15 @@ members = [
 exclude = ["vendor/netstack-smoltcp"]
 resolver = "3"
 
+# The version of every crate here (each says `version.workspace = true`), and
+# so of a release: `spora --version`, the relay's `build-info`, the records.
+# A release is tagged `v<this>`, and spora-core's build script fails the build
+# of a tagged commit that says anything else. For a release, change it here
+# and commit Cargo.lock with it (any cargo command rewrites it), then tag
+# that commit.
+[workspace.package]
+version = "0.3.3"
+
 [workspace.dependencies]
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

@@ -72,11 +72,29 @@ jobs:
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # The C in the binaries (ring, the bundled SQLite) is compiled by the
+      # runner's gcc, and what gcc targets by default is the image's choice:
+      # ubuntu-26.04 is built for x86-64-v3, so v0.3.3's x86_64 binaries
+      # needed AVX2 and BMI and died with "Illegal instruction" on any CPU
+      # without them (ring's LIMB_is_zero was the first to run). The flags
+      # name the baseline every x86_64 CPU has; the last -march wins, so they
+      # hold whatever the compiler's own default is. Rust code is baseline
+      # already: nothing here sets a target-cpu.
       - name: Build
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p spora-cli -p relay
+          CFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
+        run: |
+          if [ "${{ matrix.arch }}" = x86_64 ]; then
+            # What the compiler turns on with these flags: nothing past SSE2.
+            beyond=$(echo | musl-gcc $CFLAGS_x86_64_unknown_linux_musl -dM -E - \
+              | { grep -oE '__(SSE3|SSSE3|SSE4_[12]|POPCNT|AVX[0-9A-Z_]*|BMI2?|FMA|F16C|LZCNT|MOVBE)__' || true; } \
+              | sort -u | tr '\n' ' ')
+            [ -z "$beyond" ] \
+              || { echo "::error::the C compiler targets more than baseline x86-64: $beyond"; exit 1; }
+          fi
+          cargo build --release --target ${{ matrix.target }} -p spora-cli -p relay
 
       - name: Verify binaries
         run: |

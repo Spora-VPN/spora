@@ -16,7 +16,7 @@ resolver = "3"
 # and commit Cargo.lock with it (any cargo command rewrites it), then tag
 # that commit.
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 
 [workspace.dependencies]
 quinn = "0.11"

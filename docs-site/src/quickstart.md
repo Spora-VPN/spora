@@ -5,9 +5,35 @@ to use, `use` on the machine that should tunnel through it.
 
 ## Install
 
-Download the latest release for your system from the
-[releases page](https://github.com/Spora-VPN/spora/releases) and put the
-binary somewhere on your `PATH`:
+On Linux and macOS:
+
+```bash
+curl -fsSL https://spora.to/docs/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://spora.to/docs/install.ps1 | iex
+```
+
+The script downloads the latest release for your system from GitHub, checks
+it against the release's checksums and installs it. On Linux and macOS the
+binary goes to `/usr/local/bin/spora`, and `sudo` may ask for your password
+for that one step. On Windows, `spora.exe` goes to
+`%LOCALAPPDATA%\Programs\Spora`, which is added to your `PATH`. Run the same
+command again to upgrade.
+
+Both scripts are short, so read them first if you like:
+[install.sh](https://github.com/Spora-VPN/spora/blob/main/docs-site/src/install.sh),
+[install.ps1](https://github.com/Spora-VPN/spora/blob/main/docs-site/src/install.ps1).
+The comment at the top of each says how to pin a version or install
+somewhere else.
+
+### Install by hand
+
+Download the archive for your system from the
+[releases page](https://github.com/Spora-VPN/spora/releases):
 
 - **Linux**: `spora-<version>-linux-<arch>.tar.gz`, a single static
   binary named `spora`.
@@ -15,13 +41,22 @@ binary somewhere on your `PATH`:
   silicon, `x86_64` for Intel), a single binary named `spora`. It is not
   notarized yet, so if a browser downloaded the archive, macOS will refuse
   to run the binary until you clear the quarantine flag
-  (`xattr -d com.apple.quarantine spora`); fetching with `curl` avoids the
-  flag entirely.
+  (`xattr -d com.apple.quarantine spora`).
 - **Windows**: `spora-<version>-windows-<arch>.zip`, containing `spora.exe`
   plus `wintun.dll`. `spora use` loads the DLL from next to the executable,
-  so keep the two files together.
+  so keep the two files together, in a folder on your `PATH`.
 
-Or build from source (a Rust toolchain is the only requirement):
+On Linux and macOS, unpack the archive and put the binary in
+`/usr/local/bin`, where `sudo` finds it too (`spora use` runs as root):
+
+```bash
+tar -xzf spora-*.tar.gz
+sudo install -m 755 spora /usr/local/bin/spora
+```
+
+### Build from source
+
+A Rust toolchain is the only requirement:
 
 ```bash
 git clone https://github.com/Spora-VPN/spora.git

@@ -22,3 +22,12 @@ mdbook serve docs-site        # live preview at http://localhost:3000
   applies: plain and honest wording, concrete scenarios, and never an em
   dash (use periods, commas, or colons instead).
 - New pages must be listed in `src/SUMMARY.md` or mdBook will not build them.
+- `src/install.sh` and `src/install.ps1` are the installers the quickstart
+  tells readers to pipe into a shell. mdBook copies files that are not
+  Markdown as they are, so they are published at
+  `https://spora.to/docs/install.sh` and `install.ps1` with the book. They
+  find the CLI archive by the names the release workflow gives it
+  (`.github/workflows/release.yml`). `sh docs-site/install-test.sh` tests
+  `install.sh` offline; CI's `install-scripts` job also runs both against
+  the latest release. Keep `install.ps1` ASCII and free of `exit` (its
+  header says why).

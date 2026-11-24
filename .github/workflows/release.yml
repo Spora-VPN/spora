@@ -12,6 +12,10 @@ name: release
 #   spora-relay-<tag>-linux-{x86_64,aarch64}.tar.gz  relay (static musl)
 #   spora-ffi-<tag>-android.zip                      jniLibs (4 ABIs) + Kotlin bindings
 #   SHA256SUMS
+#
+# The quickstart's installers (docs-site/src/install.sh and install.ps1) find
+# the CLI archive by these names in SHA256SUMS, and a published release is
+# what `releases/latest` hands them: rename an archive and they change too.
 
 on:
   push:

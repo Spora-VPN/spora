@@ -66,6 +66,66 @@ jobs:
         run: command -v mdbook >/dev/null || cargo install mdbook --locked --version 0.5.4
       - run: mdbook build docs-site
 
+  install-scripts:
+    # The quickstart's install commands: docs-site/src/install.sh and
+    # install.ps1, published with the book. Each is run the way a reader
+    # runs it, against the latest published release, so a script that
+    # breaks, or a release whose archives the scripts no longer find, fails
+    # here. That makes this the one job that needs GitHub's release
+    # downloads to answer.
+    name: install script (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # sh is dash on the first and bash 3.2 on the second.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Lint
+        if: runner.os == 'Linux'
+        run: shellcheck docs-site/src/install.sh docs-site/install-test.sh
+
+      # Made-up releases read over file://: upgrades, a pinned version,
+      # sudo, and the refusals (an archive that fails its checksum above
+      # all).
+      - name: Test install.sh
+        if: runner.os != 'Windows'
+        run: sh docs-site/install-test.sh
+
+      - name: Install the latest release (install.sh)
+        if: runner.os != 'Windows'
+        run: |
+          sh < docs-site/src/install.sh
+          spora --help | grep -qi share
+
+      - name: Install the latest release (install.ps1, Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Get-Content -Raw docs-site/src/install.ps1 | Invoke-Expression
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Spora'
+          if (-not (Test-Path (Join-Path $dir 'wintun.dll'))) { throw 'wintun.dll is not next to spora.exe' }
+          $out = spora --help
+          if ($LASTEXITCODE -ne 0 -or -not ($out | Select-String -Quiet -SimpleMatch 'share')) {
+            throw 'the installed spora does not run from PATH'
+          }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if (($userPath -split ';') -notcontains $dir) { throw "the user PATH does not list $dir" }
+
+      # Again over the copy just installed, which is what an upgrade is.
+      - name: Install the latest release (install.ps1, PowerShell 7)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Content -Raw docs-site/src/install.ps1 | Invoke-Expression
+          $out = spora --help
+          if ($LASTEXITCODE -ne 0 -or -not ($out | Select-String -Quiet -SimpleMatch 'share')) {
+            throw 'the installed spora does not run from PATH'
+          }
+
   cli-windows:
     # `spora use` is a full VPN client on Windows (wintun + IP Helper);
     # nothing else builds the workspace for a Windows target, so this job

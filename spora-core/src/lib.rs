@@ -221,6 +221,9 @@ pub struct Timings {
     /// Per-relay budget for the client's relay-via dial (handshake + accept
     /// ack). When it elapses the client fails over to the next relay, so a
     /// dead/censored relay doesn't stall the whole connect on one endpoint.
+    /// Also the share's budget for parking one connection at a TCP relay
+    /// (connect + preamble). A parked connection that lasts twice this was
+    /// taken by the relay: when it is closed later, that is no refusal.
     pub relay_dial_timeout: Duration,
     /// Adaptive keepalive: send-silence gap that re-activates probing.
     pub keepalive_idle_threshold: Duration,
@@ -228,6 +231,14 @@ pub struct Timings {
     pub keepalive_response_timeout: Duration,
     /// Adaptive keepalive: inbound within this window keeps the peer alive.
     pub keepalive_inbound_grace: Duration,
+    /// TCP keepalive on the connections a share keeps parked at a TCP relay:
+    /// the kernel probes one that has been idle this long, then every sixth
+    /// of it (at least 1 s), and gives the connection up after 3 probes
+    /// without an answer (Windows: 10). Nothing is ever written to a parked
+    /// connection, so without the probes one that died with no FIN and no
+    /// RST (the relay host lost power, a NAT forgot it) would be waited on
+    /// for ever. The probes also keep a NAT's mapping for it in use.
+    pub park_keepalive: Duration,
 }
 
 impl Default for Timings {
@@ -248,6 +259,7 @@ impl Default for Timings {
             keepalive_idle_threshold: Duration::from_secs(20),
             keepalive_response_timeout: Duration::from_secs(3),
             keepalive_inbound_grace: Duration::from_secs(5),
+            park_keepalive: Duration::from_secs(60),
         }
     }
 }
@@ -831,6 +843,7 @@ fn spawn_tcp_registrars(
                     cancel.clone(),
                     config.protector.clone(),
                     rec.clone(),
+                    config.timings.clone(),
                 ));
             }
         }
@@ -846,12 +859,18 @@ struct ParkTarget {
     credentials: Credentials,
 }
 
-/// How long a park worker waits after the relay refused or reaped its
-/// connection: 500 ms, doubling while the refusals continue (a lapsed or
-/// missing token is refused every time), at most a minute. A new relay
-/// token cuts the wait short.
+/// How long a park worker waits after the relay refused its connection:
+/// 500 ms, doubling while the refusals continue (a lapsed or missing token
+/// is refused every time), at most a minute. A new relay token cuts the
+/// wait short. A connection the relay closes after having taken it is not
+/// a refusal: see [`tcp_park_worker`].
 const PARK_RETRY_FIRST: Duration = Duration::from_millis(500);
 const PARK_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Keepalive probes without an answer after which the kernel gives a parked
+/// connection up, where a socket may choose (Windows always sends 10).
+#[cfg(not(windows))]
+const PARK_KEEPALIVE_PROBES: u32 = 3;
 
 /// One pool worker: keep a connection parked at the target, delivering a
 /// session whenever a client is spliced in, until cancelled.
@@ -862,6 +881,7 @@ async fn tcp_park_worker(
     cancel: CancellationToken,
     protector: SocketProtector,
     rec: Recorder,
+    timings: Timings,
 ) {
     let relay_addr = target.addr;
     let mut token_changed = target.credentials.subscribe();
@@ -874,7 +894,10 @@ async fn tcp_park_worker(
             .step_now(StepKind::RelayPark)
             .via(relay_addr)
             .carrier(Carrier::TcpTls);
-        let wait = match park_and_accept(&target, identity.as_ref(), &protector, &cancel).await {
+        let dialed = tokio::time::Instant::now();
+        let parked =
+            park_and_accept(&target, identity.as_ref(), &protector, &cancel, &timings).await;
+        let wait = match parked {
             Ok(Some(session)) => {
                 parking.detail("a client was spliced in").ok();
                 if session_tx.send((session, None)).is_err() {
@@ -884,18 +907,32 @@ async fn tcp_park_worker(
                 continue;
             }
             // Reaped (idle) or refused (a relay that will not take this
-            // share: a bad, lapsed or absent token) — re-park after a pause
-            // so a refusal doesn't become a tight reconnect loop.
+            // share: a bad, lapsed or absent token).
             Ok(None) => {
-                // The relay does not say which of the two this was, and this
-                // is not the place to guess.
+                // The relay does not say which of the two this was, and the
+                // record is not the place to guess.
                 parking.fail(
                     Reason::PeerClosed,
                     "the relay closed the parked connection (idle reap, or a refused park)",
                 );
-                let w = retry;
-                retry = (retry * 2).min(PARK_RETRY_MAX);
-                w
+                if dialed.elapsed() >= 2 * timings.relay_dial_timeout {
+                    // The next park cannot wait for certainty, though. A
+                    // refusal comes as soon as the relay has read the
+                    // preamble, and this connection outlived that: the relay
+                    // had taken it and dropped it later. It is restarting,
+                    // or it found the connection too old (its PARK_TTL) for
+                    // a client who is now waiting there for the next one,
+                    // 3 s at most. So park again at once, and count no
+                    // refusal.
+                    retry = PARK_RETRY_FIRST;
+                    Duration::ZERO
+                } else {
+                    // Re-park after a pause so a refusal doesn't become a
+                    // tight reconnect loop.
+                    let w = retry;
+                    retry = (retry * 2).min(PARK_RETRY_MAX);
+                    w
+                }
             }
             Err(e) => {
                 debug!("tcp registrar {}: {}", relay_addr, e);
@@ -918,38 +955,60 @@ async fn tcp_park_worker(
 
 /// Park one connection at the relay; when a client is spliced in, run the E2E
 /// TLS server and return the session. `Ok(None)` = the relay closed the
-/// parked connection (an idle reap, or a refusal; re-park). Cancellable while
-/// parked.
+/// parked connection (an idle reap, or a refusal; re-park). Cancellable
+/// while dialing and while parked.
 async fn park_and_accept(
     target: &ParkTarget,
     identity: &ShareIdentity,
     protector: &SocketProtector,
     cancel: &CancellationToken,
+    timings: &Timings,
 ) -> Result<Option<carrier::PeerSession>, Fault> {
     use tokio::io::AsyncWriteExt;
     let relay_addr = target.addr;
-    let mut tcp = tokio::net::TcpStream::connect(relay_addr)
-        .await
-        .map_err(|e| Fault::from_io(&e).context("connect relay"))?;
-    let _ = tcp.set_nodelay(true);
-    carrier::protect_tcp(protector, &tcp);
-    // Signed after the connect, just before the write: the relay wants each
-    // park's timestamp above the last it took for this share, so the less
-    // time between signing and arriving, the less a sibling worker's park can
-    // overtake it (a park that does lose that race is refused and retried).
-    let token = target.credentials.token(&target.credential);
-    let preamble = target
-        .signer
-        .lock()
-        .expect("register signer")
-        .park_preamble(&token);
-    tcp.write_all(&preamble)
-        .await
-        .map_err(|e| Fault::from_io(&e).context("park preamble"))?;
+    let dial = async {
+        let mut tcp = tokio::net::TcpStream::connect(relay_addr)
+            .await
+            .map_err(|e| Fault::from_io(&e).context("connect relay"))?;
+        let _ = tcp.set_nodelay(true);
+        set_park_keepalive(&tcp, timings.park_keepalive);
+        carrier::protect_tcp(protector, &tcp);
+        // Signed after the connect, just before the write: the relay wants
+        // each park's timestamp above the last it took for this share, so
+        // the less time between signing and arriving, the less a sibling
+        // worker's park can overtake it (a park that does lose that race is
+        // refused and retried).
+        let token = target.credentials.token(&target.credential);
+        let preamble = target
+            .signer
+            .lock()
+            .expect("register signer")
+            .park_preamble(&token);
+        tcp.write_all(&preamble)
+            .await
+            .map_err(|e| Fault::from_io(&e).context("park preamble"))?;
+        Ok::<_, Fault>(tcp)
+    };
+    // Bounded: left to the OS, a connect to a relay host that is down fails
+    // only after its SYN retries (two minutes on Linux), and those thin out
+    // until one can be a minute away when the host is back.
+    let tcp = tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err(Fault::new(Reason::Cancelled, "cancelled while parking"));
+        }
+        r = tokio::time::timeout(timings.relay_dial_timeout, dial) => r.map_err(|_| {
+            Fault::new(
+                Reason::ConnectTimeout,
+                format!("no connection parked after {:?}", timings.relay_dial_timeout),
+            )
+        })??,
+    };
 
-    // Park: wait (no timeout, cancellable) for the first byte — a client was
-    // spliced in. EOF (0) means the relay reaped this idle parked connection
-    // (its PARK_TTL) or refused it; the caller re-parks.
+    // Park: wait (cancellable) for the first byte — a client was spliced in.
+    // EOF (0) means the relay reaped this idle parked connection (its
+    // PARK_TTL) or refused it; the caller re-parks. There is no timeout
+    // here: the socket's keepalive is what ends the wait on a connection
+    // that died silently, as an error.
     let mut peek = [0u8; 1];
     let n = tokio::select! {
         _ = cancel.cancelled() => {
@@ -970,6 +1029,23 @@ async fn park_and_accept(
         signal: None,
         fixed_mtu: carrier::STREAM_TUNNEL_MTU,
     }))
+}
+
+/// Have the kernel probe a parked connection once it has been idle for
+/// `idle` (see [`Timings::park_keepalive`]). A parked connection carries
+/// nothing until a client is spliced in, and nothing may be written to it
+/// (the relay would hand that to the client), so TCP's own keepalive is the
+/// only way to learn that the far end is gone.
+fn set_park_keepalive(tcp: &tokio::net::TcpStream, idle: Duration) {
+    let probe_every = (idle / 6).max(Duration::from_secs(1));
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(idle)
+        .with_interval(probe_every);
+    #[cfg(not(windows))]
+    let keepalive = keepalive.with_retries(PARK_KEEPALIVE_PROBES);
+    if let Err(e) = socket2::SockRef::from(tcp).set_tcp_keepalive(&keepalive) {
+        debug!("tcp registrar: no keepalive on a parked connection: {e}");
+    }
 }
 
 /// Sharer-side Noise UDP carrier. Bind a dedicated socket, register every
@@ -4138,6 +4214,19 @@ pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), Strin
 mod tests {
     use super::*;
     use crate::e2e::{E2eSession, accept_one};
+
+    /// The park pool's timings are only right against the TCP relay's.
+    #[test]
+    fn park_timings_fit_the_relays() {
+        let timings = Timings::default();
+        // The relay refuses a park once it has read the preamble, for which
+        // it waits 10 s: a connection that outlives twice the dial budget
+        // was taken.
+        assert!(2 * timings.relay_dial_timeout > Duration::from_secs(10));
+        // A park that lost the timestamp race to a sibling is back while a
+        // client still waits for one.
+        assert!(PARK_RETRY_FIRST * 2 < relay::tcp::CONNECT_WAIT);
+    }
 
     fn quic(addr: &str) -> (SocketAddr, RelayProtocol) {
         (addr.parse().unwrap(), RelayProtocol::UdpQuic)

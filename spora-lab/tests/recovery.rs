@@ -78,6 +78,8 @@ fn main() {
             nat_keepalive_maintains_mapping,
             nat_symmetric_rebind_recovery,
             tcp_dead_client_reaped,
+            // a relay that dies without closing its connections
+            tcp_parked_pool_survives_relay_power_loss,
         ],
     );
     // Print/record outage metrics even when budgets failed — a red run is
@@ -1145,6 +1147,148 @@ fn tcp_dead_client_reaped() -> Result<(), String> {
     log::info!("tcp dead-client reaped in {reaped:.1?}");
 
     client.stop();
+    sharer.stop();
+    Ok(())
+}
+
+/// A TCP relay that can lose power: [`PowerCutRelay::cut`] ends it without
+/// closing the connections sharers had parked there (they stay open, held
+/// by nobody: their far ends get neither a FIN nor a RST) and starts one
+/// that remembers nothing, on the same address.
+struct PowerCutRelay {
+    addr: SocketAddrV4,
+    cuts: tokio::sync::mpsc::UnboundedSender<std::sync::mpsc::Sender<()>>,
+    _host: spora_lab::netns::HostHandle,
+}
+
+impl PowerCutRelay {
+    /// Its own port: the wan services' TCP relay runs on `RELAY_PORT`.
+    const PORT: u16 = spora_lab::RELAY_PORT + 1;
+
+    fn start(wan: &Netns) -> Result<Self, String> {
+        let addr = svc(Self::PORT);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (cuts, mut cut_rx) =
+            tokio::sync::mpsc::unbounded_channel::<std::sync::mpsc::Sender<()>>();
+        let host = wan.spawn_host("power-cut-relay", move |_cancel| async move {
+            let serve = || async {
+                let listener = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| format!("bind tcp {addr}: {e}"))?;
+                let state = relay::tcp::TcpRelayState::new();
+                let task = tokio::spawn(relay::tcp::serve_tcp(listener, state.clone()));
+                Ok::<_, String>((task, state))
+            };
+            let mut running = match serve().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+            let _ = ready_tx.send(Ok(()));
+            // What each cut took with it, never closed.
+            let mut lost = Vec::new();
+            while let Some(done) = cut_rx.recv().await {
+                let (task, state) = running;
+                task.abort();
+                let _ = task.await;
+                lost.push(state);
+                running = match serve().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::error!("power-cut relay: {e}");
+                        return;
+                    }
+                };
+                let _ = done.send(());
+            }
+        })?;
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|e| format!("power-cut relay did not start: {e}"))??;
+        Ok(Self {
+            addr,
+            cuts,
+            _host: host,
+        })
+    }
+
+    fn cut(&self) -> Result<(), String> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        self.cuts
+            .send(done_tx)
+            .map_err(|_| "power-cut relay is gone".to_string())?;
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|e| format!("power-cut relay did not come back: {e}"))
+    }
+}
+
+/// The relay host loses power and comes back. Nothing tells the sharer:
+/// its parked connections were never closed, and while the host is down
+/// nothing answers. REGRESSION TEST: a parked connection used to be waited
+/// on with no timeout and no keepalive, so the sharer kept its dead pool
+/// for ever, the relay that came back had nothing parked for the share, and
+/// TCP clients were turned away until the share was restarted. Now the
+/// kernel probes each parked connection (`Timings::park_keepalive`, scaled
+/// here to 1 s idle, 3 probes 1 s apart), the unanswered probes end the
+/// wait, and the workers dial again until the relay is back.
+fn tcp_parked_pool_survives_relay_power_loss() -> Result<(), String> {
+    /// One dial cycle of a park worker (2 s dial timeout + 1 s pause) and
+    /// one client attempt, with margin.
+    const BUDGET: Duration = Duration::from_secs(8);
+
+    let topo = pr_pr()?;
+    let wan = services::start_wan(&topo.wan, scaled_relay_state)?;
+    let relay = PowerCutRelay::start(&topo.wan)?;
+    let mut opts = carrier_opts(&wan, RelayProtocol::TcpTls);
+    opts.relays = vec![RelayEndpoint::with_protocol(
+        relay.addr.ip().to_string(),
+        relay.addr.port(),
+        RelayProtocol::TcpTls,
+    )];
+    opts.timings.park_keepalive = Duration::from_secs(1);
+    let (mut sharer, client1) = establish(&topo, &opts, RelayProtocol::TcpTls)?;
+    client1.stop();
+    // The worker that served client1 parks again.
+    std::thread::sleep(Duration::from_secs(1));
+
+    // The host goes dark for the sharer, in both directions, and loses
+    // what it held.
+    netem::block(&topo.wan, topo.ext_ip_a, svc_ip())?;
+    topo.wan.run(&format!(
+        "iptables -w -A OUTPUT -d {} -j DROP",
+        topo.ext_ip_a
+    ))?;
+    relay.cut()?;
+    // Past the keepalive's verdict (1 s idle + 3 probes).
+    std::thread::sleep(Duration::from_secs(7));
+    netem::unblock(&topo.wan, topo.ext_ip_a, svc_ip())?;
+    topo.wan.run(&format!(
+        "iptables -w -D OUTPUT -d {} -j DROP",
+        topo.ext_ip_a
+    ))?;
+    sharer.discard_events();
+
+    let t0 = Instant::now();
+    let (mut client2, attempts, elapsed) =
+        connect_until(&topo.client, sharer.url(), &opts, t0, RECOVERY_CEILING)
+            .map_err(|e| format!("the sharer never parked at the relay that came back: {e}"))?;
+    record_outage("tcp_relay_power_loss", elapsed);
+    record_attempts("tcp_relay_power_loss", attempts);
+    log::info!("tcp pool back {elapsed:.1?} after the relay, {attempts} attempt(s)");
+    if elapsed > BUDGET {
+        return Err(format!(
+            "a TCP client got through only {elapsed:.1?} after the relay came back \
+             (budget {BUDGET:?}), in {attempts} attempts"
+        ));
+    }
+    client2
+        .wait_event(is_relay_established, EVENT_TIMEOUT)
+        .map_err(|e| format!("client2 session event: {e}"))?;
+    expect_clean_echo(&client2, "echo through the relay that came back")?;
+    client2.stop();
     sharer.stop();
     Ok(())
 }

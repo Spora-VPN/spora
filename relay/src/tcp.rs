@@ -25,12 +25,20 @@ use relay_client::tcp::{self, Preamble};
 use crate::RoutingHash;
 use crate::authz::{self, Authorizer, Carrier, RegistrationCtx};
 
-/// How long a parked connection stays eligible. The sharer refreshes its pool
-/// well within this; older ones are discarded on pop so a vanished sharer never
-/// leaves the relay splicing a client into a dead socket.
+/// How long a parked connection stays eligible. A sharer may be gone with
+/// no FIN (its host lost power, it moved to another network), and nothing
+/// here would show it, so an older connection is discarded on pop instead of
+/// being handed to a client. Sharers do not refresh their pools: one parks
+/// again when a connection of its is taken or closed. A pool that has waited
+/// longer than this is therefore dropped whole by the first client to come,
+/// who waits [`CONNECT_WAIT`] for the park that follows. The relay closes no
+/// connection for its age alone: sharers up to 0.3.4 wait twice as long
+/// after every close by the relay, up to a minute, with nothing parked
+/// meanwhile.
 pub const PARK_TTL: Duration = Duration::from_secs(90);
-/// How long a CONNECT waits for a parked sharer connection to appear (covers the
-/// brief window while the sharer refills its pool).
+/// How long a CONNECT waits for a parked sharer connection to appear (covers
+/// the sharer refilling its pool, or parking again after its connections were
+/// discarded as older than [`PARK_TTL`]).
 pub const CONNECT_WAIT: Duration = Duration::from_secs(3);
 /// Cap on parked connections held per routing hash.
 pub const MAX_PARKED: usize = 32;
@@ -42,6 +50,11 @@ const PREAMBLE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PARK_TS_TTL: Duration = crate::REGISTRATION_TIMEOUT;
 /// The map is pruned at most this often (on a park), not on every park.
 const PARK_TS_PRUNE_EVERY: Duration = Duration::from_secs(5);
+/// How often parked connections their sharers have closed are dropped (a
+/// sharer that stopped or restarted, or gave a connection up): otherwise
+/// each stays, a socket held for nobody, until a client comes for that share
+/// or the relay restarts.
+const PARK_SWEEP_EVERY: Duration = Duration::from_secs(10);
 
 struct Parked {
     conn: TcpStream,
@@ -93,17 +106,33 @@ impl TcpRelayState {
         });
     }
 
-    /// Pop a *fresh* parked connection for `rk`, discarding any that expired.
+    /// Pop a *fresh* parked connection for `rk`, discarding any that expired
+    /// and any its sharer has closed: after a sharer restarts, what its old
+    /// process parked is still here, ahead of what the new one parks.
     fn take_fresh(&self, rk: &RoutingHash) -> Option<TcpStream> {
         let mut map = self.parked.lock().unwrap();
         let q = map.get_mut(rk)?;
         while let Some(p) = q.pop_front() {
-            if p.at.elapsed() < PARK_TTL {
+            if p.at.elapsed() < PARK_TTL && sharer_still_there(&p.conn) {
                 return Some(p.conn);
             }
-            // else: stale — discard and keep looking
+            // else: stale, or closed — discard and keep looking
         }
         None
+    }
+
+    /// Drop every parked connection its sharer has closed, and forget
+    /// routing hashes with none left. Returns how many were dropped.
+    fn sweep_closed(&self) -> usize {
+        let mut map = self.parked.lock().unwrap();
+        let mut dropped = 0;
+        map.retain(|_, q| {
+            let before = q.len();
+            q.retain(|p| sharer_still_there(&p.conn));
+            dropped += before - q.len();
+            !q.is_empty()
+        });
+        dropped
     }
 
     /// Take `ts` as the last park timestamp of `rk` if it is fresh
@@ -168,19 +197,52 @@ impl TcpRelayState {
     }
 }
 
-/// Accept loop. Runs forever.
+/// Whether the sharer's end of a parked connection is still open, as far as
+/// this host has heard: false once its FIN or a reset is in. Asks the socket
+/// (a peek that never waits) and takes nothing from it. A sharer that is
+/// gone without either still looks open: that is what [`PARK_TTL`] is for.
+fn sharer_still_there(conn: &TcpStream) -> bool {
+    let mut byte = [std::mem::MaybeUninit::<u8>::uninit()];
+    match socket2::SockRef::from(conn).peek(&mut byte) {
+        Ok(0) => false,
+        // Bytes ahead of any client are not what a sharer sends, but the
+        // connection is open, and they are the client's to judge.
+        Ok(_) => true,
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ),
+    }
+}
+
+/// Accept loop, and the sweep of parked connections their sharers closed.
+/// Runs forever.
 pub async fn serve_tcp(listener: TcpListener, state: Arc<TcpRelayState>) {
+    serve_tcp_sweeping(listener, state, PARK_SWEEP_EVERY).await
+}
+
+async fn serve_tcp_sweeping(listener: TcpListener, state: Arc<TcpRelayState>, every: Duration) {
     match listener.local_addr() {
         Ok(a) => info!("tcp-relay listening on {a}"),
         Err(_) => info!("tcp-relay listening"),
     }
+    let mut sweep = tokio::time::interval(every);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        match listener.accept().await {
-            Ok((conn, addr)) => {
-                let _ = conn.set_nodelay(true);
-                tokio::spawn(handle_conn(conn, addr, state.clone()));
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((conn, addr)) => {
+                    let _ = conn.set_nodelay(true);
+                    tokio::spawn(handle_conn(conn, addr, state.clone()));
+                }
+                Err(e) => warn!("tcp accept error: {e}"),
+            },
+            _ = sweep.tick() => {
+                let dropped = state.sweep_closed();
+                if dropped > 0 {
+                    debug!("tcp: dropped {dropped} parked connection(s) closed by their sharers");
+                }
             }
-            Err(e) => warn!("tcp accept error: {e}"),
         }
     }
 }
@@ -334,6 +396,98 @@ mod tests {
         let mut buf2 = [0u8; 12];
         client.read_exact(&mut buf2).await.unwrap();
         assert_eq!(&buf2, b"hello-client");
+    }
+
+    fn parked_for(state: &TcpRelayState, rk: &RoutingHash) -> usize {
+        state.parked.lock().unwrap().get(rk).map_or(0, |q| q.len())
+    }
+
+    /// Poll until `rk` has `want` connections parked, up to ~400 ms.
+    async fn wait_parked_for(state: &TcpRelayState, rk: &RoutingHash, want: usize) {
+        for _ in 0..40 {
+            if parked_for(state, rk) == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} parked, not {want}", parked_for(state, rk));
+    }
+
+    #[tokio::test]
+    async fn a_parked_connection_its_sharer_closed_is_not_handed_to_a_client() {
+        let (addr, state) = start().await;
+        let mut sig = signer();
+        let rk = sig.routing_hash();
+
+        // What a sharer parked before it restarted, and what it parks
+        // after: the relay holds both, the closed one first.
+        let before_restart = park(addr, &sig.park_preamble(&[])).await;
+        wait_parked_for(&state, &rk, 1).await;
+        drop(before_restart);
+        let mut sharer = park(addr, &sig.park_preamble(&[])).await;
+        wait_parked_for(&state, &rk, 2).await;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&tcp::build_connect(&rk)).await.unwrap();
+        client.write_all(b"hello-sharer").await.unwrap();
+        let mut buf = [0u8; 12];
+        tokio::time::timeout(Duration::from_secs(2), sharer.read_exact(&mut buf))
+            .await
+            .expect("the client was spliced into the connection nobody holds")
+            .unwrap();
+        assert_eq!(&buf, b"hello-sharer");
+    }
+
+    #[tokio::test]
+    async fn the_sweep_drops_what_sharers_closed_and_nothing_else() {
+        let (addr, state) = start().await;
+        let (mut left, mut stays) = (signer(), signer());
+
+        let gone = park(addr, &left.park_preamble(&[])).await;
+        wait_parked_for(&state, &left.routing_hash(), 1).await;
+        let given_up = park(addr, &stays.park_preamble(&[])).await;
+        wait_parked_for(&state, &stays.routing_hash(), 1).await;
+        let _open = park(addr, &stays.park_preamble(&[])).await;
+        wait_parked_for(&state, &stays.routing_hash(), 2).await;
+        assert_eq!(state.sweep_closed(), 0, "all three are open");
+
+        drop(gone);
+        drop(given_up);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(state.sweep_closed(), 2);
+        assert_eq!(parked_for(&state, &stays.routing_hash()), 1);
+        assert_eq!(
+            state.parked.lock().unwrap().len(),
+            1,
+            "a share with nothing parked is forgotten"
+        );
+
+        // An open connection is never closed for its age: its sharer would
+        // have nothing parked while it waits to park again. It is a client
+        // that discards it.
+        let old = Instant::now().checked_sub(PARK_TTL + Duration::from_secs(1));
+        state.parked.lock().unwrap().values_mut().next().unwrap()[0].at =
+            old.expect("a clock that has run for 91 s");
+        assert_eq!(state.sweep_closed(), 0);
+        assert_eq!(parked_for(&state, &stays.routing_hash()), 1);
+        assert!(state.take_fresh(&stays.routing_hash()).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_accept_loop_sweeps() {
+        let state = TcpRelayState::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tcp_sweeping(
+            listener,
+            state.clone(),
+            Duration::from_millis(50),
+        ));
+        let mut sig = signer();
+        let sharer = park(addr, &sig.park_preamble(&[])).await;
+        assert_eq!(wait_parked(&state, 1).await, 1);
+        drop(sharer);
+        assert_eq!(wait_parked(&state, 0).await, 0, "the closed park stayed");
     }
 
     #[tokio::test]

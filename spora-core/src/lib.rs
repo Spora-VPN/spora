@@ -338,6 +338,9 @@ pub struct Config {
     /// `None` disables it at the core level; platforms are expected to
     /// enable it by default with a platform-appropriate directory. When set
     /// but unwritable, `share()` fails loudly rather than running unlogged.
+    /// A host process that keeps its connection log elsewhere names a
+    /// consumer of its own instead of a directory, or beside one
+    /// ([`ConnLogConfig::sink`]).
     pub conn_log: Option<ConnLogConfig>,
     /// Share side only: the DNS forwarder behind the tunnel's synthetic
     /// resolver address (see [`dns`]). The default forwards clients' queries

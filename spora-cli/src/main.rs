@@ -886,7 +886,7 @@ async fn run(mode: Mode, shutdown: Option<&Shutdown>) -> Result<(), Box<dyn std:
                     cl.egress_lookup = Some(os_route::conntrack_egress_lookup());
                 }
                 config.conn_log = Some(cl);
-                Some(dir)
+                dir
             };
             let record_dir =
                 record_config(&mut config, no_record, record_dir, record_label, record_id);
@@ -3971,7 +3971,7 @@ mod state_dir_tests {
     fn only_a_log_in_the_state_directory_sweeps_its_siblings() {
         let hash: RoutingHash = [7; 20];
         let own = conn_log_config(None, &hash, 30, true);
-        assert_eq!(own.dir, default_connlog_dir(&hash));
+        assert_eq!(own.dir, Some(default_connlog_dir(&hash)));
         assert!(own.sweep_siblings);
         assert_eq!(own.retention, std::time::Duration::from_secs(30 * 86_400));
         assert!(!own.log_destinations);

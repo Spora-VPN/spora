@@ -11,18 +11,27 @@
 //!   destination with bytes counted in both directions.
 //! - `punch_addrs_recorded`: a successful direct upgrade records
 //!   address-validated (`punch_verified` / `verified`) session addresses.
+//! - `sink_handed_tcp_flow`: a share whose log goes to a consumer of the
+//!   host's own (`ConnLogConfig::sink`) and to no directory hands it the
+//!   session and the TCP flow, with the same particulars, as they happen.
+//!   (Two shares on one sink, and a directory beside a sink, run over
+//!   loopback in spora-core's `connlog_sink` test.)
 //!
 //! The connlog writer thread is asynchronous to the tunnel, so every
 //! assertion polls the database with a deadline (the `wait_for` pattern from
 //! the connlog unit tests); the per-scenario config uses a 50ms flush
 //! interval to keep that fast.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use spora_core::TunnelEvent;
-use spora_core::connlog::{self, ConnLogConfig, FlowQuery, FlowRow, SessionRow};
+use spora_core::connlog::{
+    self, ConnLogConfig, ConnLogEvent, ConnLogSink, EventKind, FlowQuery, FlowRow, Mark,
+    SessionRow, ShareRef,
+};
 use spora_lab::peers::{self, ClientHandle, LabPeerOpts, SharerHandle};
 use spora_lab::services::{self, WanHandle};
 use spora_lab::topology::{Topology, TopologySpec};
@@ -31,7 +40,12 @@ use spora_lab::{CLIENT_INNER_IP, ECHO_TCP_PORT, ECHO_UDP_PORT, NatKind, WAN_SERV
 fn main() {
     let ok = spora_lab::harness::lab_main(
         "connlog",
-        spora_lab::scenarios![tcp_flow_recorded, udp_flow_recorded, punch_addrs_recorded,],
+        spora_lab::scenarios![
+            tcp_flow_recorded,
+            udp_flow_recorded,
+            punch_addrs_recorded,
+            sink_handed_tcp_flow,
+        ],
     );
     std::process::exit(if ok { 0 } else { 1 });
 }
@@ -142,10 +156,21 @@ fn start_logged_peers(
     let mut sharer_opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
     sharer_opts.enable_direct_upgrade = enable_direct_upgrade;
     sharer_opts.conn_log = Some(conn_log_cfg(log_dir));
-    let mut client_opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
-    client_opts.enable_direct_upgrade = enable_direct_upgrade;
+    start_peers(topo, wan, &sharer_opts)
+}
 
-    let mut sharer = peers::start_sharer(&topo.sharer, &sharer_opts)?;
+/// A client for the sharer `sharer_opts` describe, with the direct upgrade
+/// as the sharer has it. Returns once the relay-via session is up on both
+/// sides.
+fn start_peers(
+    topo: &Topology,
+    wan: &WanHandle,
+    sharer_opts: &LabPeerOpts,
+) -> Result<(SharerHandle, ClientHandle), String> {
+    let mut client_opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
+    client_opts.enable_direct_upgrade = sharer_opts.enable_direct_upgrade;
+
+    let mut sharer = peers::start_sharer(&topo.sharer, sharer_opts)?;
     let mut client = peers::start_client(&topo.client, sharer.url().clone(), &client_opts)?;
     client
         .wait_event(is_relay_session, SESSION_TIMEOUT)
@@ -392,4 +417,155 @@ fn punch_addrs_recorded() -> Result<(), String> {
     client.stop();
     sharer.stop();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 4. sink_handed_tcp_flow
+
+/// A sink that keeps what it is handed, in order.
+#[derive(Default)]
+struct MemorySink(Mutex<Vec<ConnLogEvent>>);
+
+impl ConnLogSink for MemorySink {
+    fn event(&self, event: ConnLogEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+impl MemorySink {
+    fn events(&self) -> Vec<ConnLogEvent> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// The share's log goes to a sink of the host's own and nowhere else (no
+/// directory, so no database). The same 64 KiB TCP bulk echo as
+/// `tcp_flow_recorded` must reach the sink as that flow's open, established
+/// and close events, in that order, with what the database row would hold:
+/// the inner client address, the echo service, an egress address, exact
+/// byte counts. The session comes first, through the relay's address; the
+/// stop of the share ends the session and then the share's log, and every
+/// event names the share.
+fn sink_handed_tcp_flow() -> Result<(), String> {
+    let topo = Topology::build(&TopologySpec::new(
+        NatKind::PortRestricted,
+        NatKind::PortRestricted,
+    ))?;
+    let wan = services::start_wan(&topo.wan, relay::State::default)?;
+    let sink = Arc::new(MemorySink::default());
+    let mut sharer_opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
+    sharer_opts.enable_direct_upgrade = false;
+    sharer_opts.conn_log = Some(ConnLogConfig::to_sink(sink.clone()));
+    // Pinned, to know what the share's events must be named by.
+    sharer_opts.pin_share();
+    let (_, share) = sharer_opts.sharer_identity();
+    let named = ShareRef {
+        routing_hash: share.routing_hash(),
+        share_id: share.share_id,
+    };
+    let (sharer, client) = start_peers(&topo, &wan, &sharer_opts)?;
+
+    const BULK: usize = 64 * 1024;
+    let echo = SocketAddr::V4(svc(ECHO_TCP_PORT));
+    let bulk = client.tcp_bulk(svc(ECHO_TCP_PORT), BULK, Duration::from_secs(90))?;
+    if bulk.bytes != BULK {
+        return Err(format!("tcp bulk incomplete: {bulk:?}"));
+    }
+
+    // No writer thread to wait for, but the share-side proxy closes the
+    // flow a moment after the driver's close handshake.
+    let is_close = |k: &EventKind| matches!(k, EventKind::FlowClose { .. });
+    poll_db("the flow's close at the sink", DB_TIMEOUT, || {
+        Ok(sink
+            .events()
+            .iter()
+            .any(|e| is_close(&e.kind))
+            .then_some(()))
+    })?;
+    let events = sink.events();
+    if let Some(other) = events.iter().find(|e| e.share != named) {
+        return Err(format!("an event that names another share: {other:?}"));
+    }
+    let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
+    let [
+        EventKind::Mark {
+            mark: Mark::ShareStart,
+            ..
+        },
+        EventKind::SessionStart { session, relay, .. },
+        EventKind::FlowOpen {
+            flow,
+            session: open_session,
+            proto: PROTO_TCP,
+            src,
+            dst,
+            confirmed: true,
+            ..
+        },
+        EventKind::FlowEstablished {
+            flow: established_flow,
+            egress: Some(_),
+            ..
+        },
+        EventKind::FlowClose {
+            flow: closed_flow,
+            session: closed_session,
+            up,
+            down,
+            established: true,
+            reason: "closed",
+            ..
+        },
+    ] = kinds[..]
+    else {
+        return Err(format!("unexpected events at the sink: {kinds:#?}"));
+    };
+    if relay != wan.relay_addr() {
+        return Err(format!("session relay {relay} != {}", wan.relay_addr()));
+    }
+    if src.ip() != CLIENT_INNER_IP || dst != echo {
+        return Err(format!(
+            "flow {src} -> {dst}, not the inner client -> {echo}"
+        ));
+    }
+    if (established_flow, closed_flow) != (flow, flow)
+        || (open_session, closed_session) != (session, session)
+    {
+        return Err(format!("the flow's events do not agree on ids: {kinds:#?}"));
+    }
+    // The echo doubles every byte: BULK up (client->service) and BULK back.
+    if (up, down) != (BULK as u64, BULK as u64) {
+        return Err(format!(
+            "byte counts up={up} down={down} != {BULK} each way"
+        ));
+    }
+
+    // Stopping the share ends the session; the share's stop is the last
+    // thing its log says.
+    client.stop();
+    sharer.stop();
+    let tail = poll_db("the share's stop at the sink", DB_TIMEOUT, || {
+        let rest: Vec<EventKind> = sink.events()[kinds.len()..]
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        let stopped = matches!(
+            rest.last(),
+            Some(EventKind::Mark {
+                mark: Mark::ShareStop,
+                ..
+            })
+        );
+        Ok(stopped.then_some(rest))
+    })?;
+    match tail[..] {
+        [
+            EventKind::SessionEnd { session: ended, .. },
+            EventKind::Mark {
+                mark: Mark::ShareStop,
+                ..
+            },
+        ] if ended == session => Ok(()),
+        _ => Err(format!("unexpected end of the log: {tail:#?}")),
+    }
 }

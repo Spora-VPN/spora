@@ -22,6 +22,15 @@
 //! quietly destroy the log's exculpatory value). The same thinking drives the
 //! `share_start`/`share_stop` and `clock_jump` marks.
 //!
+//! A host process that keeps its connection log elsewhere supplies a
+//! [`ConnLogSink`] instead of a directory, or beside one
+//! ([`ConnLogConfig::sink`]). The hooks, the per-session rate limit and the
+//! `Drop` behaviour of the handles are the same for every consumer; with a
+//! sink alone a share opens no database and starts no thread, each hook hands
+//! its [`ConnLogEvent`] straight to the sink, and every share of the process
+//! may feed the same one (each event names its share). Queueing, what
+//! happens when the queue is full, and retention are then the sink's.
+//!
 //! Retention: the writer sweeps its own log (records older than
 //! [`ConnLogConfig::retention`], unless a hold pins them) and records that
 //! retention in the log. A share that is replaced or deleted leaves its log
@@ -39,7 +48,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use log::{error, info, warn};
 use rusqlite::Connection;
 
-use crate::identity::ShareIdentity;
+use crate::identity::{RoutingHash, ShareId, ShareIdentity};
 
 /// Bump when the schema changes; stored in `meta` so any database file is
 /// self-identifying.
@@ -51,7 +60,7 @@ pub const FORMAT_VERSION: i64 = 1;
 const CHANNEL_CAPACITY: usize = 16 * 1024;
 
 /// Wall-vs-monotonic divergence that gets recorded as a `clock_jump` mark
-/// (suspend/resume, NTP step, manual clock change).
+/// (suspend/resume, NTP step, manual clock change). See [`ClockWatch`].
 const CLOCK_JUMP_THRESHOLD_MS: i64 = 2_000;
 
 /// [`ConnLogConfig::retention`]'s default: 90 days.
@@ -78,12 +87,25 @@ const META_RETENTION_MS: &str = "retention_ms";
 /// briefly), once per flow: `(proto, inner_src, dst) -> egress`.
 pub type EgressLookup = Arc<dyn Fn(u8, SocketAddr, SocketAddr) -> Option<SocketAddr> + Send + Sync>;
 
+/// Where a share's connection log goes: a database in [`dir`](Self::dir), a
+/// consumer the host supplies ([`sink`](Self::sink)), or both. One of the
+/// two must be set, or `share()` fails.
 #[derive(Clone)]
 pub struct ConnLogConfig {
-    /// Directory holding `connlog.sqlite` (created 0700 on unix).
-    pub dir: PathBuf,
+    /// Directory holding `connlog.sqlite` (created 0700 on unix): the share
+    /// keeps its own log there, written by a thread of its own. `None` keeps
+    /// no database and starts no thread: the log is then what
+    /// [`sink`](Self::sink) makes of the events.
+    pub dir: Option<PathBuf>,
+    /// A consumer of the host's own, handed every event as it happens (see
+    /// [`ConnLogSink`] for what it takes on). For a host process that keeps
+    /// its connection log elsewhere, and for one that runs many shares: all
+    /// of them may be given the same sink. Beside a `dir`, the database and
+    /// the sink each get every event. Default `None`.
+    pub sink: Option<Arc<dyn ConnLogSink>>,
     /// Records older than this are deleted by the periodic sweep, unless
-    /// pinned by a hold (see [`add_hold`]). Default 90 days.
+    /// pinned by a hold (see [`add_hold`]). Default 90 days. The database's
+    /// only: a sink keeps its records as long as its host decides.
     pub retention: Duration,
     /// `false` = sessions-only mode: record who was connected and when, but
     /// no per-flow destination records. For sharers who want the
@@ -92,7 +114,8 @@ pub struct ConnLogConfig {
     /// Record flows that were refused by policy (`block_local`) — they never
     /// egressed, but the attempt is an abuse signal. Default true.
     pub log_blocked: bool,
-    /// Writer batch window: events are committed at least this often.
+    /// Writer batch window: events are committed to the database at least
+    /// this often. (A sink is handed each event at once.)
     pub flush_interval: Duration,
     /// Meter-path flow delimitation (the netstack path uses its own NAT
     /// timeout): a UDP flow with no packets for this long is closed.
@@ -104,7 +127,10 @@ pub struct ConnLogConfig {
     /// and surfaced as `flow_throttle` marks instead of bloating the log.
     pub max_flow_records_per_sec: u32,
     pub flow_record_burst: u32,
-    /// See [`EgressLookup`].
+    /// See [`EgressLookup`]. Called by the database's writer thread, so
+    /// only with a `dir`: no hook may wait for it. A sink that wants the
+    /// same enrichment looks unconfirmed flows up itself, off the tunnel's
+    /// tasks.
     pub egress_lookup: Option<EgressLookup>,
     /// Also sweep the logs of the other shares under `dir`'s parent, by
     /// retention, whenever this share sweeps its own (see [`sweep_root`]).
@@ -116,9 +142,34 @@ pub struct ConnLogConfig {
 }
 
 impl ConnLogConfig {
+    /// A log kept in a database in `dir`, with the default settings.
     pub fn in_dir(dir: impl Into<PathBuf>) -> Self {
         Self {
-            dir: dir.into(),
+            dir: Some(dir.into()),
+            ..Self::unplaced()
+        }
+    }
+
+    /// A log handed to `sink` and kept nowhere else, with the default
+    /// settings: no database, no writer thread.
+    pub fn to_sink(sink: Arc<dyn ConnLogSink>) -> Self {
+        Self {
+            sink: Some(sink),
+            ..Self::unplaced()
+        }
+    }
+
+    /// The same log, handed to `sink` as well.
+    pub fn with_sink(mut self, sink: Arc<dyn ConnLogSink>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// The default settings, with nowhere to log to yet.
+    fn unplaced() -> Self {
+        Self {
+            dir: None,
+            sink: None,
             retention: DEFAULT_RETENTION,
             log_destinations: true,
             log_blocked: true,
@@ -154,7 +205,8 @@ pub enum AddrKind {
 }
 
 impl AddrKind {
-    fn as_str(self) -> &'static str {
+    /// The kind as the database stores it.
+    pub fn as_str(self) -> &'static str {
         match self {
             AddrKind::Reported => "reported",
             AddrKind::PunchVerified => "punch_verified",
@@ -180,25 +232,60 @@ fn random_id() -> i64 {
     }
 }
 
-enum Ev {
+/// The share a [`ConnLogEvent`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShareRef {
+    /// The share's routing hash: what its relays know it by.
+    pub routing_hash: RoutingHash,
+    pub share_id: ShareId,
+}
+
+/// One event of a share's connection log, as its hooks produce it. What a
+/// [`ConnLogSink`] is handed; the database is written from the same events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnLogEvent {
+    pub share: ShareRef,
+    pub kind: EventKind,
+}
+
+/// What happened. Session and flow ids are random, positive and made where
+/// the event is: they need no database to be unique, and a consumer joins a
+/// flow to its session, and an event to an earlier one, by them. Timestamps
+/// are wall-clock milliseconds since the Unix epoch.
+///
+/// A new kind of event is a new variant here, deliberately not hidden
+/// behind `#[non_exhaustive]`: a consumer that does not know an event must
+/// fail to build, not pass it over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// A session was accepted. `relay` is its remote address at accept
+    /// time: for a session that came through a relay, the relay's, which
+    /// says nothing of where the client is.
     SessionStart {
-        id: i64,
+        session: i64,
         ts_ms: i64,
         relay: SocketAddr,
     },
+    /// Something learned about an outer address of the session, at most
+    /// once per (kind, address) and 64 times per session.
     SessionAddr {
         session: i64,
         ts_ms: i64,
-        kind: &'static str,
+        kind: AddrKind,
         addr: SocketAddr,
     },
+    /// The session ended. Sent exactly once per session: by the share loop
+    /// with its reason (`cancelled`, `transport_closed`), else when the
+    /// session's handle is dropped (`dropped`).
     SessionEnd {
         session: i64,
         ts_ms: i64,
         reason: &'static str,
     },
+    /// A flow began: IP protocol `proto` (6, 17) from the client's inner
+    /// address `src` to `dst`.
     FlowOpen {
-        id: i64,
+        flow: i64,
         session: i64,
         ts_ms: i64,
         proto: u8,
@@ -209,44 +296,237 @@ enum Ev {
         /// sees traffic *offered* to the tunnel.
         confirmed: bool,
     },
-    /// A flow refused by policy: one self-contained row, no close needed.
+    /// A flow refused by policy: complete in itself, no close follows.
     FlowBlocked {
-        id: i64,
+        flow: i64,
         session: i64,
         ts_ms: i64,
         proto: u8,
         src: SocketAddr,
         dst: SocketAddr,
     },
+    /// The flow reached its destination. `egress` is the source address the
+    /// destination saw from this host, when the exit knows it. At most once
+    /// per flow.
     FlowEstablished {
-        id: i64,
+        flow: i64,
+        session: i64,
         egress: Option<SocketAddr>,
     },
+    /// The flow ended, with its byte counts (client to world `up`, world to
+    /// client `down`). Sent exactly once per opened flow: with the exit's
+    /// reason (`closed`, `error`, `connect_failed`, `abandoned`, `idle`,
+    /// `evicted`, `fin`, `rst`), else when the flow's guard is dropped
+    /// (`session_end`). `last_ms` is the flow's last activity, which for an
+    /// idle flow is earlier than the event; a wall-clock step may even put
+    /// it before the open's `ts_ms` (the database stores the later of the
+    /// two).
     FlowClose {
-        id: i64,
+        flow: i64,
+        session: i64,
         last_ms: i64,
         up: u64,
         down: u64,
         established: bool,
         reason: &'static str,
     },
-    Mark {
-        ts_ms: i64,
-        kind: &'static str,
-        detail: String,
-    },
+    /// Something about the log itself, not about traffic.
+    Mark { ts_ms: i64, mark: Mark },
 }
 
-/// Shared sender side: try_send that counts drops instead of blocking (the
-/// EventHook discipline — never stall a tunnel task on the log).
-#[derive(Clone)]
-struct EvSender {
-    tx: SyncSender<Ev>,
+/// What a log says about itself, so that an absence of records can be told
+/// from an absence of traffic. The hooks send a sink the first three; the
+/// rest are what a consumer records about its own keeping of the log, here
+/// so that a sink can say it in the words the database uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    /// The share began to log.
+    ShareStart,
+    /// The share's last session and flow are gone: nothing follows from
+    /// this run of it.
+    ShareStop,
+    /// A session's rate limit held back `suppressed` flow records between
+    /// `from_ms` and `to_ms` ([`ConnLogConfig::max_flow_records_per_sec`]).
+    FlowThrottle {
+        session: i64,
+        suppressed: u64,
+        from_ms: i64,
+        to_ms: i64,
+    },
+    /// The wall clock moved `drift_ms` against the monotonic one (see
+    /// [`ClockWatch`]): timestamps before and after are not on one line.
+    ClockJump { drift_ms: i64 },
+    /// `dropped` events were lost because the consumer's queue was full.
+    QueueFull { dropped: u64 },
+    /// Events could not be recorded from `from_ms` until this mark.
+    WriteError { from_ms: i64 },
+}
+
+impl Mark {
+    /// The mark's kind as the database stores it (`marks.kind`).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Mark::ShareStart => "share_start",
+            Mark::ShareStop => "share_stop",
+            Mark::FlowThrottle { .. } => "flow_throttle",
+            Mark::ClockJump { .. } => "clock_jump",
+            Mark::QueueFull { .. } | Mark::WriteError { .. } => "log_gap",
+        }
+    }
+
+    /// The mark's particulars as the database stores them (`marks.detail`,
+    /// a JSON object).
+    pub fn detail(&self) -> Option<String> {
+        match *self {
+            Mark::ShareStart => Some(format!(
+                "{{\"software\":\"{}\"}}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            Mark::ShareStop => None,
+            Mark::FlowThrottle {
+                session,
+                suppressed,
+                from_ms,
+                to_ms,
+            } => Some(format!(
+                "{{\"session\":{},\"suppressed\":{},\"from_ms\":{},\"to_ms\":{}}}",
+                session, suppressed, from_ms, to_ms
+            )),
+            Mark::ClockJump { drift_ms } => Some(format!("{{\"drift_ms\":{}}}", drift_ms)),
+            Mark::QueueFull { dropped } => Some(format!(
+                "{{\"reason\":\"channel_full\",\"dropped\":{}}}",
+                dropped
+            )),
+            Mark::WriteError { from_ms } => Some(format!(
+                "{{\"reason\":\"write_error\",\"from_ms\":{}}}",
+                from_ms
+            )),
+        }
+    }
+}
+
+/// A consumer of connection-log events that the host process supplies
+/// ([`ConnLogConfig::sink`]), for a host that keeps its connection log
+/// elsewhere than in a database per share. Any number of shares may feed
+/// one sink; each event names its share.
+///
+/// What stays with the core, whatever the consumer: the hooks, the
+/// per-session rate limit on flow records (its [`Mark::FlowThrottle`]
+/// included), one end per session and one close per flow even when they are
+/// torn down without a word, and the [`Mark::ShareStart`] and
+/// [`Mark::ShareStop`] around a share's run.
+///
+/// What a sink takes on:
+///
+/// - **Never to block.** [`event`](Self::event) is called from the tunnel's
+///   own tasks and from destructors, once per event, from any thread and
+///   from several at once. It returns at once: no I/O, no waiting for room,
+///   no lock that something slow may hold. A sink that does anything more
+///   than keep a count puts the event on a queue of its own and returns.
+/// - **To record its gaps.** When that queue is full the event is lost, and
+///   so is whatever the sink fails to store later. Every such loss must
+///   leave a record of its own, with how much was lost and when, as the
+///   database's writer leaves a `log_gap` mark ([`Mark::QueueFull`],
+///   [`Mark::WriteError`]): an absence of records must never be mistaken
+///   for an absence of traffic. Events lost with a process that died are
+///   marked by what is missing: a `ShareStart` whose `ShareStop` never
+///   came, sessions and flows left open.
+/// - **Clock jumps.** Timestamps are wall-clock. A sink that wants a
+///   reader to trust their order keeps a [`ClockWatch`] and records what it
+///   reports.
+/// - **Retention**, and holds if it has them: nothing here expires a
+///   record the sink was handed.
+pub trait ConnLogSink: Send + Sync {
+    /// One event. Must not block: see the trait.
+    ///
+    /// Order: a session's start comes before anything else of that session,
+    /// a flow's events come as open, established, close, and a share's
+    /// `ShareStop` comes after everything else of that run. A flow's close
+    /// may come after its session's end (flows close as the session's tasks
+    /// are torn down), and events of different flows, sessions and shares
+    /// interleave.
+    fn event(&self, event: ConnLogEvent);
+}
+
+/// Notices the wall clock moving against the monotonic one (a suspend and
+/// resume, an NTP step, a clock set by hand), which every consumer of the
+/// log records so that a reader can put its timestamps back on one line.
+/// The database's writer checks it on every batch; a [`ConnLogSink`] keeps
+/// its own and checks it wherever it drains its queue.
+#[derive(Debug, Clone)]
+pub struct ClockWatch {
+    anchor: Instant,
+    anchor_wall_ms: i64,
+}
+
+/// What a [`ClockWatch`] found: at `ts_ms` the wall clock was `drift_ms`
+/// ahead of (negative: behind) where the monotonic clock puts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockJump {
+    pub ts_ms: i64,
+    pub drift_ms: i64,
+}
+
+impl ClockJump {
+    /// The event that records it.
+    pub fn mark(&self) -> EventKind {
+        EventKind::Mark {
+            ts_ms: self.ts_ms,
+            mark: Mark::ClockJump {
+                drift_ms: self.drift_ms,
+            },
+        }
+    }
+}
+
+impl ClockWatch {
+    pub fn new() -> Self {
+        Self {
+            anchor: Instant::now(),
+            anchor_wall_ms: now_ms(),
+        }
+    }
+
+    /// `Some` when the wall clock has moved more than two seconds against
+    /// the monotonic clock since the watch was made, or since the last jump
+    /// it reported: the watch then starts over from now. Slow drift (a
+    /// clock being slewed) adds up to a jump too, in time. Cheap enough to
+    /// call per batch; calling it rarely only reports a jump later.
+    pub fn check(&mut self) -> Option<ClockJump> {
+        self.observe(Instant::now(), now_ms())
+    }
+
+    fn observe(&mut self, now: Instant, wall_ms: i64) -> Option<ClockJump> {
+        let elapsed = now.saturating_duration_since(self.anchor).as_millis() as i64;
+        let drift_ms = wall_ms - (self.anchor_wall_ms + elapsed);
+        if drift_ms.abs() <= CLOCK_JUMP_THRESHOLD_MS {
+            return None;
+        }
+        self.anchor = now;
+        self.anchor_wall_ms = wall_ms;
+        Some(ClockJump {
+            ts_ms: wall_ms,
+            drift_ms,
+        })
+    }
+}
+
+impl Default for ClockWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The database writer's queue: try_send that counts drops instead of
+/// blocking (the EventHook discipline — never stall a tunnel task on the
+/// log).
+struct WriterQueue {
+    tx: SyncSender<EventKind>,
     dropped: Arc<AtomicU64>,
 }
 
-impl EvSender {
-    fn send(&self, ev: Ev) {
+impl WriterQueue {
+    fn send(&self, ev: EventKind) {
         match self.tx.try_send(ev) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
@@ -256,56 +536,92 @@ impl EvSender {
     }
 }
 
+/// Where one share's events go: its database's writer, the host's sink, or
+/// both. Shared by the share's [`ConnLog`] and every session and flow
+/// handle; when the last of them is dropped the writer's queue closes (it
+/// then flushes, writes its `share_stop` mark and exits) and the sink is
+/// told the same.
+struct Feed {
+    share: ShareRef,
+    writer: Option<WriterQueue>,
+    sink: Option<Arc<dyn ConnLogSink>>,
+}
+
+impl Feed {
+    /// Never blocks, as long as the sink keeps its word.
+    fn send(&self, kind: EventKind) {
+        self.tell_sink(kind);
+        if let Some(writer) = &self.writer {
+            writer.send(kind);
+        }
+    }
+
+    /// For the two marks the writer makes for its database by itself.
+    fn tell_sink(&self, kind: EventKind) {
+        if let Some(sink) = &self.sink {
+            sink.event(ConnLogEvent {
+                share: self.share,
+                kind,
+            });
+        }
+    }
+}
+
+impl Drop for Feed {
+    fn drop(&mut self) {
+        self.tell_sink(EventKind::Mark {
+            ts_ms: now_ms(),
+            mark: Mark::ShareStop,
+        });
+    }
+}
+
 /// Open handle to the share's connection log. Created once per `share()`;
 /// hands out per-session [`SessionLog`]s. Dropping every handle (sessions and
 /// flows included) lets the writer thread flush, write a `share_stop` mark,
-/// and exit.
+/// and exit, and hands a sink its [`Mark::ShareStop`].
 pub struct ConnLog {
-    sender: EvSender,
+    feed: Arc<Feed>,
     cfg: ConnLogConfig,
 }
 
 impl ConnLog {
-    /// Open (or create) the database and start the writer thread. Errors are
-    /// returned synchronously so a default-on log that cannot be written
-    /// fails `share()` loudly instead of degrading silently from the start.
+    /// Start the share's log. With a directory: open (or create) the
+    /// database and start the writer thread. Errors are returned
+    /// synchronously so a default-on log that cannot be written fails
+    /// `share()` loudly instead of degrading silently from the start.
     /// `hook` receives [`TunnelEvent::ConnLogDegraded`](crate::TunnelEvent)
-    /// when writing breaks at runtime.
+    /// when writing breaks at runtime. With a sink alone nothing is opened
+    /// and nothing started: the hooks call the sink.
     pub fn open(
         cfg: ConnLogConfig,
         identity: &ShareIdentity,
         hook: crate::EventHook,
     ) -> Result<ConnLog, String> {
-        std::fs::create_dir_all(&cfg.dir)
-            .map_err(|e| format!("connlog: create dir {}: {}", cfg.dir.display(), e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&cfg.dir, std::fs::Permissions::from_mode(0o700));
-        }
-        let path = cfg.dir.join(DB_FILE);
-        let db = open_db(&path, identity, cfg.retention)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // The -wal/-shm side files inherit the database file's mode.
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Ev>(CHANNEL_CAPACITY);
-        let dropped = Arc::new(AtomicU64::new(0));
-        let writer_cfg = cfg.clone();
-        let writer_dropped = dropped.clone();
-        std::thread::Builder::new()
-            .name("spora-connlog".into())
-            .spawn(move || writer_loop(db, rx, writer_cfg, writer_dropped, hook))
-            .map_err(|e| format!("connlog: spawn writer: {}", e))?;
-
-        info!("connlog: logging to {}", path.display());
-        Ok(ConnLog {
-            sender: EvSender { tx, dropped },
-            cfg,
-        })
+        let writer = match &cfg.dir {
+            Some(dir) => Some(start_writer(dir, &cfg, identity, hook)?),
+            None if cfg.sink.is_none() => {
+                return Err("connlog: neither a directory nor a sink to log to".into());
+            }
+            None => {
+                info!("connlog: logging to the host's sink only");
+                None
+            }
+        };
+        let feed = Arc::new(Feed {
+            share: ShareRef {
+                routing_hash: identity.routing_hash,
+                share_id: identity.share_id,
+            },
+            writer,
+            sink: cfg.sink.clone(),
+        });
+        // The database got its `share_start` when it was opened.
+        feed.tell_sink(EventKind::Mark {
+            ts_ms: now_ms(),
+            mark: Mark::ShareStart,
+        });
+        Ok(ConnLog { feed, cfg })
     }
 
     /// Record a new accepted session. `relay` is the QUIC connection's remote
@@ -313,14 +629,14 @@ impl ConnLog {
     /// sessions always bootstrap relay-via; it is recorded as such.
     pub(crate) fn session(&self, relay: SocketAddr) -> Arc<SessionLog> {
         let id = random_id();
-        self.sender.send(Ev::SessionStart {
-            id,
+        self.feed.send(EventKind::SessionStart {
+            session: id,
             ts_ms: now_ms(),
             relay,
         });
         Arc::new(SessionLog {
             id,
-            sender: self.sender.clone(),
+            feed: self.feed.clone(),
             log_destinations: self.cfg.log_destinations,
             log_blocked: self.cfg.log_blocked,
             udp_idle: self.cfg.udp_idle,
@@ -335,12 +651,50 @@ impl ConnLog {
     }
 }
 
+/// Open (or create) the database in `dir` and start its writer thread.
+fn start_writer(
+    dir: &Path,
+    cfg: &ConnLogConfig,
+    identity: &ShareIdentity,
+    hook: crate::EventHook,
+) -> Result<WriterQueue, String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("connlog: create dir {}: {}", dir.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let path = dir.join(DB_FILE);
+    let db = open_db(&path, identity, cfg.retention)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // The -wal/-shm side files inherit the database file's mode.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<EventKind>(CHANNEL_CAPACITY);
+    let dropped = Arc::new(AtomicU64::new(0));
+    // The writer is the database's alone: it has no use for the sink.
+    let mut writer_cfg = cfg.clone();
+    writer_cfg.sink = None;
+    let writer_dropped = dropped.clone();
+    std::thread::Builder::new()
+        .name("spora-connlog".into())
+        .spawn(move || writer_loop(db, rx, writer_cfg, writer_dropped, hook))
+        .map_err(|e| format!("connlog: spawn writer: {}", e))?;
+
+    info!("connlog: logging to {}", path.display());
+    Ok(WriterQueue { tx, dropped })
+}
+
 /// Per-session log handle. Flow hooks and the upgrade task hold this via
 /// `Arc`; ending is idempotent and `Drop` is the fallback so a session can
 /// never silently vanish from the log.
 pub struct SessionLog {
     id: i64,
-    sender: EvSender,
+    feed: Arc<Feed>,
     log_destinations: bool,
     log_blocked: bool,
     pub(crate) udp_idle: Duration,
@@ -367,10 +721,10 @@ impl SessionLog {
                 return;
             }
         }
-        self.sender.send(Ev::SessionAddr {
+        self.feed.send(EventKind::SessionAddr {
             session: self.id,
             ts_ms: now_ms(),
-            kind: kind.as_str(),
+            kind,
             addr,
         });
     }
@@ -390,8 +744,8 @@ impl SessionLog {
         }
         let id = random_id();
         let ts_ms = now_ms();
-        self.sender.send(Ev::FlowOpen {
-            id,
+        self.feed.send(EventKind::FlowOpen {
+            flow: id,
             session: self.id,
             ts_ms,
             proto,
@@ -401,7 +755,8 @@ impl SessionLog {
         });
         Some(FlowGuard {
             id,
-            sender: self.sender.clone(),
+            session: self.id,
+            feed: self.feed.clone(),
             up: Arc::new(AtomicU64::new(0)),
             down: Arc::new(AtomicU64::new(0)),
             established: AtomicBool::new(false),
@@ -414,8 +769,8 @@ impl SessionLog {
         if !self.log_destinations || !self.log_blocked || !self.allow_flow_record() {
             return;
         }
-        self.sender.send(Ev::FlowBlocked {
-            id: random_id(),
+        self.feed.send(EventKind::FlowBlocked {
+            flow: random_id(),
             session: self.id,
             ts_ms: now_ms(),
             proto,
@@ -426,19 +781,26 @@ impl SessionLog {
 
     fn allow_flow_record(&self) -> bool {
         let now = now_ms();
-        let mut t = self.throttle.lock().unwrap();
-        let (allowed, summary) = t.allow(now);
-        if let Some((from, to, count)) = summary {
-            self.sender.send(Ev::Mark {
+        // The lock is released before the event is sent: a sink is the
+        // host's code.
+        let (allowed, summary) = self.throttle.lock().unwrap().allow(now);
+        self.flow_throttle(now, summary);
+        allowed
+    }
+
+    /// Record a finished stretch of suppressed flow records.
+    fn flow_throttle(&self, now: i64, summary: Option<(i64, i64, u64)>) {
+        if let Some((from_ms, to_ms, suppressed)) = summary {
+            self.feed.send(EventKind::Mark {
                 ts_ms: now,
-                kind: "flow_throttle",
-                detail: format!(
-                    "{{\"session\":{},\"suppressed\":{},\"from_ms\":{},\"to_ms\":{}}}",
-                    self.id, count, from, to
-                ),
+                mark: Mark::FlowThrottle {
+                    session: self.id,
+                    suppressed,
+                    from_ms,
+                    to_ms,
+                },
             });
         }
-        allowed
     }
 
     /// Idempotent session end; `Drop` falls back to reason `"dropped"`.
@@ -446,17 +808,8 @@ impl SessionLog {
         if !self.ended.swap(true, Ordering::SeqCst) {
             let now = now_ms();
             let summary = self.throttle.lock().unwrap().take_summary();
-            if let Some((from, to, count)) = summary {
-                self.sender.send(Ev::Mark {
-                    ts_ms: now,
-                    kind: "flow_throttle",
-                    detail: format!(
-                        "{{\"session\":{},\"suppressed\":{},\"from_ms\":{},\"to_ms\":{}}}",
-                        self.id, count, from, to
-                    ),
-                });
-            }
-            self.sender.send(Ev::SessionEnd {
+            self.flow_throttle(now, summary);
+            self.feed.send(EventKind::SessionEnd {
                 session: self.id,
                 ts_ms: now,
                 reason,
@@ -478,7 +831,8 @@ impl Drop for SessionLog {
 /// alike, which is what makes "flush flows at session end" automatic.
 pub struct FlowGuard {
     id: i64,
-    sender: EvSender,
+    session: i64,
+    feed: Arc<Feed>,
     /// Client→world bytes. Shared with whatever counts (a counting IO
     /// wrapper, the UDP send path, the meter).
     pub(crate) up: Arc<AtomicU64>,
@@ -495,8 +849,9 @@ impl FlowGuard {
     /// saw from this host.
     pub(crate) fn established(&self, egress: Option<SocketAddr>) {
         if !self.established.swap(true, Ordering::SeqCst) {
-            self.sender.send(Ev::FlowEstablished {
-                id: self.id,
+            self.feed.send(EventKind::FlowEstablished {
+                flow: self.id,
+                session: self.session,
                 egress,
             });
         }
@@ -515,8 +870,9 @@ impl FlowGuard {
     /// interval late).
     pub(crate) fn close(&self, reason: &'static str, idle_for: Duration) {
         if !self.closed.swap(true, Ordering::SeqCst) {
-            self.sender.send(Ev::FlowClose {
-                id: self.id,
+            self.feed.send(EventKind::FlowClose {
+                flow: self.id,
+                session: self.session,
                 last_ms: now_ms() - idle_for.as_millis() as i64,
                 up: self.up.load(Ordering::Relaxed),
                 down: self.down.load(Ordering::Relaxed),
@@ -654,11 +1010,8 @@ fn open_db(
         ],
     )
     .map_err(|e| format!("connlog: meta: {}", e))?;
-    db.execute(
-        "INSERT INTO marks(ts_ms, kind, detail) VALUES (?1, 'share_start', ?2)",
-        rusqlite::params![now_ms(), format!("{{\"software\":\"{}\"}}", version)],
-    )
-    .map_err(|e| format!("connlog: share_start mark: {}", e))?;
+    insert_mark(&db, now_ms(), Mark::ShareStart)
+        .map_err(|e| format!("connlog: share_start mark: {}", e))?;
     Ok(db)
 }
 
@@ -716,8 +1069,7 @@ CREATE TABLE IF NOT EXISTS holds (
 ";
 
 struct WriterState {
-    anchor_instant: Instant,
-    anchor_wall_ms: i64,
+    clock: ClockWatch,
     dropped_seen: u64,
     last_sweep: Option<Instant>,
     /// Set after a write failure; cleared (with a log_gap mark) on recovery.
@@ -728,22 +1080,28 @@ struct WriterState {
     sibling_sweep: Option<std::thread::JoinHandle<()>>,
 }
 
+fn insert_mark(db: &Connection, ts_ms: i64, mark: Mark) -> Result<usize, rusqlite::Error> {
+    db.execute(
+        "INSERT INTO marks(ts_ms, kind, detail) VALUES (?1, ?2, ?3)",
+        rusqlite::params![ts_ms, mark.kind(), mark.detail()],
+    )
+}
+
 fn writer_loop(
     mut db: Connection,
-    rx: Receiver<Ev>,
+    rx: Receiver<EventKind>,
     cfg: ConnLogConfig,
     dropped: Arc<AtomicU64>,
     hook: crate::EventHook,
 ) {
     let mut state = WriterState {
-        anchor_instant: Instant::now(),
-        anchor_wall_ms: now_ms(),
+        clock: ClockWatch::new(),
         dropped_seen: 0,
         last_sweep: None,
         degraded_since_ms: None,
         sibling_sweep: None,
     };
-    let mut batch: Vec<Ev> = Vec::new();
+    let mut batch: Vec<EventKind> = Vec::new();
 
     loop {
         let disconnected = match rx.recv_timeout(cfg.flush_interval) {
@@ -768,14 +1126,8 @@ fn writer_loop(
         if !batch.is_empty() {
             match flush_batch(&mut db, &cfg, &batch) {
                 Ok(()) => {
-                    if let Some(since) = state.degraded_since_ms.take() {
-                        let _ = db.execute(
-                            "INSERT INTO marks(ts_ms, kind, detail) VALUES (?1, 'log_gap', ?2)",
-                            rusqlite::params![
-                                now_ms(),
-                                format!("{{\"reason\":\"write_error\",\"from_ms\":{}}}", since)
-                            ],
-                        );
+                    if let Some(from_ms) = state.degraded_since_ms.take() {
+                        let _ = insert_mark(&db, now_ms(), Mark::WriteError { from_ms });
                         info!("connlog: writer recovered");
                     }
                     batch.clear();
@@ -811,10 +1163,7 @@ fn writer_loop(
         }
 
         if disconnected {
-            let _ = db.execute(
-                "INSERT INTO marks(ts_ms, kind, detail) VALUES (?1, 'share_stop', NULL)",
-                rusqlite::params![now_ms()],
-            );
+            let _ = insert_mark(&db, now_ms(), Mark::ShareStop);
             let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
             info!("connlog: writer stopped");
             return;
@@ -827,34 +1176,24 @@ fn housekeeping(
     cfg: &ConnLogConfig,
     state: &mut WriterState,
     dropped: &AtomicU64,
-    batch: &mut Vec<Ev>,
+    batch: &mut Vec<EventKind>,
 ) {
     // Clock-jump detection: wall time diverging from the monotonic clock
     // (suspend, NTP step, manual change) is recorded so a reader can
     // reconstruct the true timeline instead of silently mis-ordering.
-    let expected = state.anchor_wall_ms + state.anchor_instant.elapsed().as_millis() as i64;
     let actual = now_ms();
-    let drift = actual - expected;
-    if drift.abs() > CLOCK_JUMP_THRESHOLD_MS {
-        batch.push(Ev::Mark {
-            ts_ms: actual,
-            kind: "clock_jump",
-            detail: format!("{{\"drift_ms\":{}}}", drift),
-        });
-        state.anchor_instant = Instant::now();
-        state.anchor_wall_ms = actual;
+    if let Some(jump) = state.clock.observe(Instant::now(), actual) {
+        batch.push(jump.mark());
     }
 
     // Fold channel-overflow drops into a visible gap record.
     let cur = dropped.load(Ordering::Relaxed);
     if cur > state.dropped_seen {
-        batch.push(Ev::Mark {
+        batch.push(EventKind::Mark {
             ts_ms: actual,
-            kind: "log_gap",
-            detail: format!(
-                "{{\"reason\":\"channel_full\",\"dropped\":{}}}",
-                cur - state.dropped_seen
-            ),
+            mark: Mark::QueueFull {
+                dropped: cur - state.dropped_seen,
+            },
         });
         state.dropped_seen = cur;
     }
@@ -870,8 +1209,10 @@ fn housekeeping(
         let _ = db.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
         // The previous round still running (a sibling stuck behind a busy
         // database) skips this one.
-        if cfg.sweep_siblings && state.sibling_sweep.as_ref().is_none_or(|t| t.is_finished()) {
-            let dir = cfg.dir.clone();
+        if cfg.sweep_siblings
+            && let Some(dir) = cfg.dir.clone()
+            && state.sibling_sweep.as_ref().is_none_or(|t| t.is_finished())
+        {
             let fallback = cfg.retention;
             state.sibling_sweep = std::thread::Builder::new()
                 .name("spora-connlog-sweep".into())
@@ -890,18 +1231,22 @@ fn housekeeping(
 fn flush_batch(
     db: &mut Connection,
     cfg: &ConnLogConfig,
-    batch: &[Ev],
+    batch: &[EventKind],
 ) -> Result<(), rusqlite::Error> {
     let tx = db.transaction()?;
     for ev in batch {
         match ev {
-            Ev::SessionStart { id, ts_ms, relay } => {
+            EventKind::SessionStart {
+                session: id,
+                ts_ms,
+                relay,
+            } => {
                 tx.execute(
                     "INSERT OR IGNORE INTO sessions(id, start_ms, relay_addr) VALUES (?1, ?2, ?3)",
                     rusqlite::params![id, ts_ms, relay.to_string()],
                 )?;
             }
-            Ev::SessionAddr {
+            EventKind::SessionAddr {
                 session,
                 ts_ms,
                 kind,
@@ -909,10 +1254,10 @@ fn flush_batch(
             } => {
                 tx.execute(
                     "INSERT INTO session_addrs(session_id, ts_ms, kind, addr) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![session, ts_ms, kind, addr.to_string()],
+                    rusqlite::params![session, ts_ms, kind.as_str(), addr.to_string()],
                 )?;
             }
-            Ev::SessionEnd {
+            EventKind::SessionEnd {
                 session,
                 ts_ms,
                 reason,
@@ -922,8 +1267,8 @@ fn flush_batch(
                     rusqlite::params![session, ts_ms, reason],
                 )?;
             }
-            Ev::FlowOpen {
-                id,
+            EventKind::FlowOpen {
+                flow: id,
                 session,
                 ts_ms,
                 proto,
@@ -959,8 +1304,8 @@ fn flush_batch(
                     )?;
                 }
             }
-            Ev::FlowBlocked {
-                id,
+            EventKind::FlowBlocked {
+                flow: id,
                 session,
                 ts_ms,
                 proto,
@@ -982,19 +1327,22 @@ fn flush_batch(
                     ],
                 )?;
             }
-            Ev::FlowEstablished { id, egress } => {
+            EventKind::FlowEstablished {
+                flow: id, egress, ..
+            } => {
                 tx.execute(
                     "UPDATE flows SET established=1, egress_addr=COALESCE(?2, egress_addr) WHERE id=?1",
                     rusqlite::params![id, egress.map(|a| a.to_string())],
                 )?;
             }
-            Ev::FlowClose {
-                id,
+            EventKind::FlowClose {
+                flow: id,
                 last_ms,
                 up,
                 down,
                 established,
                 reason,
+                ..
             } => {
                 // MAX(.., first_ms): idle backdating computes last_ms from a
                 // monotonic elapsed value, so a wall-clock step between open
@@ -1006,15 +1354,8 @@ fn flush_batch(
                     rusqlite::params![id, last_ms, up, down, *established, reason],
                 )?;
             }
-            Ev::Mark {
-                ts_ms,
-                kind,
-                detail,
-            } => {
-                tx.execute(
-                    "INSERT INTO marks(ts_ms, kind, detail) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![ts_ms, kind, detail],
-                )?;
+            EventKind::Mark { ts_ms, mark } => {
+                insert_mark(&tx, *ts_ms, *mark)?;
             }
         }
     }
@@ -2113,5 +2454,496 @@ mod tests {
         assert!(stopped.is_dir());
         assert!(files_in(&empty).is_empty());
         assert_eq!(destinations(elsewhere.path()), ["expired.example"]);
+    }
+
+    // ---------- A host-supplied sink ----------
+
+    /// A sink that keeps what it is handed, in order.
+    #[derive(Default)]
+    struct MemorySink(std::sync::Mutex<Vec<ConnLogEvent>>);
+
+    impl ConnLogSink for MemorySink {
+        fn event(&self, event: ConnLogEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    impl MemorySink {
+        fn events(&self) -> Vec<ConnLogEvent> {
+            self.0.lock().unwrap().clone()
+        }
+
+        fn kinds(&self) -> Vec<EventKind> {
+            self.events().iter().map(|e| e.kind).collect()
+        }
+    }
+
+    fn share_ref(identity: &ShareIdentity) -> ShareRef {
+        ShareRef {
+            routing_hash: identity.routing_hash,
+            share_id: identity.share_id,
+        }
+    }
+
+    fn mark_of(kind: &EventKind) -> Option<Mark> {
+        match kind {
+            EventKind::Mark { mark, .. } => Some(*mark),
+            _ => None,
+        }
+    }
+
+    /// The session-and-flow story of `session_and_flow_lifecycle_lands_in_db`.
+    fn run_one_session(log: &ConnLog) {
+        let session = log.session(addr([203, 0, 113, 1], 443));
+        session.addr(AddrKind::Reported, addr([198, 51, 100, 7], 6000));
+        let flow = session
+            .flow_open(
+                6,
+                addr([10, 0, 85, 2], 50000),
+                addr([93, 184, 216, 34], 443),
+                true,
+            )
+            .unwrap();
+        flow.established(Some(addr([192, 0, 2, 10], 41000)));
+        flow.add_up(1200);
+        flow.add_down(48_000);
+        flow.close("closed", Duration::ZERO);
+        drop(flow);
+        session.flow_blocked(6, addr([10, 0, 85, 2], 50001), addr([192, 168, 1, 1], 80));
+        session.end("ended");
+    }
+
+    /// With a sink and no directory, the hooks hand every event to the sink
+    /// as it happens, each naming the share, and nothing else exists: no
+    /// writer's queue, hence no thread and no database.
+    #[test]
+    fn a_sink_alone_is_handed_every_event() {
+        let sink = Arc::new(MemorySink::default());
+        let identity = ShareIdentity::generate();
+        let log = ConnLog::open(ConnLogConfig::to_sink(sink.clone()), &identity, None).unwrap();
+        assert!(log.feed.writer.is_none());
+        // Synchronously: nothing to wait for.
+        assert_eq!(
+            sink.kinds().iter().filter_map(mark_of).collect::<Vec<_>>(),
+            [Mark::ShareStart]
+        );
+
+        run_one_session(&log);
+        let events = sink.events();
+        assert!(events.iter().all(|e| e.share == share_ref(&identity)));
+        let kinds = sink.kinds();
+        let [
+            EventKind::Mark {
+                mark: Mark::ShareStart,
+                ..
+            },
+            EventKind::SessionStart {
+                session,
+                relay,
+                ts_ms,
+            },
+            EventKind::SessionAddr {
+                session: addr_session,
+                kind: AddrKind::Reported,
+                addr: reported,
+                ..
+            },
+            EventKind::FlowOpen {
+                flow,
+                session: flow_session,
+                proto: 6,
+                src,
+                dst,
+                confirmed: true,
+                ..
+            },
+            EventKind::FlowEstablished {
+                flow: established_flow,
+                session: established_session,
+                egress,
+            },
+            EventKind::FlowClose {
+                flow: closed_flow,
+                session: closed_session,
+                up: 1200,
+                down: 48_000,
+                established: true,
+                reason: "closed",
+                ..
+            },
+            EventKind::FlowBlocked {
+                flow: blocked_flow,
+                session: blocked_session,
+                dst: blocked_dst,
+                ..
+            },
+            EventKind::SessionEnd {
+                session: ended_session,
+                reason: "ended",
+                ..
+            },
+        ] = kinds[..]
+        else {
+            panic!("unexpected events: {kinds:#?}");
+        };
+        assert!(session > 0 && flow > 0 && blocked_flow > 0 && flow != blocked_flow);
+        assert!((now_ms() - ts_ms).abs() < 60_000);
+        assert_eq!(relay, addr([203, 0, 113, 1], 443));
+        assert_eq!(reported, addr([198, 51, 100, 7], 6000));
+        assert_eq!(src, addr([10, 0, 85, 2], 50000));
+        assert_eq!(dst, addr([93, 184, 216, 34], 443));
+        assert_eq!(egress, Some(addr([192, 0, 2, 10], 41000)));
+        assert_eq!(blocked_dst, addr([192, 168, 1, 1], 80));
+        assert_eq!((established_flow, closed_flow), (flow, flow));
+        for of_session in [
+            addr_session,
+            flow_session,
+            established_session,
+            closed_session,
+            blocked_session,
+            ended_session,
+        ] {
+            assert_eq!(of_session, session);
+        }
+
+        // The stop comes when the last handle goes, once.
+        drop(log);
+        let kinds = sink.kinds();
+        assert_eq!(kinds.len(), 9, "{kinds:#?}");
+        assert_eq!(mark_of(&kinds[8]), Some(Mark::ShareStop));
+    }
+
+    /// The core's part for every consumer: a flow and a session torn down
+    /// without a word still get their close and their end, and the share's
+    /// stop waits for the last of them.
+    #[test]
+    fn a_sink_hears_of_what_was_dropped_unclosed() {
+        let sink = Arc::new(MemorySink::default());
+        let log = ConnLog::open(
+            ConnLogConfig::to_sink(sink.clone()),
+            &ShareIdentity::generate(),
+            None,
+        )
+        .unwrap();
+        let session = log.session(addr([203, 0, 113, 1], 443));
+        let flow = session
+            .flow_open(17, addr([10, 0, 85, 2], 5353), addr([8, 8, 8, 8], 53), true)
+            .unwrap();
+        flow.add_up(64);
+        drop(log);
+        drop(session);
+        assert!(
+            sink.kinds()
+                .iter()
+                .filter_map(mark_of)
+                .all(|m| m != Mark::ShareStop)
+        );
+        drop(flow);
+
+        let kinds = sink.kinds();
+        let [
+            EventKind::Mark {
+                mark: Mark::ShareStart,
+                ..
+            },
+            EventKind::SessionStart { .. },
+            EventKind::FlowOpen { .. },
+            EventKind::SessionEnd {
+                reason: "dropped", ..
+            },
+            EventKind::FlowClose {
+                up: 64,
+                down: 0,
+                established: false,
+                reason: "session_end",
+                ..
+            },
+            EventKind::Mark {
+                mark: Mark::ShareStop,
+                ..
+            },
+        ] = kinds[..]
+        else {
+            panic!("unexpected events: {kinds:#?}");
+        };
+    }
+
+    /// The per-session rate limit is the core's for a sink too: what it
+    /// holds back never reaches the sink, and the count does.
+    #[test]
+    fn a_sink_is_told_what_the_throttle_held_back() {
+        let sink = Arc::new(MemorySink::default());
+        let mut cfg = ConnLogConfig::to_sink(sink.clone());
+        cfg.max_flow_records_per_sec = 1;
+        cfg.flow_record_burst = 5;
+        let log = ConnLog::open(cfg, &ShareIdentity::generate(), None).unwrap();
+        let session = log.session(addr([203, 0, 113, 1], 443));
+        for i in 0..50u16 {
+            let dst = addr([8, 8, 8, 8], 53);
+            drop(session.flow_open(17, addr([10, 0, 85, 2], 40000 + i), dst, true));
+        }
+        session.end("ended");
+
+        let kinds = sink.kinds();
+        let opened = kinds
+            .iter()
+            .filter(|k| matches!(k, EventKind::FlowOpen { .. }))
+            .count() as u64;
+        assert!((5..=6).contains(&opened), "{opened} flow records");
+        let suppressed: u64 = kinds
+            .iter()
+            .filter_map(mark_of)
+            .map(|m| match m {
+                Mark::FlowThrottle { suppressed, .. } => suppressed,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(opened + suppressed, 50, "{kinds:#?}");
+        // Before the session's end, not after it.
+        assert!(matches!(kinds.last(), Some(EventKind::SessionEnd { .. })));
+    }
+
+    /// A directory and a sink at once: the database is written as it is
+    /// without a sink, and the sink is handed the same sessions and flows
+    /// under the same ids.
+    #[test]
+    fn a_directory_and_a_sink_get_the_same_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(MemorySink::default());
+        let identity = ShareIdentity::generate();
+        let cfg = test_cfg(dir.path()).with_sink(sink.clone());
+        let log = ConnLog::open(cfg, &identity, None).unwrap();
+        assert!(log.feed.writer.is_some());
+        run_one_session(&log);
+        drop(log);
+        wait_for(dir.path(), share_stopped);
+
+        let db = open_readonly(dir.path()).unwrap();
+        let sessions = query_sessions(&db, None).unwrap();
+        let flows = query_flows(&db, &FlowQuery::default()).unwrap();
+        let marks = query_marks(&db, None, None).unwrap();
+        assert_eq!((sessions.len(), flows.len()), (1, 2));
+        let mark_kinds: Vec<&str> = marks.iter().map(|m| m.kind.as_str()).collect();
+        assert_eq!(mark_kinds, ["share_start", "share_stop"]);
+
+        let events = sink.events();
+        assert!(events.iter().all(|e| e.share == share_ref(&identity)));
+        let kinds = sink.kinds();
+        assert_eq!(
+            kinds.iter().filter_map(mark_of).collect::<Vec<_>>(),
+            [Mark::ShareStart, Mark::ShareStop]
+        );
+        let mut seen_flows = 0;
+        for kind in &kinds {
+            match *kind {
+                EventKind::SessionStart {
+                    session,
+                    ts_ms,
+                    relay,
+                } => {
+                    assert_eq!(sessions[0].id, session);
+                    assert_eq!(sessions[0].start_ms, ts_ms);
+                    assert_eq!(sessions[0].relay_addr, relay.to_string());
+                }
+                EventKind::SessionAddr {
+                    kind, addr, ts_ms, ..
+                } => {
+                    assert_eq!(
+                        sessions[0].addrs,
+                        [(ts_ms, kind.as_str().to_string(), addr.to_string())]
+                    );
+                }
+                EventKind::SessionEnd { ts_ms, reason, .. } => {
+                    assert_eq!(sessions[0].end_ms, Some(ts_ms));
+                    assert_eq!(sessions[0].end_reason.as_deref(), Some(reason));
+                }
+                EventKind::FlowOpen {
+                    flow,
+                    session,
+                    ts_ms,
+                    dst,
+                    ..
+                }
+                | EventKind::FlowBlocked {
+                    flow,
+                    session,
+                    ts_ms,
+                    dst,
+                    ..
+                } => {
+                    let row = flows.iter().find(|f| f.id == flow).expect("the flow's row");
+                    assert_eq!(row.session_id, session);
+                    assert_eq!(row.first_ms, ts_ms);
+                    assert_eq!(
+                        (row.dst.clone(), row.dst_port),
+                        (dst.ip().to_string(), dst.port())
+                    );
+                    seen_flows += 1;
+                }
+                EventKind::FlowEstablished { flow, egress, .. } => {
+                    let row = flows.iter().find(|f| f.id == flow).expect("the flow's row");
+                    assert_eq!(row.egress_addr, egress.map(|a| a.to_string()));
+                }
+                EventKind::FlowClose {
+                    flow,
+                    up,
+                    down,
+                    established,
+                    reason,
+                    ..
+                } => {
+                    let row = flows.iter().find(|f| f.id == flow).expect("the flow's row");
+                    assert_eq!((row.bytes_up, row.bytes_down), (up, down));
+                    assert_eq!(row.established, established);
+                    assert_eq!(row.end_reason.as_deref(), Some(reason));
+                }
+                EventKind::Mark { .. } => {}
+            }
+        }
+        assert_eq!(seen_flows, 2);
+    }
+
+    /// A host that runs many shares gives them all one sink: each event
+    /// says whose it is, and each share has its own start and stop.
+    #[test]
+    fn two_shares_feed_one_sink() {
+        let sink = Arc::new(MemorySink::default());
+        let (first, second) = (ShareIdentity::generate(), ShareIdentity::generate());
+        let open = |identity: &ShareIdentity| {
+            ConnLog::open(ConnLogConfig::to_sink(sink.clone()), identity, None).unwrap()
+        };
+        let (log_a, log_b) = (open(&first), open(&second));
+        // Interleaved, from two threads, as two shares' tunnels would.
+        std::thread::scope(|s| {
+            s.spawn(|| run_one_session(&log_a));
+            s.spawn(|| run_one_session(&log_b));
+        });
+        drop(log_a);
+        run_one_session(&log_b);
+        drop(log_b);
+
+        let events = sink.events();
+        let of = |identity: &ShareIdentity| -> Vec<EventKind> {
+            events
+                .iter()
+                .filter(|e| e.share == share_ref(identity))
+                .map(|e| e.kind)
+                .collect()
+        };
+        let (a, b) = (of(&first), of(&second));
+        assert_eq!(a.len() + b.len(), events.len());
+        // One run of the session story for the first share, two for the
+        // second, each between its own start and stop.
+        assert_eq!((a.len(), b.len()), (9, 16));
+        for kinds in [&a, &b] {
+            assert_eq!(mark_of(&kinds[0]), Some(Mark::ShareStart));
+            assert_eq!(mark_of(kinds.last().unwrap()), Some(Mark::ShareStop));
+        }
+        let sessions = |kinds: &[EventKind]| -> Vec<i64> {
+            kinds
+                .iter()
+                .filter_map(|k| match k {
+                    EventKind::SessionStart { session, .. } => Some(*session),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!((sessions(&a).len(), sessions(&b).len()), (1, 2));
+        assert!(sessions(&b).iter().all(|s| !sessions(&a).contains(s)));
+    }
+
+    #[test]
+    fn a_log_with_nowhere_to_go_is_refused() {
+        let mut cfg = ConnLogConfig::in_dir("unused");
+        cfg.dir = None;
+        let Err(e) = ConnLog::open(cfg, &ShareIdentity::generate(), None) else {
+            panic!("a log with neither a directory nor a sink was opened");
+        };
+        assert!(e.contains("neither a directory nor a sink"), "{e}");
+    }
+
+    /// What the database stores for each mark: readers of existing logs
+    /// (and `spora log query`) know these words.
+    #[test]
+    fn marks_keep_the_words_the_database_stores() {
+        let text = |m: Mark| (m.kind(), m.detail());
+        assert_eq!(
+            text(Mark::ShareStart),
+            (
+                "share_start",
+                Some(format!(
+                    "{{\"software\":\"{}\"}}",
+                    env!("CARGO_PKG_VERSION")
+                ))
+            )
+        );
+        assert_eq!(text(Mark::ShareStop), ("share_stop", None));
+        assert_eq!(
+            text(Mark::FlowThrottle {
+                session: 7,
+                suppressed: 3,
+                from_ms: 10,
+                to_ms: 20
+            }),
+            (
+                "flow_throttle",
+                Some(r#"{"session":7,"suppressed":3,"from_ms":10,"to_ms":20}"#.into())
+            )
+        );
+        assert_eq!(
+            text(Mark::ClockJump { drift_ms: -4000 }),
+            ("clock_jump", Some(r#"{"drift_ms":-4000}"#.into()))
+        );
+        assert_eq!(
+            text(Mark::QueueFull { dropped: 12 }),
+            (
+                "log_gap",
+                Some(r#"{"reason":"channel_full","dropped":12}"#.into())
+            )
+        );
+        assert_eq!(
+            text(Mark::WriteError { from_ms: 99 }),
+            (
+                "log_gap",
+                Some(r#"{"reason":"write_error","from_ms":99}"#.into())
+            )
+        );
+    }
+
+    /// The clock watch a sink shares with the database's writer: quiet
+    /// while the two clocks agree, one report per jump, then quiet again
+    /// from the new time.
+    #[test]
+    fn a_clock_watch_reports_each_jump_once() {
+        let start = Instant::now();
+        let wall = 1_700_000_000_000i64;
+        let mut watch = ClockWatch {
+            anchor: start,
+            anchor_wall_ms: wall,
+        };
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        assert_eq!(watch.observe(at(10), wall + 10_000), None);
+        // Within the threshold: scheduling noise, not a jump.
+        assert_eq!(watch.observe(at(20), wall + 21_500), None);
+        // The wall clock an hour ahead (a resume from suspend).
+        let jumped = wall + 30_000 + 3_600_000;
+        let jump = watch.observe(at(30), jumped).expect("a jump");
+        assert_eq!((jump.ts_ms, jump.drift_ms), (jumped, 3_600_000));
+        assert_eq!(
+            jump.mark(),
+            EventKind::Mark {
+                ts_ms: jumped,
+                mark: Mark::ClockJump {
+                    drift_ms: 3_600_000
+                }
+            }
+        );
+        assert_eq!(watch.observe(at(40), jumped + 10_000), None);
+        // And back (the clock set by hand).
+        let back = watch
+            .observe(at(50), jumped + 20_000 - 5_000)
+            .expect("a jump back");
+        assert_eq!(back.drift_ms, -5_000);
+        assert_eq!(ClockWatch::new().check(), None);
     }
 }

@@ -359,7 +359,21 @@ pub struct Config {
     /// authorizing relay refuses, until
     /// [`ShareSession::update_relay_token`] brings one.
     pub relay_token: Option<Vec<u8>>,
+    /// Share side only: how many connections the share keeps parked at each
+    /// address of each `TcpTls` relay, waiting for a client to be spliced
+    /// in. A client's dial takes one, and another is parked in its place as
+    /// soon as that dial has been answered, so this is how many dials may
+    /// come to one address together and each find a connection waiting (one
+    /// that finds none waits at the relay for the next to be parked). Every
+    /// parked connection is a socket here and at the relay, with its
+    /// keepalive probes: a host that runs many shares may want fewer than
+    /// the default, [`DEFAULT_TCP_PARK_POOL`] (4). With 0 nothing is parked
+    /// and no client reaches the share through its TCP relays.
+    pub tcp_park_pool: usize,
 }
+
+/// [`Config::tcp_park_pool`]'s default.
+pub const DEFAULT_TCP_PARK_POOL: usize = 4;
 
 impl Default for Config {
     fn default() -> Self {
@@ -375,6 +389,7 @@ impl Default for Config {
             dns_forwarder: Some(dns::DnsForwarder::system()),
             record: None,
             relay_token: None,
+            tcp_park_pool: DEFAULT_TCP_PARK_POOL,
         }
     }
 }
@@ -801,9 +816,10 @@ impl QuicListener {
     }
 }
 
-/// Spawn TCP/TLS registrar pools for every `TcpTls` relay of the share. Each
-/// pool worker parks a connection at the relay; when a client is spliced in it
-/// runs the E2E TLS server and delivers the session, then re-parks to refill.
+/// Spawn TCP/TLS registrar pools for every `TcpTls` relay of the share:
+/// `Config::tcp_park_pool` workers per relay address. Each pool worker parks a
+/// connection at the relay; when a client is spliced in it runs the E2E TLS
+/// server and delivers the session, then re-parks to refill.
 fn spawn_tcp_registrars(
     config: &Config,
     carriers: &ShareCarriers,
@@ -812,13 +828,18 @@ fn spawn_tcp_registrars(
     cancel: CancellationToken,
     rec: &Recorder,
 ) {
-    // Connections kept parked per relay so a client always finds one.
-    const POOL_SIZE: usize = 4;
     for relay in carriers
         .relays
         .iter()
         .filter(|r| r.endpoint.protocol == RelayProtocol::TcpTls)
     {
+        if config.tcp_park_pool == 0 {
+            warn!(
+                "tcp registrar: nothing parked at {} (a pool of 0): no client reaches the share through it",
+                relay.endpoint.host
+            );
+            continue;
+        }
         let addrs = match resolve_one_relay(&relay.endpoint) {
             Ok(a) => a,
             Err(e) => {
@@ -830,7 +851,7 @@ fn spawn_tcp_registrars(
             }
         };
         for addr in addrs {
-            for _ in 0..POOL_SIZE {
+            for _ in 0..config.tcp_park_pool {
                 tokio::spawn(tcp_park_worker(
                     ParkTarget {
                         addr,

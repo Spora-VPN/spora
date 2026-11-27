@@ -71,8 +71,9 @@ async fn wait_for(what: &str, within: Duration, mut done: impl FnMut() -> bool) 
     }
 }
 
-/// Connections a share keeps parked per relay address (`POOL_SIZE`).
-const POOL: usize = 4;
+/// Connections a share keeps parked per relay address unless it is set
+/// otherwise (`Config::tcp_park_pool`).
+const POOL: usize = spora_core::DEFAULT_TCP_PARK_POOL;
 
 /// Reads what a share parks, like a relay, and splices nobody in. With
 /// `hold` it keeps the connections until `close_all`; without, it closes
@@ -164,6 +165,50 @@ async fn a_pool_the_relay_dropped_is_parked_again_while_a_client_would_wait() {
         .await;
     }
     session.stop().await;
+}
+
+/// `Config::tcp_park_pool`: a share keeps that many connections parked per
+/// relay address, no more, and refills to that many.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_share_parks_as_many_connections_as_it_is_set_to() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    assert_eq!(POOL, 4);
+    assert_eq!(Config::default().tcp_park_pool, POOL);
+    let dial_timeout = Duration::from_millis(250);
+    let mut sessions = Vec::new();
+    // The default beside a smaller and a larger pool, so that neither
+    // number is 4 by accident; then no pool at all.
+    for pool in [POOL, 2, 7, 0] {
+        let relay = FakeRelay::start(true).await;
+        let device = DeviceIdentity::generate();
+        let sh = Share::new(&device, vec![tcp_relay(relay.addr)]).unwrap();
+        let config = Config {
+            tcp_park_pool: pool,
+            ..share_config(dial_timeout)
+        };
+        let session = share(device, sh, config).await.expect("share()");
+        wait_for("the pool", Duration::from_secs(5), || relay.parks() >= pool).await;
+        // Nothing beyond it, however long the share is left alone.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(relay.parks(), pool, "parked with a pool of {pool}");
+
+        // Each connection the relay drops (having taken it) is replaced,
+        // one for one.
+        if pool > 0 {
+            let dropped = Instant::now();
+            relay.close_all();
+            wait_for("the pool again", Duration::from_secs(5), || {
+                relay.parks_after(dropped) >= pool
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            assert_eq!(relay.parks_after(dropped), pool, "re-parked of {pool}");
+        }
+        sessions.push(session);
+    }
+    for session in sessions {
+        session.stop().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

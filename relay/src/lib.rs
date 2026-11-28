@@ -19,6 +19,10 @@
 //!     refused later (a lapsed token) stops new clients from finding the
 //!     share, and its live flows run on until they fall idle.
 //!   - Idle entries time out (registrations ~120s, flows ~60s).
+//!
+//! The forwarding loop is [`serve`]: one task, one socket, reading ahead of
+//! its sending into a queue of its own, so that a burst from several
+//! sessions waits there and not in the socket's small receive buffer.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -43,6 +47,16 @@ pub const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(120);
 pub const FLOW_TIMEOUT: Duration = Duration::from_secs(60);
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 pub const RECV_BUF: usize = 4096;
+
+/// How many datagrams the relay holds between reading them from its socket
+/// and sending them on (see [`serve`]): 8 MiB of slots, touched only as far
+/// as the queue has ever grown.
+pub const QUEUE_DATAGRAMS: usize = 2048;
+
+/// How many queued datagrams [`serve`] sends before it reads the socket
+/// again: few, so that what arrives during one round's sends fits the
+/// socket's receive buffer even at a stock size.
+pub const SEND_BURST: usize = 8;
 
 /// Smallest `nz` (Noise UDP) carrier first packet the relay will route by its
 /// leading routing-hash prefix: `routing_hash(20) | session index(4) | a
@@ -583,27 +597,156 @@ impl State {
     }
 }
 
+/// Datagrams read from the socket and not yet sent on, oldest first. A ring
+/// of fixed-size slots: a datagram is read straight into its slot and sent
+/// from it, with no copy and no allocation on the way.
+struct Queue {
+    /// `capacity` slots of [`RECV_BUF`] bytes.
+    slots: Vec<u8>,
+    /// Per slot: the datagram's length and where it goes.
+    held: Vec<(usize, SocketAddr)>,
+    head: usize,
+    len: usize,
+}
+
+impl Queue {
+    fn new(capacity: usize) -> Queue {
+        Queue {
+            slots: vec![0; capacity * RECV_BUF],
+            held: vec![(0, SocketAddr::from(([0, 0, 0, 0], 0))); capacity],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.held.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn is_full(&self) -> bool {
+        self.len == self.capacity()
+    }
+
+    fn free_index(&self) -> usize {
+        debug_assert!(!self.is_full());
+        (self.head + self.len) % self.capacity()
+    }
+
+    /// The slot the next datagram is read into. Reading into it queues
+    /// nothing; [`Queue::keep`] does. Only while the queue is not full.
+    fn free_slot(&mut self) -> &mut [u8] {
+        let at = self.free_index() * RECV_BUF;
+        &mut self.slots[at..at + RECV_BUF]
+    }
+
+    /// Queue the first `n` bytes of the slot just read into, for `dst`.
+    fn keep(&mut self, n: usize, dst: SocketAddr) {
+        let slot = self.free_index();
+        self.held[slot] = (n, dst);
+        self.len += 1;
+    }
+
+    /// The oldest datagram and where it goes.
+    fn front(&self) -> Option<(&[u8], SocketAddr)> {
+        if self.is_empty() {
+            return None;
+        }
+        let (n, dst) = self.held[self.head];
+        let at = self.head * RECV_BUF;
+        Some((&self.slots[at..at + n], dst))
+    }
+
+    /// Let go of the oldest datagram.
+    fn pop(&mut self) {
+        debug_assert!(!self.is_empty());
+        self.len -= 1;
+        // An empty queue starts over at its first slot: a relay that keeps
+        // up then works in the same few slots instead of walking the ring.
+        self.head = if self.len == 0 {
+            0
+        } else {
+            (self.head + 1) % self.capacity()
+        };
+    }
+}
+
 /// Main recv/forward loop. Runs forever.
+///
+/// One task and one socket, and reading comes first: each round reads every
+/// datagram the socket holds into a queue of the relay's own
+/// ([`QUEUE_DATAGRAMS`]), sends at most [`SEND_BURST`] from its head, and
+/// reads again. Sending is the slow half (a send takes the datagram through
+/// the host's whole egress path, a read copies it out of a buffer), and
+/// senders burst: a few busy sessions deliver hundreds of datagrams in the
+/// time a handful of sends take. Read one, send one, and such a burst waits
+/// in the socket's receive buffer, which a stock system sizes for about a
+/// hundred full-size datagrams; what does not fit there the kernel drops,
+/// and the peers slow down as for a congested path, with the relay far from
+/// busy. Read first, and the burst waits here instead.
+///
+/// The queue only moves the wait. Datagrams leave in the order they came,
+/// and none is held while the socket would take it. A full queue stops the
+/// reading, so what overflows is still dropped at the socket, by the
+/// kernel, which counts it there.
 pub async fn serve(socket: UdpSocket, mut state: State) {
-    let mut buf = vec![0u8; RECV_BUF];
+    let mut queue = Queue::new(QUEUE_DATAGRAMS);
     let mut last_sweep = Instant::now();
     loop {
-        let (n, src) = match socket.recv_from(&mut buf).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("recv error: {}", e);
-                continue;
-            }
-        };
-        let now = Instant::now();
-        if let Action::Forward(dst) = state.handle_packet(src, &buf[..n], now)
-            && let Err(e) = socket.send_to(&buf[..n], dst).await
+        if queue.is_empty()
+            && let Err(e) = socket.readable().await
         {
-            warn!("send_to {} ({} bytes) failed: {}", dst, n, e);
+            warn!("recv error: {}", e);
+            continue;
+        }
+        let now = Instant::now();
+        while !queue.is_full() {
+            let buf = queue.free_slot();
+            match socket.try_recv_from(buf) {
+                Ok((n, src)) => {
+                    if let Action::Forward(dst) = state.handle_packet(src, &buf[..n], now) {
+                        queue.keep(n, dst);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    warn!("recv error: {}", e);
+                    break;
+                }
+            }
+        }
+        let mut burst = SEND_BURST;
+        while burst > 0
+            && let Some((pkt, dst)) = queue.front()
+        {
+            match socket.try_send_to(pkt, dst) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // The socket's send buffer is full: wait for room and
+                    // offer the same datagram again.
+                    if let Err(e) = socket.writable().await {
+                        warn!("send error: {}", e);
+                    }
+                    continue;
+                }
+                Err(e) => warn!("send_to {} ({} bytes) failed: {}", dst, pkt.len(), e),
+            }
+            queue.pop();
+            burst -= 1;
         }
         if now.duration_since(last_sweep) >= state.sweep_interval {
             state.sweep(now);
             last_sweep = now;
+        }
+        if !queue.is_empty() {
+            // More to send, and nothing above waited: give the runtime a
+            // turn, so that it sees what has arrived meanwhile (on a
+            // single-threaded runtime nothing else looks) and other tasks
+            // on this thread run.
+            tokio::task::yield_now().await;
         }
     }
 }
@@ -1515,6 +1658,94 @@ mod tests {
             .unwrap();
         assert_eq!(&buf[..recv.0], &reply[..]);
         assert_eq!(recv.1, relay_addr);
+    }
+
+    /// More datagrams at once than one round sends ([`SEND_BURST`]): all of
+    /// them come out, in the order they went in, in both directions.
+    #[tokio::test]
+    async fn a_burst_longer_than_a_round_is_forwarded_whole_and_in_order() {
+        let relay_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_sock.local_addr().unwrap();
+        let _serve = tokio::spawn(serve(relay_sock, State::default()));
+        let a_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let mut reg = registrar();
+        let key = reg.routing_key();
+        a_sock
+            .send_to(&reg.next_register_packet(), relay_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut buf = [0u8; 2048];
+        b_sock
+            .send_to(&initial_with_dcid(&key), relay_addr)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), a_sock.recv_from(&mut buf))
+            .await
+            .expect("A should receive B's initial")
+            .unwrap();
+
+        // Short-header datagrams, numbered. A hundred small ones fit any
+        // system's default socket buffers, so none is lost on the way in or
+        // out however the tasks are scheduled.
+        const BURST: u16 = 100;
+        assert!(usize::from(BURST) > 4 * SEND_BURST);
+        for (from, to) in [(&b_sock, &a_sock), (&a_sock, &b_sock), (&b_sock, &a_sock)] {
+            for i in 0..BURST {
+                let [hi, lo] = i.to_be_bytes();
+                from.send_to(&[0x40, hi, lo], relay_addr).await.unwrap();
+            }
+            for i in 0..BURST {
+                let (n, src) = tokio::time::timeout(Duration::from_secs(2), to.recv_from(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| panic!("datagram {i} never came"))
+                    .unwrap();
+                let [hi, lo] = i.to_be_bytes();
+                assert_eq!((&buf[..n], src), (&[0x40, hi, lo][..], relay_addr));
+            }
+        }
+    }
+
+    #[test]
+    fn the_queue_keeps_arrival_order_around_the_end_of_its_ring() {
+        let dst = |i: u8| addr(&format!("10.0.0.{i}:1000"));
+        let push = |q: &mut Queue, i: u8| {
+            let slot = q.free_slot();
+            assert_eq!(slot.len(), RECV_BUF);
+            slot[..2].copy_from_slice(&[i, i]);
+            q.keep(usize::from(i % 2) + 1, dst(i));
+        };
+        let front = |q: &Queue| q.front().map(|(pkt, to)| (pkt.to_vec(), to));
+
+        let mut q = Queue::new(4);
+        assert!(q.is_empty() && !q.is_full() && q.front().is_none());
+        for i in 1..=3 {
+            push(&mut q, i);
+        }
+        assert_eq!(front(&q), Some((vec![1, 1], dst(1))));
+        q.pop();
+        q.pop();
+        // Three more: the last two go to the slots the first two left.
+        for i in 4..=6 {
+            push(&mut q, i);
+        }
+        assert!(q.is_full());
+        for i in 3..=6u8 {
+            let len = usize::from(i % 2) + 1;
+            assert_eq!(front(&q), Some((vec![i; len], dst(i))));
+            q.pop();
+        }
+        assert!(q.is_empty() && q.front().is_none());
+
+        // Emptied, it starts over at its first slot.
+        assert_eq!(q.free_index(), 0);
+        // And a slot read into but not kept is the next one read into.
+        q.free_slot()[0] = 9;
+        assert!(q.is_empty());
+        push(&mut q, 7);
+        assert_eq!(front(&q), Some((vec![7, 7], dst(7))));
     }
 
     // --- Session logging ---

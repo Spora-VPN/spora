@@ -29,6 +29,25 @@ fallback. A hostname with
 both A and AAAA records counts as one relay per address family, and gives
 you IPv6 connectivity for free.
 
+## A relay for many sessions
+
+All sessions share the relay's one UDP socket, and the kernel drops what
+arrives while that socket's buffer is full. The relay keeps the buffer
+empty by reading ahead of its sending, into a queue of its own, and asks
+the kernel for a larger buffer besides (8 MiB; `--udp-buffer <bytes>` for
+another size). A stock Linux grants 208 KiB, about a hundred datagrams,
+unless the host's limit is raised:
+
+```bash
+# /etc/sysctl.d/60-spora-relay.conf; apply with `sysctl --system`, then restart the relay
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+```
+
+The relay logs the sizes it got when it starts, and warns when they are
+less than it asked for. A relay for a few people works without this; set
+it on a host that carries many busy sessions at once.
+
 ## Skipping the relay entirely
 
 If the sharing machine itself has a public, reachable address, no relay is

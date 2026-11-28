@@ -47,3 +47,24 @@ relay --token-file relay.token # admit only sharers presenting this token
 ```
 
 Point sharers at it with `spora-cli share --relay <host>:<port>` (repeat for several). 443 is the default port because it blends with HTTPS; a real deployment usually wants it there (and behind a hardened systemd unit with `StateDirectory=`).
+
+## Carrying many sessions
+
+All UDP sessions share one socket and one task, and senders burst: a few busy sessions deliver hundreds of datagrams in the time the relay takes to send a handful on. So the relay reads first. Each round it reads every datagram the socket holds into a queue of its own (2,048 datagrams), sends a few from the head of the queue, and reads again; datagrams leave in the order they came. A burst then waits in the relay instead of in the socket's receive buffer, which a stock system sizes for about a hundred full-size datagrams (208 KiB on Linux). What does not fit in that buffer the kernel drops, the peers take the loss for a congested path, and every session slows down while the relay is far from busy.
+
+The queue holds bursts while the relay is running. For the moments it is not (the host is busy with something else, a virtual CPU is waiting its turn), the relay also asks the kernel for larger buffers on the socket: 8 MiB for receiving and 8 MiB for sending (`--udp-buffer <bytes>`; `0` keeps the system's defaults). The kernel grants no more than the host allows, and on a stock Linux that limit is the same 208 KiB. On a host whose relay is to carry many sessions, raise it:
+
+```bash
+# /etc/sysctl.d/60-spora-relay.conf; apply with `sysctl --system`, then restart the relay
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+```
+
+A socket's buffers are set when the relay starts, so the limit has to be in place before that. At start the relay logs what the socket got and warns when that is less than it asked for. Linux reports twice the size it granted (`16777216` for 8 MiB): it counts its own bookkeeping against the buffer. On a running relay, `ss` shows the same sizes (`rb`, `tb`) and, as `d`, the datagrams this socket has dropped for want of room:
+
+```bash
+ss -ulnm 'sport = :443'
+#   skmem:(r0,rb16777216,t0,tb16777216,f0,w0,o0,bl0,d0)
+```
+
+A `d` that keeps growing means datagrams arrive faster than the relay forwards them: its queue is full and the socket's buffer after it, or the relay is not getting the CPU. The host-wide counts are `nstat -az UdpRcvbufErrors Udp6RcvbufErrors`.

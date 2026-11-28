@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
 use relay::authz::{Authorizer, Open, StaticToken};
-use relay::server::{ServeOptions, default_session_log_path};
+use relay::server::{DEFAULT_UDP_BUFFER, ServeOptions, Tuning, default_session_log_path};
 use relay::sessionlog::SessionLogConfig;
 
 #[derive(Parser, Debug)]
@@ -58,6 +58,13 @@ struct Args {
     /// blind-splices; the end-to-end TLS stays between the peers.
     #[arg(long)]
     tcp_port: Option<u16>,
+    /// Bytes to ask the system for as the UDP socket's receive buffer and as
+    /// its send buffer; 0 keeps the system's defaults. The system grants no
+    /// more than the host's limit (Linux: net.core.rmem_max and
+    /// net.core.wmem_max, 208 KiB unless raised), and the relay logs what it
+    /// got. See the README, "Carrying many sessions".
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_UDP_BUFFER)]
+    udp_buffer: usize,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -149,7 +156,9 @@ async fn main() {
         json: args.json,
         on_ready: None,
     };
-    if let Err(e) = relay::server::run(opts, authorizer).await {
+    let mut tuning = Tuning::default();
+    tuning.udp_buffer = args.udp_buffer;
+    if let Err(e) = relay::server::run_tuned(opts, tuning, authorizer).await {
         eprintln!("relay: {e}");
         process::exit(1);
     }
@@ -171,6 +180,16 @@ mod tests {
         assert!(serve.command.is_none());
         assert_eq!(serve.port, 8443);
         assert!(serve.json);
+    }
+
+    #[test]
+    fn the_udp_buffer_is_the_library_default_unless_given() {
+        let plain = Args::try_parse_from(["relay"]).unwrap();
+        assert_eq!(plain.udp_buffer, Tuning::default().udp_buffer);
+        let given = Args::try_parse_from(["relay", "--udp-buffer", "1048576"]).unwrap();
+        assert_eq!(given.udp_buffer, 1 << 20);
+        let off = Args::try_parse_from(["relay", "--udp-buffer", "0"]).unwrap();
+        assert_eq!(off.udp_buffer, 0);
     }
 
     #[test]
